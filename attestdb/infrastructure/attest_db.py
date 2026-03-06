@@ -2175,8 +2175,10 @@ class AttestDB:
 
         for entity in entities:
             claims = self.claims_for(entity.id)
-            sources = {c.provenance.source_id for c in claims}
-            if len(sources) == 1 and len(claims) >= min_claims:
+            # Exclude meta-claims (inquiries) — they aren't real evidence
+            evidence_claims = [c for c in claims if c.predicate.id != "inquiry"]
+            sources = {c.provenance.source_id for c in evidence_claims}
+            if len(sources) == 1 and len(evidence_claims) >= min_claims:
                 single_source.append(entity.id)
 
         # Compute knowledge gaps from predicate constraints
