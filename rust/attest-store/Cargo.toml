@@ -1,0 +1,22 @@
+[package]
+name = "attest-store"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Storage engine for Attest: append-only claim log, indexes, persistence"
+
+[dependencies]
+attest-core = { path = "../attest-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+crc32fast = "1"
+fs2 = "0.4"
+log = "0.4"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "store_bench"
+harness = false

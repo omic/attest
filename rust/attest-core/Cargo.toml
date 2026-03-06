@@ -1,0 +1,12 @@
+[package]
+name = "attest-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Locked invariants for Attest: normalization, hashing, types, errors, confidence, vocabulary"
+
+[dependencies]
+unicode-normalization = "0.1"
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

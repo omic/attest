@@ -1,0 +1,75 @@
+[project]
+name = "attestdb"
+version = "0.1.0"
+description = "The database for knowledge you can verify"
+readme = "README.md"
+license = {text = "BSL-1.1"}
+requires-python = ">=3.11"
+authors = [
+    {name = "Omic Research"},
+]
+keywords = ["knowledge-graph", "claims", "provenance", "biology", "link-prediction"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: Other/Proprietary License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+    "usearch>=2.9",
+    "numpy>=1.24",
+    "jsonschema>=4.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.4",
+    "mypy>=1.8",
+]
+mcp = [
+    "mcp[cli]>=1.0",
+]
+all = [
+    "attestdb[mcp]",
+]
+
+[project.urls]
+Homepage = "https://attestdb.com"
+Documentation = "https://attestdb.com/quickstart.html"
+Repository = "https://github.com/omic/attest"
+
+[project.scripts]
+attest-mcp = "attestdb.mcp_server:main"
+attest-mcp-http = "attestdb.mcp_server_http:main"
+attest = "attestdb.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["attestdb"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true

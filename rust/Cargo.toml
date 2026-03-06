@@ -1,0 +1,3 @@
+[workspace]
+members = ["attest-core", "attest-store", "attest-py"]
+resolver = "2"

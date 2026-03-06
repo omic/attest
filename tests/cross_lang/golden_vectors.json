@@ -1,0 +1,705 @@
+{
+  "version": 1,
+  "description": "Golden test vectors for cross-language verification",
+  "normalization": [
+    {
+      "input": "Hello World",
+      "expected": "hello world",
+      "description": "basic lowercase"
+    },
+    {
+      "input": "BRCA1",
+      "expected": "brca1",
+      "description": "uppercase gene"
+    },
+    {
+      "input": "  hello   world  ",
+      "expected": "hello world",
+      "description": "whitespace collapse"
+    },
+    {
+      "input": "hello\t\nworld",
+      "expected": "hello world",
+      "description": "tab and newline"
+    },
+    {
+      "input": "",
+      "expected": "",
+      "description": "empty string"
+    },
+    {
+      "input": "a",
+      "expected": "a",
+      "description": "single char"
+    },
+    {
+      "input": "already lowercase",
+      "expected": "already lowercase",
+      "description": "no change needed"
+    },
+    {
+      "input": "TNF-α",
+      "expected": "tnf-alpha",
+      "description": "greek alpha"
+    },
+    {
+      "input": "β-catenin",
+      "expected": "beta-catenin",
+      "description": "greek beta"
+    },
+    {
+      "input": "IFN-γ",
+      "expected": "ifn-gamma",
+      "description": "greek gamma"
+    },
+    {
+      "input": "δ-aminolevulinic acid",
+      "expected": "delta-aminolevulinic acid",
+      "description": "greek delta"
+    },
+    {
+      "input": "ε-aminocaproic acid",
+      "expected": "epsilon-aminocaproic acid",
+      "description": "greek epsilon"
+    },
+    {
+      "input": "κ-casein",
+      "expected": "kappa-casein",
+      "description": "greek kappa"
+    },
+    {
+      "input": "λ phage",
+      "expected": "lambda phage",
+      "description": "greek lambda"
+    },
+    {
+      "input": "μ-opioid",
+      "expected": "mu-opioid",
+      "description": "greek mu"
+    },
+    {
+      "input": "τ protein",
+      "expected": "tau protein",
+      "description": "greek tau"
+    },
+    {
+      "input": "ω-3 fatty acid",
+      "expected": "omega-3 fatty acid",
+      "description": "greek omega"
+    },
+    {
+      "input": "α-β complex",
+      "expected": "alpha-beta complex",
+      "description": "multiple greek"
+    },
+    {
+      "input": "αβγδε",
+      "expected": "alphabetagammadeltaepsilon",
+      "description": "all greek concat"
+    },
+    {
+      "input": "TNF-α receptor",
+      "expected": "tnf-alpha receptor",
+      "description": "greek in middle"
+    },
+    {
+      "input": "ﬁbronectin",
+      "expected": "fibronectin",
+      "description": "fi ligature"
+    },
+    {
+      "input": "ﬂuorescence",
+      "expected": "fluorescence",
+      "description": "fl ligature"
+    },
+    {
+      "input": "naïve",
+      "expected": "naïve",
+      "description": "diaeresis"
+    },
+    {
+      "input": "café",
+      "expected": "café",
+      "description": "accent"
+    },
+    {
+      "input": "résumé",
+      "expected": "résumé",
+      "description": "multiple accents"
+    },
+    {
+      "input": "Ångström",
+      "expected": "ångström",
+      "description": "angstrom"
+    },
+    {
+      "input": "   ",
+      "expected": "",
+      "description": "only spaces"
+    },
+    {
+      "input": "\t\t\t",
+      "expected": "",
+      "description": "only tabs"
+    },
+    {
+      "input": "\n\n\n",
+      "expected": "",
+      "description": "only newlines"
+    },
+    {
+      "input": "  a  ",
+      "expected": "a",
+      "description": "spaces around single char"
+    },
+    {
+      "input": "a  b  c  d",
+      "expected": "a b c d",
+      "description": "multiple words with extra spaces"
+    },
+    {
+      "input": "TP53  Gene",
+      "expected": "tp53 gene",
+      "description": "mixed case and spaces"
+    },
+    {
+      "input": "  BRCA1  ",
+      "expected": "brca1",
+      "description": "padded gene name"
+    },
+    {
+      "input": "HER2/neu",
+      "expected": "her2/neu",
+      "description": "slash in name"
+    },
+    {
+      "input": "p53-MDM2",
+      "expected": "p53-mdm2",
+      "description": "hyphenated"
+    },
+    {
+      "input": "NF-κB",
+      "expected": "nf-kappab",
+      "description": "greek in complex name"
+    },
+    {
+      "input": "IL-1β",
+      "expected": "il-1beta",
+      "description": "interleukin with greek"
+    },
+    {
+      "input": "TGF-β1",
+      "expected": "tgf-beta1",
+      "description": "growth factor greek"
+    },
+    {
+      "input": "PD-L1 (CD274)",
+      "expected": "pd-l1 (cd274)",
+      "description": "parenthetical"
+    },
+    {
+      "input": "CRISPR-Cas9",
+      "expected": "crispr-cas9",
+      "description": "hyphenated tech"
+    },
+    {
+      "input": "mTOR/AKT pathway",
+      "expected": "mtor/akt pathway",
+      "description": "slash pathway"
+    },
+    {
+      "input": "12345",
+      "expected": "12345",
+      "description": "pure numbers"
+    },
+    {
+      "input": "gene_123",
+      "expected": "gene_123",
+      "description": "underscore"
+    },
+    {
+      "input": "gene-123-variant",
+      "expected": "gene-123-variant",
+      "description": "multiple hyphens"
+    },
+    {
+      "input": "Hello.World",
+      "expected": "hello.world",
+      "description": "period separator"
+    },
+    {
+      "input": "test@entity",
+      "expected": "test@entity",
+      "description": "at sign"
+    },
+    {
+      "input": "entity#1",
+      "expected": "entity#1",
+      "description": "hash"
+    },
+    {
+      "input": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "expected": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "description": "very long string"
+    },
+    {
+      "input": "α α α α α α α α α α α α α α α α α α α α α α α α α α α α α α α α α α α α α α α α α α α α α α α α α α ",
+      "expected": "alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha",
+      "description": "repeated greek with spaces"
+    },
+    {
+      "input": "Ω",
+      "expected": "omega",
+      "description": "capital omega (should lowercase to omega)"
+    },
+    {
+      "input": "µ",
+      "expected": "mu",
+      "description": "micro sign U+00B5 (NFKD → μ → mu)"
+    }
+  ],
+  "hashing": [
+    {
+      "type": "claim_id",
+      "args": [
+        "brca1",
+        "binds_to",
+        "tp53",
+        "pub123",
+        "literature",
+        1000
+      ],
+      "expected": "bc9104de9307d058a7bfc126ad3ad78dc28e5a08418f9b720972ca29f6cf5ec2",
+      "description": "basic claim id"
+    },
+    {
+      "type": "claim_id",
+      "args": [
+        "brca1",
+        "binds_to",
+        "tp53",
+        "pub123",
+        "literature",
+        2000
+      ],
+      "expected": "d84fd1691f02fa59e7e1e109efd26907f10f0768d713ecbe7002bea7859f97f4",
+      "description": "different timestamp"
+    },
+    {
+      "type": "claim_id",
+      "args": [
+        "tp53",
+        "binds_to",
+        "brca1",
+        "pub123",
+        "literature",
+        1000
+      ],
+      "expected": "1bccfc91313dc16cf97ada0902848776c8f4c94dec094d66fe8b6b5b247837bb",
+      "description": "swapped subject/object"
+    },
+    {
+      "type": "claim_id",
+      "args": [
+        "",
+        "",
+        "",
+        "",
+        "",
+        0
+      ],
+      "expected": "250c676e6ff14141f3aa60356310a573a8466e507082fa28ac0d65404658d0a5",
+      "description": "all empty"
+    },
+    {
+      "type": "claim_id",
+      "args": [
+        "a|b",
+        "c",
+        "d",
+        "e",
+        "f",
+        0
+      ],
+      "expected": "0bd18dcffe14a104b29b9fe78ceb8fd694837d9a40e98493410d7d7462217e41",
+      "description": "pipe in subject"
+    },
+    {
+      "type": "claim_id",
+      "args": [
+        "tnf-alpha",
+        "activates",
+        "nf-kappab",
+        "pmid:12345",
+        "experimental",
+        1706000000000000000
+      ],
+      "expected": "37f2885dfb9b4a07fc313a0259cb1fabead45b7494971c72dfd89ae86345b54f",
+      "description": "realistic bio claim"
+    },
+    {
+      "type": "claim_id",
+      "args": [
+        "brca1",
+        "binds_to",
+        "tp53",
+        "pub456",
+        "literature",
+        1000
+      ],
+      "expected": "35134472086fd4901c99cd2e140c40210a5892f2355b06634bbf505293137e5a",
+      "description": "different source_id"
+    },
+    {
+      "type": "claim_id",
+      "args": [
+        "brca1",
+        "binds_to",
+        "tp53",
+        "pub123",
+        "experimental",
+        1000
+      ],
+      "expected": "023a0f244ede9cea006ea44c4b75587151c5c17ed359c86013b31cfce2db536c",
+      "description": "different source_type"
+    },
+    {
+      "type": "claim_id",
+      "args": [
+        "brca1",
+        "inhibits",
+        "tp53",
+        "pub123",
+        "literature",
+        1000
+      ],
+      "expected": "74d2346f756e8c43006db89089bf876fd2b7fccaac320aefc18b44998b3ffcb4",
+      "description": "different predicate"
+    },
+    {
+      "type": "claim_id",
+      "args": [
+        "αααααααααααααααααααααααααααααααααααααααααααααααααααααααααααααααααααααααααααααααααααααααααααααααααααα",
+        "β",
+        "γ",
+        "δ",
+        "ε",
+        999
+      ],
+      "expected": "9481edd104adc6146826622fb115cf2a9f1361c1455367e717c63fde9ebf70a4",
+      "description": "unicode in all fields"
+    },
+    {
+      "type": "content_id",
+      "args": [
+        "brca1",
+        "binds_to",
+        "tp53"
+      ],
+      "expected": "e33630fb860e6e572b90ebe2a5a56fb42a5f072622651d31b056925a62ec724e",
+      "description": "basic content id"
+    },
+    {
+      "type": "content_id",
+      "args": [
+        "tp53",
+        "binds_to",
+        "brca1"
+      ],
+      "expected": "73b769909b75a028fa190f3615a866d275511d269c144ef865830941c7d245cb",
+      "description": "swapped subject/object content id"
+    },
+    {
+      "type": "content_id",
+      "args": [
+        "",
+        "",
+        ""
+      ],
+      "expected": "565d240f5343e625ae579a4d45a770f1f02c6368b5ed4d06da4fbe6f47c28866",
+      "description": "all empty content id"
+    },
+    {
+      "type": "content_id",
+      "args": [
+        "tnf-alpha",
+        "activates",
+        "nf-kappab"
+      ],
+      "expected": "94e8282634086071d58a65398511dc8a57a33e74b5cd054c24f1532839c9a962",
+      "description": "bio content id"
+    },
+    {
+      "type": "content_id",
+      "args": [
+        "a|b",
+        "c|d",
+        "e|f"
+      ],
+      "expected": "0232358a261ca00b3efe9a48cd72b135f7a407fc755ec104554abe1eb3e591c7",
+      "description": "pipes in content id"
+    },
+    {
+      "type": "content_id",
+      "args": [
+        "gene with spaces",
+        "relates_to",
+        "another gene"
+      ],
+      "expected": "b6d6adabeed6f90daf070177d23aecfaed08a25dde2db2cf934a637908e2ac8f",
+      "description": "spaces in content id"
+    },
+    {
+      "type": "content_id",
+      "args": [
+        "brca1",
+        "binds_to",
+        "tp53"
+      ],
+      "expected": "e33630fb860e6e572b90ebe2a5a56fb42a5f072622651d31b056925a62ec724e",
+      "description": "deterministic content id (same as first)"
+    },
+    {
+      "type": "content_id",
+      "args": [
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+      ],
+      "expected": "373cf6c9ac396dad45ed41001022c443c251a28ff9f1024ed5289725b95c67bd",
+      "description": "long fields content id"
+    },
+    {
+      "type": "content_id",
+      "args": [
+        "κ-casein",
+        "binds_to",
+        "β-lactoglobulin"
+      ],
+      "expected": "b62f5617b674a88ebdcc4043334132651d6a3e5bcdd3befc92dbfe0e34c739d3",
+      "description": "greek in content id"
+    },
+    {
+      "type": "content_id",
+      "args": [
+        "Hello\nWorld",
+        "test",
+        "foo\tbar"
+      ],
+      "expected": "b6b3895d7564abd20228c53cce26d2ae38570062a01f897b1afc9df17aac2507",
+      "description": "control chars in content id"
+    }
+  ],
+  "chain_hash": [
+    {
+      "prev_chain_hash": "genesis",
+      "claim_id": "claim_abc",
+      "expected": "5d98203d6a44b892b8fc29d7558718fbfe59718607426e7ff1655845f6b2ed5c",
+      "description": "genesis first link"
+    },
+    {
+      "prev_chain_hash": "genesis",
+      "claim_id": "",
+      "expected": "6e78dcb83ed8dc1d10117b9b3e9e2d7611a4107c6cb28e8b78e084e24b9ce260",
+      "description": "genesis with empty claim_id"
+    },
+    {
+      "prev_chain_hash": "",
+      "claim_id": "claim_abc",
+      "expected": "0f013f2ea3614cc627e68fe2ae1802d0a54c4bbd8f375914ac1cdd5656494643",
+      "description": "empty prev hash"
+    },
+    {
+      "prev_chain_hash": "",
+      "claim_id": "",
+      "expected": "cbe5cfdf7c2118a9c3d78ef1d684f3afa089201352886449a06a6511cfef74a7",
+      "description": "both empty"
+    },
+    {
+      "prev_chain_hash": "hash_a",
+      "claim_id": "claim_1",
+      "expected": "2b543845f470ae203323d842b0a1159275aef3eb6c84d7ece6c367fea8682405",
+      "description": "basic chain step"
+    },
+    {
+      "prev_chain_hash": "hash_b",
+      "claim_id": "claim_1",
+      "expected": "04f8406dfce6285cb939648268e8abd29b1b184026417805967b90ef9004cb78",
+      "description": "different prev same claim"
+    },
+    {
+      "prev_chain_hash": "hash_a",
+      "claim_id": "claim_2",
+      "expected": "c59705e0cce354d144649f37701bc3629af8d6881e20811e22cd2621195a74c0",
+      "description": "same prev different claim"
+    },
+    {
+      "prev_chain_hash": "genesis",
+      "claim_id": "c1",
+      "expected": "269b9a250f7c5939febde46d54509e4ca40ef083fdd9983e32e4f46cedabc53e",
+      "description": "chain link 1"
+    },
+    {
+      "prev_chain_hash": "269b9a250f7c5939febde46d54509e4ca40ef083fdd9983e32e4f46cedabc53e",
+      "claim_id": "c2",
+      "expected": "068d2aac6586b6eae4111cb9d1fcf695685391ccfaf9dc277f8de1e53ad28742",
+      "description": "chain link 2"
+    },
+    {
+      "prev_chain_hash": "068d2aac6586b6eae4111cb9d1fcf695685391ccfaf9dc277f8de1e53ad28742",
+      "claim_id": "c3",
+      "expected": "cfb853bab6817a7d8bc34a5ab15630f980c3ebb05a187ea86dcb9dd6a81a6421",
+      "description": "chain link 3"
+    },
+    {
+      "prev_chain_hash": "αβγ",
+      "claim_id": "δεζ",
+      "expected": "59f06cd6d5cbc48fb4d9251e31b1bb2e0a4f8c91bcc39f9fca7086c21c675b03",
+      "description": "greek in chain hash"
+    },
+    {
+      "prev_chain_hash": "prev|with|pipes",
+      "claim_id": "claim|pipes",
+      "expected": "6d099e18c5758f6d97e0dd4546220e124c42ca1165ca9de318bcf533223690f4",
+      "description": "pipes in chain hash args"
+    },
+    {
+      "prev_chain_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "claim_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "expected": "dfb484fa87938837327c83b4a7e3483a33a3dcd868655a1495e63b0886ae0b76",
+      "description": "long hex-like strings"
+    }
+  ],
+  "confidence": [
+    {
+      "source_type": "computation",
+      "expected": 0.5,
+      "description": "weight for computation"
+    },
+    {
+      "source_type": "computational_alphafold",
+      "expected": 0.6,
+      "description": "weight for computational_alphafold"
+    },
+    {
+      "source_type": "computational_docking",
+      "expected": 0.4,
+      "description": "weight for computational_docking"
+    },
+    {
+      "source_type": "computational_md",
+      "expected": 0.5,
+      "description": "weight for computational_md"
+    },
+    {
+      "source_type": "computational_ml_prediction",
+      "expected": 0.35,
+      "description": "weight for computational_ml_prediction"
+    },
+    {
+      "source_type": "crystallography",
+      "expected": 0.95,
+      "description": "weight for crystallography"
+    },
+    {
+      "source_type": "database_import",
+      "expected": 0.7,
+      "description": "weight for database_import"
+    },
+    {
+      "source_type": "docking",
+      "expected": 0.4,
+      "description": "weight for docking"
+    },
+    {
+      "source_type": "document_extraction",
+      "expected": 0.6,
+      "description": "weight for document_extraction"
+    },
+    {
+      "source_type": "experimental",
+      "expected": 0.85,
+      "description": "weight for experimental"
+    },
+    {
+      "source_type": "experimental_assay",
+      "expected": 0.85,
+      "description": "weight for experimental_assay"
+    },
+    {
+      "source_type": "experimental_cryo_em",
+      "expected": 0.95,
+      "description": "weight for experimental_cryo_em"
+    },
+    {
+      "source_type": "experimental_crystallography",
+      "expected": 1.0,
+      "description": "weight for experimental_crystallography"
+    },
+    {
+      "source_type": "experimental_mass_spec",
+      "expected": 0.85,
+      "description": "weight for experimental_mass_spec"
+    },
+    {
+      "source_type": "experimental_spr",
+      "expected": 0.9,
+      "description": "weight for experimental_spr"
+    },
+    {
+      "source_type": "expert_annotation",
+      "expected": 0.8,
+      "description": "weight for expert_annotation"
+    },
+    {
+      "source_type": "human_annotation",
+      "expected": 0.9,
+      "description": "weight for human_annotation"
+    },
+    {
+      "source_type": "literature",
+      "expected": 0.65,
+      "description": "weight for literature"
+    },
+    {
+      "source_type": "literature_extraction",
+      "expected": 0.5,
+      "description": "weight for literature_extraction"
+    },
+    {
+      "source_type": "llm_inference",
+      "expected": 0.3,
+      "description": "weight for llm_inference"
+    },
+    {
+      "source_type": "mass_spec",
+      "expected": 0.8,
+      "description": "weight for mass_spec"
+    },
+    {
+      "source_type": "observation",
+      "expected": 0.7,
+      "description": "weight for observation"
+    },
+    {
+      "source_type": "pathway_database",
+      "expected": 0.7,
+      "description": "weight for pathway_database"
+    },
+    {
+      "source_type": "totally_unknown_type",
+      "expected": 0.5,
+      "description": "unknown type -> default"
+    },
+    {
+      "source_type": "",
+      "expected": 0.5,
+      "description": "empty string -> default"
+    },
+    {
+      "source_type": "OBSERVATION",
+      "expected": 0.5,
+      "description": "uppercase (not in map) -> default"
+    }
+  ]
+}

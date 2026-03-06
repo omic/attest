@@ -1,0 +1,895 @@
+"""Shared dataclasses defining the contract between infrastructure and intelligence."""
+
+from __future__ import annotations
+
+import enum
+import json
+from dataclasses import dataclass, field
+
+
+class ClaimStatus(enum.Enum):
+    ACTIVE = "active"
+    ARCHIVED = "archived"
+    TOMBSTONED = "tombstoned"
+    PROVENANCE_DEGRADED = "provenance_degraded"
+
+
+@dataclass
+class EntityRef:
+    id: str
+    entity_type: str
+    display_name: str = ""
+    external_ids: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class PredicateRef:
+    id: str
+    predicate_type: str
+
+
+@dataclass
+class Provenance:
+    source_type: str
+    source_id: str
+    method: str | None = None
+    chain: list[str] = field(default_factory=list)
+    model_version: str | None = None
+    organization: str | None = None
+
+
+@dataclass
+class Payload:
+    schema_ref: str
+    data: dict
+
+
+@dataclass
+class Claim:
+    claim_id: str
+    content_id: str
+    subject: EntityRef
+    predicate: PredicateRef
+    object: EntityRef
+    confidence: float
+    provenance: Provenance
+    embedding: list[float] | None = None
+    payload: Payload | None = None
+    timestamp: int = 0
+    status: ClaimStatus = ClaimStatus.ACTIVE
+
+
+@dataclass
+class ClaimInput:
+    """Input structure for ingesting a new claim."""
+    subject: tuple[str, str]  # (id, entity_type)
+    predicate: tuple[str, str]  # (id, predicate_type)
+    object: tuple[str, str]  # (id, entity_type)
+    provenance: dict[str, object]
+    confidence: float | None = None
+    embedding: list[float] | None = None
+    payload: dict | None = None
+    timestamp: int | None = None
+    external_ids: dict[str, dict[str, str]] | None = None
+
+
+@dataclass
+class EntitySummary:
+    id: str
+    name: str
+    entity_type: str
+    external_ids: dict[str, str] = field(default_factory=dict)
+    claim_count: int = 0
+
+
+@dataclass
+class Relationship:
+    predicate: str
+    target: EntitySummary
+    confidence: float
+    n_independent_sources: int = 1
+    source_types: list[str] = field(default_factory=list)
+    latest_claim_timestamp: int = 0
+    payload: dict | None = None
+    is_symmetric: bool = False
+
+
+@dataclass
+class Contradiction:
+    claim_a: str
+    claim_b: str
+    description: str = ""
+    evidence_a: int = 0
+    evidence_b: int = 0
+    status: str = "unresolved"  # "unresolved", "a_preferred", "b_preferred"
+
+
+@dataclass
+class QuantitativeClaim:
+    predicate: str
+    target: str
+    value: float
+    unit: str
+    metric: str = ""
+    source_type: str = ""
+    confidence: float = 0.0
+
+
+@dataclass
+class ContextFrame:
+    focal_entity: EntitySummary
+    direct_relationships: list[Relationship] = field(default_factory=list)
+    quantitative_data: list[QuantitativeClaim] = field(default_factory=list)
+    contradictions: list[Contradiction] = field(default_factory=list)
+    knowledge_gaps: list[str] = field(default_factory=list)
+    narrative: str = ""
+    provenance_summary: dict[str, float] = field(default_factory=dict)
+    claim_count: int = 0
+    confidence_range: tuple[float, float] = (0.0, 0.0)
+    topic_membership: list[str] = field(default_factory=list)
+    open_inquiries: list[str] = field(default_factory=list)
+
+
+@dataclass
+class BatchResult:
+    ingested: int = 0
+    duplicates: int = 0
+    errors: list[str] = field(default_factory=list)
+
+
+# --- Knowledge Topology types ---
+
+
+@dataclass
+class Community:
+    id: str
+    members: list[str]
+    resolution: float
+    density: float
+    dominant_entity_types: dict[str, int] = field(default_factory=dict)
+    label: str = ""
+
+
+@dataclass
+class TopicNode:
+    id: str
+    label: str
+    level: int
+    entities: list[str] = field(default_factory=list)
+    parent_ids: list[str] = field(default_factory=list)
+    child_ids: list[str] = field(default_factory=list)
+    density: float = 0.0
+
+
+@dataclass
+class DensityMapEntry:
+    topic_id: str
+    topic_label: str
+    level: int
+    internal_density: float
+    entity_count: int
+    claim_count: int = 0
+
+
+@dataclass
+class CrossDomainBridge:
+    entity_id: str
+    entity_type: str
+    communities: list[str]
+    bridge_score: float
+    explanation: str = ""
+
+
+@dataclass
+class QueryProfile:
+    focal_entity: str
+    total_candidates: int
+    after_scoring: int
+    after_budget: int
+    elapsed_ms: float
+    depth: int
+    filters_applied: dict = field(default_factory=dict)
+
+
+@dataclass
+class RetractResult:
+    source_id: str
+    reason: str
+    retracted_count: int
+    claim_ids: list[str]
+
+
+@dataclass
+class QualityReport:
+    total_claims: int = 0
+    total_entities: int = 0
+    entity_type_counts: dict[str, int] = field(default_factory=dict)
+    single_source_entity_count: int = 0
+    stale_entity_count: int = 0
+    gap_count: int = 0
+    confidence_alert_count: int = 0
+    avg_claims_per_entity: float = 0.0
+    source_type_distribution: dict[str, int] = field(default_factory=dict)
+    predicate_distribution: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class RelationshipPattern:
+    """A (subject_type, predicate, object_type) pattern with occurrence count."""
+
+    subject_type: str
+    predicate: str
+    object_type: str
+    count: int = 0
+
+
+@dataclass
+class SchemaDescriptor:
+    """Metadata descriptor of the knowledge graph — like Neo4j's db.schema().
+
+    Shows what entity types exist, what predicates connect them,
+    relationship patterns, source types, and counts.
+    """
+
+    entity_types: dict[str, int] = field(default_factory=dict)        # type → count
+    predicate_types: dict[str, int] = field(default_factory=dict)     # predicate → count
+    source_types: dict[str, int] = field(default_factory=dict)        # source_type → count
+    relationship_patterns: list[RelationshipPattern] = field(default_factory=list)
+    total_claims: int = 0
+    total_entities: int = 0
+    registered_vocabularies: list[str] = field(default_factory=list)
+
+    def __str__(self) -> str:
+        lines = [f"Schema: {self.total_entities} entities, {self.total_claims} claims"]
+        if self.entity_types:
+            lines.append("Entity types:")
+            for t, c in sorted(self.entity_types.items(), key=lambda x: -x[1]):
+                lines.append(f"  {t}: {c}")
+        if self.relationship_patterns:
+            lines.append("Relationship patterns:")
+            for rp in sorted(self.relationship_patterns, key=lambda x: -x.count)[:20]:
+                lines.append(f"  ({rp.subject_type})-[{rp.predicate}]->({rp.object_type}): {rp.count}")
+        if self.source_types:
+            lines.append("Source types:")
+            for s, c in sorted(self.source_types.items(), key=lambda x: -x[1]):
+                lines.append(f"  {s}: {c}")
+        return "\n".join(lines)
+
+
+@dataclass
+class CascadeResult:
+    source_retract: RetractResult
+    degraded_claim_ids: list[str] = field(default_factory=list)
+    degraded_count: int = 0
+
+
+@dataclass
+class DownstreamNode:
+    claim_id: str
+    dependents: list["DownstreamNode"] = field(default_factory=list)
+
+
+@dataclass
+class KnowledgeHealth:
+    """Quantified health metrics for the knowledge graph."""
+    total_claims: int = 0
+    total_entities: int = 0
+    avg_confidence: float = 0.0
+    multi_source_ratio: float = 0.0       # % of entities with >1 source
+    corroboration_ratio: float = 0.0      # % of content_ids with >1 claim
+    avg_provenance_depth: float = 0.0     # avg chain length
+    source_diversity: int = 0             # unique source_type count
+    freshness_score: float = 0.0          # 0-1, based on recency of claims
+    confidence_trend: float = 0.0         # positive = improving over time
+    knowledge_density: float = 0.0        # claims_per_entity
+    health_score: float = 0.0             # 0-100 composite
+
+
+@dataclass
+class PathStep:
+    """A single hop in a path between two entities."""
+    entity_id: str
+    entity_type: str
+    predicate: str
+    confidence: float
+    source_types: list[str] = field(default_factory=list)
+
+
+@dataclass
+class PathResult:
+    """A complete path between two entities with aggregated metadata."""
+    steps: list[PathStep] = field(default_factory=list)
+    total_confidence: float = 0.0
+    length: int = 0
+
+
+# --- New API types (Stage 7) ---
+
+
+@dataclass
+class ImpactReport:
+    """Impact analysis for a source: what claims depend on it."""
+    source_id: str
+    direct_claims: int = 0
+    downstream_claims: int = 0
+    affected_entities: list[str] = field(default_factory=list)
+    claim_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
+class BlindspotMap:
+    """Knowledge gaps and single-source vulnerabilities."""
+    single_source_entities: list[str] = field(default_factory=list)
+    knowledge_gaps: list[dict] = field(default_factory=list)
+    low_confidence_areas: list[dict] = field(default_factory=list)
+
+
+@dataclass
+class ConsensusReport:
+    """Consensus analysis for a topic: agreement across sources."""
+    topic: str = ""
+    total_claims: int = 0
+    unique_sources: int = 0
+    avg_confidence: float = 0.0
+    agreement_ratio: float = 0.0
+    claims_by_source: dict[str, int] = field(default_factory=dict)
+    corroborated_content_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
+class AuditTrail:
+    """Full provenance audit for a claim."""
+    claim_id: str = ""
+    content_id: str = ""
+    corroborating_claims: list[str] = field(default_factory=list)
+    provenance_chain: list[str] = field(default_factory=list)
+    downstream_dependents: int = 0
+    source_type: str = ""
+    source_id: str = ""
+    confidence: float = 0.0
+    timestamp: int = 0
+
+
+@dataclass
+class DriftReport:
+    """Knowledge drift over a time period."""
+    period_days: int = 30
+    new_claims: int = 0
+    new_entities: int = 0
+    retracted_claims: int = 0
+    confidence_delta: float = 0.0
+    new_source_types: list[str] = field(default_factory=list)
+    entity_count_before: int = 0
+    entity_count_after: int = 0
+    claim_count_before: int = 0
+    claim_count_after: int = 0
+
+
+@dataclass
+class HypotheticalReport:
+    """What-if analysis for a hypothetical claim."""
+    would_corroborate: bool = False
+    existing_corroborations: int = 0
+    fills_gap: bool = False
+    content_id: str = ""
+    related_entities: list[str] = field(default_factory=list)
+
+
+# --- Autonomous research types ---
+
+
+@dataclass
+class ResearchQuestion:
+    """A question generated from a knowledge gap or blindspot."""
+    entity_id: str
+    entity_type: str
+    gap_type: str           # "missing_predicate", "single_source", "low_confidence", "manual"
+    question: str
+    predicate_hint: str = ""
+    inquiry_claim_id: str = ""
+
+
+@dataclass
+class ResearchResult:
+    """Outcome of researching a single question."""
+    question: ResearchQuestion
+    claims_ingested: int = 0
+    claims_rejected: int = 0
+    inquiry_resolved: bool = False
+    source: str = ""        # "llm", "search_fn", "slack"
+    raw_response: str = ""
+
+
+@dataclass
+class InvestigationReport:
+    """Summary of a full investigate() cycle."""
+    questions_generated: int = 0
+    questions_researched: int = 0
+    claims_ingested: int = 0
+    inquiries_resolved: int = 0
+    results: list = field(default_factory=list)
+    blindspot_before: int = 0
+    blindspot_after: int = 0
+
+
+@dataclass
+class CloseGapsReport:
+    """Summary of a close_gaps() cycle — hypothesis-driven or blindspot-driven."""
+    hypothesis: str = ""
+    verdict_before: str = ""
+    verdict_after: str = ""
+    confidence_before: float = 0.0
+    confidence_after: float = 0.0
+    gaps_identified: int = 0
+    gaps_researched: int = 0
+    claims_ingested: int = 0
+    investigations: list = field(default_factory=list)
+    results: list = field(default_factory=list)
+    blindspot_before: int = 0
+    blindspot_after: int = 0
+
+
+# --- Knowledge-Intelligence API types ---
+
+
+@dataclass
+class EvidenceChain:
+    """A chain of evidence hops supporting or contradicting a hypothesis."""
+    steps: list[PathStep] = field(default_factory=list)
+    propagated_confidence: float = 0.0
+    direction: str = "supporting"  # "supporting" | "contradicting"
+    summary: str = ""
+
+
+@dataclass
+class ConfidenceGap:
+    """A gap or weakness in the evidence chain."""
+    from_entity: str
+    to_entity: str
+    issue: str  # "missing" | "weak"
+    current_confidence: float = 0.0
+    explanation: str = ""
+
+
+@dataclass
+class HypothesisVerdict:
+    """Result of evaluating a natural-language hypothesis against the graph."""
+    hypothesis: str
+    verdict: str = "unsupported"  # "supported" | "contradicted" | "partial" | "unsupported" | "insufficient_data"
+    verdict_confidence: float = 0.0
+    supporting_chains: list[EvidenceChain] = field(default_factory=list)
+    contradicting_chains: list[EvidenceChain] = field(default_factory=list)
+    confidence_gaps: list[ConfidenceGap] = field(default_factory=list)
+    entities_found: list[str] = field(default_factory=list)
+    entities_missing: list[str] = field(default_factory=list)
+    suggested_next_steps: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ConfidenceChange:
+    """A confidence shift for a specific relationship over time."""
+    content_id: str
+    predicate: str
+    target_entity: str
+    confidence_before: float
+    confidence_after: float
+    delta: float
+    reason: str = ""  # "new_corroboration" | "source_retracted"
+
+
+@dataclass
+class EvolutionReport:
+    """Entity-specific knowledge evolution over time."""
+    entity_id: str
+    since_timestamp: int = 0
+    new_connections: list[str] = field(default_factory=list)
+    new_claims: int = 0
+    retracted_claims: int = 0
+    confidence_changes: list[ConfidenceChange] = field(default_factory=list)
+    new_corroborations: int = 0
+    source_types_before: list[str] = field(default_factory=list)
+    source_types_after: list[str] = field(default_factory=list)
+    new_source_types: list[str] = field(default_factory=list)
+    trajectory: str = "stable"  # "growing" | "stable" | "declining"
+    total_claims_before: int = 0
+    total_claims_after: int = 0
+
+
+@dataclass
+class Investigation:
+    """A prioritized investigation recommendation."""
+    entity_id: str
+    entity_type: str
+    reason: str
+    signal_type: str  # "single_source" | "confidence_gap" | "missing_predicate" | "predicted_link" | "stale"
+    priority_score: float = 0.0
+    affected_downstream: int = 0
+    suggested_action: str = ""
+
+
+@dataclass
+class ReasoningHop:
+    """A single hop in a reasoning chain with full evidence."""
+    from_entity: str
+    to_entity: str
+    predicate: str
+    confidence: float
+    source_types: list[str] = field(default_factory=list)
+    source_ids: list[str] = field(default_factory=list)
+    evidence_text: str = ""
+    has_contradiction: bool = False
+    contradiction_predicate: str = ""
+
+
+@dataclass
+class SourceOverlap:
+    """Source overlap between two hops in a reasoning chain."""
+    hop_a_index: int
+    hop_b_index: int
+    shared_sources: list[str] = field(default_factory=list)
+    discount_factor: float = 1.0
+
+
+@dataclass
+class ReasoningChain:
+    """A reasoning chain with source-overlap-discounted confidence."""
+    hops: list[ReasoningHop] = field(default_factory=list)
+    raw_confidence: float = 0.0
+    source_overlaps: list[SourceOverlap] = field(default_factory=list)
+    chain_confidence: float = 0.0
+    length: int = 0
+    reliability_score: float = 0.0
+
+
+# --- Discovery engine types ---
+
+
+@dataclass
+class Discovery:
+    """A proactive hypothesis generated from graph structure."""
+    hypothesis: str                # "BRCA1 may inhibit apoptosis via p53"
+    evidence_summary: str          # "3 bridging paths through p53..."
+    discovery_type: str            # "bridge_prediction" | "cross_domain" | "chain_completion"
+    confidence: float              # 0-1
+    novelty_score: float           # 0-1
+    entities: list[str]
+    supporting_paths: list[dict] = field(default_factory=list)
+    suggested_action: str = ""     # "Search for evidence of X inhibits Y"
+    predicted_predicate: str = ""  # "inhibits"
+    entity_types: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class Analogy:
+    """A structural analogy: A:B :: C:D predicted from embeddings."""
+    entity_a: str                  # Source A
+    entity_b: str                  # Source B
+    entity_c: str                  # Analog of A
+    entity_d: str                  # Analog of B (predicted)
+    predicted_predicate: str
+    score: float
+    explanation: str
+    source_predicates: list[str] = field(default_factory=list)
+    entity_types: dict[str, str] = field(default_factory=dict)
+
+
+# --- Crown jewels types ---
+
+
+@dataclass
+class BeliefChange:
+    """A single belief that changed between two time periods."""
+    content_id: str
+    subject: str
+    predicate: str
+    object: str
+    change_type: str       # "new" | "strengthened" | "weakened" | "contradicted"
+    claims_before: int
+    claims_after: int
+    confidence_before: float
+    confidence_after: float
+    new_sources: list[str] = field(default_factory=list)
+
+
+@dataclass
+class KnowledgeDiff:
+    """Knowledge diff between two time periods — like git diff for knowledge."""
+    since: int
+    until: int
+    new_beliefs: list[BeliefChange] = field(default_factory=list)
+    strengthened: list[BeliefChange] = field(default_factory=list)
+    weakened: list[BeliefChange] = field(default_factory=list)
+    new_contradictions: list[BeliefChange] = field(default_factory=list)
+    new_entities: list[str] = field(default_factory=list)
+    new_sources: list[str] = field(default_factory=list)
+    total_new_claims: int = 0
+    total_retracted: int = 0
+    net_confidence: float = 0.0
+    summary: str = ""
+
+
+@dataclass
+class ContradictionSide:
+    """One side of a contradiction with evidence metrics."""
+    predicate: str
+    claim_count: int
+    source_count: int
+    source_types: list[str] = field(default_factory=list)
+    avg_confidence: float = 0.0
+    corroboration_count: int = 0
+    newest_timestamp: int = 0
+    evidence_weight: float = 0.0
+
+
+@dataclass
+class ContradictionAnalysis:
+    """Analysis of a single contradiction between opposing predicates."""
+    subject: str
+    object: str
+    side_a: ContradictionSide = field(default_factory=lambda: ContradictionSide("", 0, 0))
+    side_b: ContradictionSide = field(default_factory=lambda: ContradictionSide("", 0, 0))
+    winner: str = "ambiguous"     # "side_a" | "side_b" | "ambiguous"
+    margin: float = 0.0
+    resolution: str = "unresolved"  # "a_preferred" | "b_preferred" | "unresolved"
+    explanation: str = ""
+
+
+@dataclass
+class ContradictionReport:
+    """Report on all contradictions found and resolved."""
+    total_found: int = 0
+    resolved: int = 0
+    ambiguous: int = 0
+    analyses: list[ContradictionAnalysis] = field(default_factory=list)
+    claims_added: int = 0
+
+
+@dataclass
+class ConnectionLoss:
+    """A pair of entities that lose connectivity in a simulation."""
+    entity_a: str
+    entity_b: str
+    lost_predicates: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ConfidenceShift:
+    """A confidence change for a content_id in a simulation."""
+    content_id: str
+    subject: str
+    predicate: str
+    object: str
+    confidence_before: float
+    confidence_after: float
+
+
+@dataclass
+class SimulationReport:
+    """Result of a counterfactual simulation — what-if analysis."""
+    scenario: str = ""
+    claims_affected: int = 0
+    claims_removed: int = 0
+    claims_degraded: int = 0
+    entities_affected: list[str] = field(default_factory=list)
+    entities_now_orphaned: int = 0
+    entities_now_single_source: int = 0
+    connection_losses: list[ConnectionLoss] = field(default_factory=list)
+    confidence_shifts: list[ConfidenceShift] = field(default_factory=list)
+    new_contradictions: list[str] = field(default_factory=list)
+    new_corroborations: int = 0
+    gaps_closed: int = 0
+    risk_score: float = 0.0
+    risk_level: str = "low"
+    summary: str = ""
+
+
+@dataclass
+class Citation:
+    """A cited claim with provenance metadata."""
+    claim_id: str
+    subject: str
+    predicate: str
+    object: str
+    confidence: float = 0.0
+    source_id: str = ""
+    source_type: str = ""
+    corroboration_count: int = 0
+
+
+@dataclass
+class AskResult:
+    """Structured answer from db.ask() with citations, contradictions, and gaps.
+
+    Dict-compatible for backward compatibility — supports r["answer"], r.get("key"), etc.
+    """
+    answer: str | None = None
+    citations: list[Citation] = field(default_factory=list)
+    contradictions: list[dict] = field(default_factory=list)
+    gaps: list[str] = field(default_factory=list)
+    entities: list = field(default_factory=list)
+    evidence: str = ""
+    meta: dict = field(default_factory=dict)
+
+    # Dict-like backward compatibility
+    def __getitem__(self, key: str):
+        return getattr(self, key)
+
+    def get(self, key: str, default=None):
+        return getattr(self, key, default)
+
+    def keys(self):
+        return ("answer", "citations", "contradictions", "gaps", "entities", "evidence", "meta")
+
+
+@dataclass
+class BriefSection:
+    """A section of a knowledge brief covering a cluster of entities."""
+    title: str
+    entities: list[str] = field(default_factory=list)
+    key_findings: list[str] = field(default_factory=list)
+    citations: list[Citation] = field(default_factory=list)
+    contradictions: list[str] = field(default_factory=list)
+    gaps: list[str] = field(default_factory=list)
+    avg_confidence: float = 0.0
+
+
+@dataclass
+class KnowledgeBrief:
+    """Structured research brief compiled from the knowledge graph."""
+    topic: str = ""
+    sections: list[BriefSection] = field(default_factory=list)
+    executive_summary: str = ""
+    total_entities: int = 0
+    total_claims_cited: int = 0
+    total_sources: int = 0
+    avg_confidence: float = 0.0
+    total_contradictions: int = 0
+    total_gaps: int = 0
+    strongest_findings: list[str] = field(default_factory=list)
+    weakest_areas: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ExplanationStep:
+    """A single hop in an explain_why chain."""
+    from_entity: str
+    to_entity: str
+    predicate: str
+    confidence: float
+    source_summary: str = ""
+    evidence_text: str = ""
+    has_contradiction: bool = False
+
+
+@dataclass
+class Explanation:
+    """Full provenance-traced explanation of how two entities are connected."""
+    entity_a: str
+    entity_b: str
+    connected: bool = False
+    steps: list[ExplanationStep] = field(default_factory=list)
+    chain_confidence: float = 0.0
+    narrative: str = ""
+    alternative_paths: int = 0
+    source_count: int = 0
+
+
+@dataclass
+class ForecastConnection:
+    """A predicted future connection for an entity."""
+    target_entity: str
+    target_type: str
+    predicted_predicate: str
+    score: float = 0.0
+    reason: str = ""
+    evidence_entities: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Forecast:
+    """Predicted next connections for an entity based on graph structure."""
+    entity_id: str
+    predictions: list[ForecastConnection] = field(default_factory=list)
+    growth_rate: float = 0.0       # connections per month
+    trajectory: str = "stable"     # "growing" | "stable" | "declining"
+    total_current_connections: int = 0
+
+
+@dataclass
+class MergeConflict:
+    """A belief where two databases disagree."""
+    content_id: str
+    subject: str
+    predicate: str
+    object: str
+    self_confidence: float
+    other_confidence: float
+    self_sources: int
+    other_sources: int
+
+
+@dataclass
+class MergeReport:
+    """Comparison of two knowledge bases — what each knows that the other doesn't."""
+    self_unique_beliefs: int = 0
+    other_unique_beliefs: int = 0
+    shared_beliefs: int = 0
+    conflicts: list[MergeConflict] = field(default_factory=list)
+    self_unique_entities: list[str] = field(default_factory=list)
+    other_unique_entities: list[str] = field(default_factory=list)
+    shared_entities: list[str] = field(default_factory=list)
+    self_total_claims: int = 0
+    other_total_claims: int = 0
+    summary: str = ""
+
+
+# --- Dict-to-dataclass converters for Rust PyO3 layer ---
+
+
+def claim_from_dict(d: dict) -> Claim:
+    """Convert a dict from the Rust store into a Claim dataclass."""
+    subj = d["subject"]
+    subject = EntityRef(
+        id=subj["id"],
+        entity_type=subj["entity_type"],
+        display_name=subj.get("display_name", ""),
+        external_ids=subj.get("external_ids", {}),
+    )
+
+    pred = d["predicate"]
+    predicate = PredicateRef(id=pred["id"], predicate_type=pred["predicate_type"])
+
+    obj = d["object"]
+    object_ = EntityRef(
+        id=obj["id"],
+        entity_type=obj["entity_type"],
+        display_name=obj.get("display_name", ""),
+        external_ids=obj.get("external_ids", {}),
+    )
+
+    prov = d["provenance"]
+    provenance = Provenance(
+        source_type=prov["source_type"],
+        source_id=prov["source_id"],
+        method=prov.get("method"),
+        chain=prov.get("chain", []),
+        model_version=prov.get("model_version"),
+        organization=prov.get("organization"),
+    )
+
+    payload = None
+    if d.get("payload") is not None:
+        pl = d["payload"]
+        if "schema_ref" in pl:
+            data = json.loads(pl["data_json"]) if "data_json" in pl else pl.get("data", {})
+            payload = Payload(schema_ref=pl["schema_ref"], data=data)
+
+    status_str = d.get("status", "active")
+    try:
+        status = ClaimStatus(status_str)
+    except ValueError:
+        status = ClaimStatus.ACTIVE
+
+    return Claim(
+        claim_id=d["claim_id"],
+        content_id=d["content_id"],
+        subject=subject,
+        predicate=predicate,
+        object=object_,
+        confidence=d["confidence"],
+        provenance=provenance,
+        payload=payload,
+        timestamp=d["timestamp"],
+        status=status,
+    )
+
+
+def entity_summary_from_dict(d: dict) -> EntitySummary:
+    """Convert a dict from the Rust store into an EntitySummary dataclass."""
+    return EntitySummary(
+        id=d["id"],
+        name=d["name"],
+        entity_type=d["entity_type"],
+        external_ids=d.get("external_ids", {}),
+        claim_count=d.get("claim_count", 0),
+    )
