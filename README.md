@@ -89,7 +89,6 @@ See `docs/` for full architecture and design documentation:
 - `docs/02_architecture.md` -- Full technical architecture
 - `docs/06_api_spec.md` -- API contract and validation rules
 - `docs/07_design_decisions.md` -- Critical decisions with rationale
-- `docs/06_api_spec.md` -- API contract and validation rules
 
 ## Running Tests
 
