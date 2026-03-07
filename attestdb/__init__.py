@@ -91,9 +91,18 @@ _ENTERPRISE_IMPORTS: dict[str, tuple[str, str]] = {
     "ConnectorResult": ("attestdb.connectors.base", "ConnectorResult"),
     # Vocabularies (closed source)
     "register_bio_vocabulary": ("attestdb.intelligence.bio_vocabulary", "register_bio_vocabulary"),
-    "register_devops_vocabulary": ("attestdb.intelligence.devops_vocabulary", "register_devops_vocabulary"),
-    "register_ml_vocabulary": ("attestdb.intelligence.ml_vocabulary", "register_ml_vocabulary"),
-    "register_ai_tools_vocabulary": ("attestdb.intelligence.ai_tools_vocabulary", "register_ai_tools_vocabulary"),
+    "register_devops_vocabulary": (
+        "attestdb.intelligence.devops_vocabulary",
+        "register_devops_vocabulary",
+    ),
+    "register_ml_vocabulary": (
+        "attestdb.intelligence.ml_vocabulary",
+        "register_ml_vocabulary",
+    ),
+    "register_ai_tools_vocabulary": (
+        "attestdb.intelligence.ai_tools_vocabulary",
+        "register_ai_tools_vocabulary",
+    ),
     # Enterprise service layer
     "Researcher": ("attestdb_enterprise.researcher", "Researcher"),
     "Client": ("attestdb_enterprise.client", "Client"),
