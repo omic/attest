@@ -7,7 +7,22 @@ import json
 import logging
 import os
 import shutil
+from typing import TYPE_CHECKING
 
+if TYPE_CHECKING:
+    from attestdb.connectors.base import Connector
+    from attestdb.core.types import (
+        AuditTrail,
+        BlindspotMap,
+        ConsensusReport,
+        DriftReport,
+        HypotheticalReport,
+        ImpactReport,
+        InvestigationReport,
+        ResearchResult,
+    )
+
+from attestdb.core.hashing import compute_chain_hash, compute_content_id
 from attestdb.core.normalization import normalize_entity_id
 from attestdb.core.types import (
     Analogy,
@@ -47,7 +62,6 @@ from attestdb.core.types import (
     MergeConflict,
     MergeReport,
     PathResult,
-    PathStep,
     QualityReport,
     QueryProfile,
     ReasoningChain,
@@ -61,7 +75,6 @@ from attestdb.core.types import (
     claim_from_dict,
     entity_summary_from_dict,
 )
-from attestdb.core.hashing import compute_chain_hash, compute_content_id
 from attestdb.infrastructure.embedding_index import EmbeddingIndex
 from attestdb.infrastructure.ingestion import IngestionPipeline
 from attestdb.infrastructure.query_engine import QueryEngine
@@ -457,7 +470,10 @@ class AttestDB:
             try:
                 from attestdb_enterprise.narrative import generate_llm_narrative
             except ImportError:
-                raise ImportError("LLM narrative requires attestdb-enterprise: pip install attestdb-enterprise")
+                raise ImportError(
+                    "LLM narrative requires attestdb-enterprise: "
+                    "pip install attestdb-enterprise"
+                )
             frame.narrative = generate_llm_narrative(
                 frame,
                 model=self._curator_model,
@@ -547,7 +563,10 @@ class AttestDB:
         offset: int = 0,
         limit: int | None = None,
     ) -> list[EntitySummary]:
-        entities = [entity_summary_from_dict(d) for d in self._store.list_entities(entity_type, min_claims)]
+        entities = [
+            entity_summary_from_dict(d)
+            for d in self._store.list_entities(entity_type, min_claims)
+        ]
         if offset:
             entities = entities[offset:]
         if limit is not None:
@@ -671,7 +690,6 @@ class AttestDB:
             return [list(entity_ids)] if entity_ids else []
 
         adj = self.get_adjacency_list()
-        id_set = set(entity_ids)
 
         # Build neighbor sets for each candidate (from full graph adjacency)
         neighbors: dict[str, set[str]] = {}
@@ -1101,7 +1119,12 @@ class AttestDB:
                     continue
                 seen.add(triple)
                 src_info = f", from: {', '.join(rel.source_types)}" if rel.source_types else ""
-                ann = f"[conf={rel.confidence:.2f}, {rel.n_independent_sources} source{'s' if rel.n_independent_sources != 1 else ''}{src_info}]"
+                n_src = rel.n_independent_sources
+                s_sfx = "s" if n_src != 1 else ""
+                ann = (
+                    f"[conf={rel.confidence:.2f}, "
+                    f"{n_src} source{s_sfx}{src_info}]"
+                )
                 lines.append(f"- {triple} {ann}")
 
                 # Evidence text from payload
@@ -1118,12 +1141,21 @@ class AttestDB:
                         h2_triple = f"{target} → {hop2.predicate} → {h2_target}"
                         if h2_triple not in seen:
                             seen.add(h2_triple)
-                            h2_ann = f"[conf={hop2.confidence:.2f}, {hop2.n_independent_sources} source{'s' if hop2.n_independent_sources != 1 else ''}]"
+                            h2_n = hop2.n_independent_sources
+                            h2_s = "s" if h2_n != 1 else ""
+                            h2_ann = (
+                                f"[conf={hop2.confidence:.2f}, "
+                                f"{h2_n} source{h2_s}]"
+                            )
                             lines.append(f"  [2-hop] {h2_triple} {h2_ann}")
 
             # Surface contradictions
             if contradictions:
-                lines.append(f"  ⚠ {len(contradictions)} contradiction{'s' if len(contradictions) != 1 else ''} detected")
+                c_sfx = "s" if len(contradictions) != 1 else ""
+                lines.append(
+                    f"  ⚠ {len(contradictions)} "
+                    f"contradiction{c_sfx} detected"
+                )
                 for c in contradictions[:3]:
                     if c.description:
                         lines.append(f"    - {c.description}")
@@ -1265,7 +1297,13 @@ class AttestDB:
             predicate=("inquiry", "inquiry"),
             object=object,
             provenance={"source_type": "human_annotation", "source_id": "inquiry"},
-            payload={"schema": "", "data": {"question": question, "predicate_hint": predicate_hint}},
+            payload={
+                "schema": "",
+                "data": {
+                    "question": question,
+                    "predicate_hint": predicate_hint,
+                },
+            },
         )
         self._fire("inquiry_created", claim_id=claim_id, question=question)
         return claim_id
@@ -1386,7 +1424,10 @@ class AttestDB:
         try:
             from attestdb_enterprise.topology import KnowledgeTopology
         except ImportError:
-            raise ImportError("Knowledge topology requires attestdb-enterprise: pip install attestdb-enterprise")
+            raise ImportError(
+                "Knowledge topology requires attestdb-enterprise: "
+                "pip install attestdb-enterprise"
+            )
 
         adj = self.get_adjacency_list()
         entity_types = {}
@@ -1699,7 +1740,10 @@ class AttestDB:
             try:
                 from attestdb_enterprise.researcher import Researcher
             except ImportError:
-                raise ImportError("Researcher requires attestdb-enterprise: pip install attestdb-enterprise")
+                raise ImportError(
+                    "Researcher requires attestdb-enterprise: "
+                    "pip install attestdb-enterprise"
+                )
             self._researcher = Researcher(
                 self, model=self._curator_model,
                 api_key=self._curator_api_key, env_path=self._curator_env_path,
@@ -1841,7 +1885,10 @@ class AttestDB:
             engine = self._get_insight_engine()
             alerts = engine.find_confidence_alerts(min_claims=3)
             if alerts:
-                self._fire("insight_alerts", alerts=alerts, trigger="sync", connector=connector_name)
+                self._fire(
+                    "insight_alerts", alerts=alerts,
+                    trigger="sync", connector=connector_name,
+                )
         except Exception as e:
             logger.warning("Post-sync insight check failed: %s", e)
 
@@ -2321,6 +2368,7 @@ class AttestDB:
     def drift(self, days: int = 30) -> "DriftReport":
         """Measure knowledge drift over the given time period."""
         import time
+
         from attestdb.core.types import DriftReport
 
         now_ns = int(time.time() * 1_000_000_000)
@@ -2341,7 +2389,11 @@ class AttestDB:
 
         new_entities = entities_after - entities_before
 
-        retracted = sum(1 for c in all_claims if c.status == ClaimStatus.TOMBSTONED and c.timestamp > cutoff_ns)
+        retracted = sum(
+            1 for c in all_claims
+            if c.status == ClaimStatus.TOMBSTONED
+            and c.timestamp > cutoff_ns
+        )
 
         conf_before = sum(c.confidence for c in before) / len(before) if before else 0.0
         conf_after = sum(c.confidence for c in all_claims) / len(all_claims) if all_claims else 0.0
@@ -2517,7 +2569,11 @@ class AttestDB:
                 # Determine target entity from the first claim
                 fc = after_claims[0]
                 target = fc.object.id if fc.subject.id == eid else fc.subject.id
-                reason = "new_corroboration" if len(after_claims) > len(before_claims) else "source_retracted"
+                reason = (
+                    "new_corroboration"
+                    if len(after_claims) > len(before_claims)
+                    else "source_retracted"
+                )
                 confidence_changes.append(ConfidenceChange(
                     content_id=cid,
                     predicate=fc.predicate.id,
@@ -2668,7 +2724,11 @@ class AttestDB:
             # Reliability score
             total_sources = len({sid for h in hops for sid in h.source_ids})
             source_diversity = total_sources / (len(hops) * 2) if hops else 0.0
-            contradiction_ratio = sum(1 for h in hops if h.has_contradiction) / len(hops) if hops else 0.0
+            contradiction_ratio = (
+                (sum(1 for h in hops if h.has_contradiction)
+                 / len(hops))
+                if hops else 0.0
+            )
             reliability = 0.6 * chain_conf + 0.3 * source_diversity - 0.1 * contradiction_ratio
             reliability = max(0.0, min(1.0, reliability))
 
@@ -2706,7 +2766,8 @@ class AttestDB:
                 if alert.entity_id in seen_entities:
                     continue
                 seen_entities.add(alert.entity_id)
-                signal = alert.alert_type.value  # "single_source", "stale_evidence", "mixed_source_quality"
+                # "single_source", "stale_evidence", "mixed_source_quality"
+                signal = alert.alert_type.value
                 if signal == "stale_evidence":
                     signal = "stale"
                 elif signal == "mixed_source_quality":
@@ -2718,9 +2779,13 @@ class AttestDB:
                     reason=alert.explanation,
                     signal_type=signal,
                     priority_score=base,
-                    suggested_action=f"Seek additional sources for {alert.entity_id}" if signal == "single_source"
-                        else f"Update evidence for {alert.entity_id}" if signal == "stale"
-                        else f"Reconcile confidence spread for {alert.entity_id}",
+                    suggested_action=(
+                        f"Seek additional sources for {alert.entity_id}"
+                        if signal == "single_source"
+                        else f"Update evidence for {alert.entity_id}"
+                        if signal == "stale"
+                        else f"Reconcile confidence spread for {alert.entity_id}"
+                    ),
                 ))
         except Exception:
             logger.debug("Could not compute confidence alerts for investigations", exc_info=True)
@@ -2784,10 +2849,17 @@ class AttestDB:
                 investigations.append(Investigation(
                     entity_id=eid,
                     entity_type=etype,
-                    reason=f"Predicted link: {bridge.entity_a} ↔ {bridge.entity_b} (similarity={bridge.similarity:.2f})",
+                    reason=(
+                        f"Predicted link: {bridge.entity_a} "
+                        f"↔ {bridge.entity_b} "
+                        f"(similarity={bridge.similarity:.2f})"
+                    ),
                     signal_type="predicted_link",
                     priority_score=score,
-                    suggested_action=f"Investigate link between {bridge.entity_a} and {bridge.entity_b}",
+                    suggested_action=(
+                        f"Investigate link between "
+                        f"{bridge.entity_a} and {bridge.entity_b}"
+                    ),
                 ))
         except Exception:
             logger.debug("Could not compute bridges for investigations", exc_info=True)
@@ -2839,8 +2911,9 @@ class AttestDB:
         Returns:
             HypothesisVerdict with supporting/contradicting evidence chains.
         """
-        from attestdb.core.vocabulary import OPPOSITE_PREDICATES
         import math
+
+        from attestdb.core.vocabulary import OPPOSITE_PREDICATES
 
         # Step 1: Parse hypothesis — LLM or fallback
         parsed_entities: list[dict] = []
@@ -2931,7 +3004,10 @@ class AttestDB:
                 verdict="insufficient_data",
                 entities_found=sorted(set(entities_found)),
                 entities_missing=entities_missing,
-                suggested_next_steps=[f"Add data about {e}" for e in entities_missing] or ["Add more entities to the knowledge graph"],
+                suggested_next_steps=(
+                    [f"Add data about {e}" for e in entities_missing]
+                    or ["Add more entities to the knowledge graph"]
+                ),
             )
 
         # Build relationships to evaluate — from LLM or from entity pairs
@@ -3003,7 +3079,10 @@ class AttestDB:
                             to_entity=to_id,
                             issue="weak",
                             current_confidence=step.confidence,
-                            explanation=f"Weak evidence for {step.predicate} (confidence={step.confidence:.2f})",
+                            explanation=(
+                                f"Weak evidence for {step.predicate} "
+                                f"(confidence={step.confidence:.2f})"
+                            ),
                         ))
 
             if rel_best > 0:
@@ -3034,7 +3113,10 @@ class AttestDB:
 
         # Verdict confidence = geometric mean of best chain confidences
         if best_confidences:
-            verdict_confidence = math.exp(sum(math.log(c) for c in best_confidences) / len(best_confidences))
+            log_sum = sum(math.log(c) for c in best_confidences)
+            verdict_confidence = math.exp(
+                log_sum / len(best_confidences)
+            )
         else:
             verdict_confidence = 0.0
 
@@ -3091,6 +3173,7 @@ class AttestDB:
         # --- Signal 1: Bridge predictions via EnsembleScorer ---
         try:
             from attestdb_enterprise.ensemble_scorer import EnsembleScorer
+
             from attestdb.intelligence.graph_embeddings import (
                 compute_graph_embeddings,
                 compute_weighted_graph_embeddings,
@@ -3145,7 +3228,10 @@ class AttestDB:
                 confidence = pred.composite_score
 
                 # Novelty: 1 - shared_neighbors/max_degree, boosted for inter-community
-                shared = len(adj.get(pred.entity_a, set()) & adj.get(pred.entity_b, set()))
+                shared = len(
+                    adj.get(pred.entity_a, set())
+                    & adj.get(pred.entity_b, set())
+                )
                 novelty = 1.0 - (shared / max_degree) if max_degree > 0 else 1.0
 
                 is_inter = pred.bridge_type == "inter-community"
@@ -3166,7 +3252,10 @@ class AttestDB:
 
                 discoveries.append(Discovery(
                     hypothesis=f"{name_a} may {predicted_pred} {name_b} via {bridge_str}",
-                    evidence_summary=f"{len(pred.evidence_paths)} bridging paths, vote={vote_frac:.0%} for {predicted_pred}",
+                    evidence_summary=(
+                        f"{len(pred.evidence_paths)} bridging paths, "
+                        f"vote={vote_frac:.0%} for {predicted_pred}"
+                    ),
                     discovery_type="bridge_prediction",
                     confidence=confidence,
                     novelty_score=novelty,
@@ -3185,7 +3274,9 @@ class AttestDB:
         # --- Signal 2: Cross-domain insights ---
         try:
             if hasattr(self, "_topology") and self._topology is not None:
-                bridges = self.cross_domain_bridges(top_k=top_k * 2)
+                bridges = self.cross_domain_bridges(
+                    top_k=top_k * 2,
+                )
                 for bridge in bridges:
                     if len(bridge.communities) < 2:
                         continue
@@ -3195,7 +3286,10 @@ class AttestDB:
                     for claim in bridge_claims:
                         for cid in bridge.communities:
                             members = communities.get(cid, set())
-                            if claim.object.id in members or claim.subject.id in members:
+                            if (
+                                claim.object.id in members
+                                or claim.subject.id in members
+                            ):
                                 comm_predicates.setdefault(cid, set()).add(claim.predicate.id)
 
                     comm_ids = list(comm_predicates.keys())
@@ -3208,13 +3302,26 @@ class AttestDB:
                                 name = entity_name_map.get(bridge.entity_id, bridge.entity_id)
                                 for dp in diff_preds:
                                     discoveries.append(Discovery(
-                                        hypothesis=f"{name}'s {dp} pattern in {comm_ids[i]} may extend to {comm_ids[j]}",
-                                        evidence_summary=f"Bridge entity spans {len(bridge.communities)} communities, bridge_score={bridge.bridge_score:.2f}",
+                                        hypothesis=(
+                                            f"{name}'s {dp} pattern in "
+                                            f"{comm_ids[i]} may extend "
+                                            f"to {comm_ids[j]}"
+                                        ),
+                                        evidence_summary=(
+                                            f"Bridge entity spans "
+                                            f"{len(bridge.communities)} "
+                                            f"communities, bridge_score="
+                                            f"{bridge.bridge_score:.2f}"
+                                        ),
                                         discovery_type="cross_domain",
                                         confidence=bridge.bridge_score * 0.5,
                                         novelty_score=0.8,
                                         entities=[bridge.entity_id],
-                                        suggested_action=f"Investigate {dp} relationships for {name} in community {comm_ids[j]}",
+                                        suggested_action=(
+                                            f"Investigate {dp} "
+                                            f"relationships for {name} "
+                                            f"in community {comm_ids[j]}"
+                                        ),
                                         predicted_predicate=dp,
                                         entity_types={bridge.entity_id: bridge.entity_type},
                                     ))
@@ -3246,8 +3353,14 @@ class AttestDB:
                         if pair in direct_pairs:
                             continue
                         # Get predicates along the path
-                        claims_a_n1 = [c for c in self.claims_for(entity.id) if c.object.id == n1 or c.subject.id == n1]
-                        claims_n1_n2 = [c for c in self.claims_for(n1) if c.object.id == n2 or c.subject.id == n2]
+                        claims_a_n1 = [
+                            c for c in self.claims_for(entity.id)
+                            if c.object.id == n1 or c.subject.id == n1
+                        ]
+                        claims_n1_n2 = [
+                            c for c in self.claims_for(n1)
+                            if c.object.id == n2 or c.subject.id == n2
+                        ]
                         if not claims_a_n1 or not claims_n1_n2:
                             continue
 
@@ -3273,11 +3386,18 @@ class AttestDB:
                         name_n1 = entity_name_map.get(n1, n1)
                         name_b = entity_name_map.get(n2, n2)
 
-                        novelty = 1.0 - (len(neighbors & n1_neighbors) / max_degree) if max_degree > 0 else 1.0
+                        novelty = (
+                            1.0 - (len(neighbors & n1_neighbors) / max_degree)
+                            if max_degree > 0 else 1.0
+                        )
 
                         discoveries.append(Discovery(
                             hypothesis=f"{name_a} may {best_composed} {name_b} via {name_n1}",
-                            evidence_summary=f"2-hop path: {name_a} →[{','.join(ac_preds)}]→ {name_n1} →[{','.join(cb_preds)}]→ {name_b}",
+                            evidence_summary=(
+                                f"2-hop path: {name_a} "
+                                f"→[{','.join(ac_preds)}]→ {name_n1} "
+                                f"→[{','.join(cb_preds)}]→ {name_b}"
+                            ),
                             discovery_type="chain_completion",
                             confidence=avg_conf * 0.7,
                             novelty_score=novelty,
@@ -3287,7 +3407,10 @@ class AttestDB:
                                 "cb_predicates": cb_preds,
                                 "path_weight": avg_conf,
                             }],
-                            suggested_action=f"Search for direct evidence of {name_a} {best_composed} {name_b}",
+                            suggested_action=(
+                                f"Search for direct evidence of "
+                                f"{name_a} {best_composed} {name_b}"
+                            ),
                             predicted_predicate=best_composed,
                             entity_types={
                                 entity.id: entity_type_map.get(entity.id, "entity"),
@@ -3407,7 +3530,10 @@ class AttestDB:
                 type_b = entity_type_map.get(entity_b, "")
                 type_c = entity_type_map.get(c_id, "")
                 type_d = entity_type_map.get(d_id, "")
-                if type_a and type_c and type_a == type_c and type_b and type_d and type_b == type_d:
+                if (
+                    type_a and type_c and type_a == type_c
+                    and type_b and type_d and type_b == type_d
+                ):
                     score *= 1.5
 
                 name_a = entity_name_map.get(entity_a, entity_a)
@@ -3420,9 +3546,17 @@ class AttestDB:
                     entity_b=entity_b,
                     entity_c=c_id,
                     entity_d=d_id,
-                    predicted_predicate=source_predicates[0] if source_predicates else "associated_with",
+                    predicted_predicate=(
+                        source_predicates[0]
+                        if source_predicates
+                        else "associated_with"
+                    ),
                     score=score,
-                    explanation=f"{name_a}:{name_b} :: {name_c}:{name_d} — sim(A,C)={sim_ac:.2f}, sim(B,D)={sim_bd:.2f}",
+                    explanation=(
+                        f"{name_a}:{name_b} :: {name_c}:{name_d}"
+                        f" — sim(A,C)={sim_ac:.2f},"
+                        f" sim(B,D)={sim_bd:.2f}"
+                    ),
                     source_predicates=source_predicates,
                     entity_types={
                         entity_a: type_a or "entity",
@@ -3467,6 +3601,7 @@ class AttestDB:
             KnowledgeDiff with categorized belief changes.
         """
         import time as _time
+
         from attestdb.core.confidence import tier1_confidence, tier2_confidence
         from attestdb.core.vocabulary import OPPOSITE_PREDICATES
 
@@ -3492,8 +3627,14 @@ class AttestDB:
         new_contradictions: list[BeliefChange] = []
 
         # Collect entities and sources
-        before_entities = {c.subject.id for c in before_claims} | {c.object.id for c in before_claims}
-        period_entities = {c.subject.id for c in period_claims} | {c.object.id for c in period_claims}
+        before_entities = (
+            {c.subject.id for c in before_claims}
+            | {c.object.id for c in before_claims}
+        )
+        period_entities = (
+            {c.subject.id for c in period_claims}
+            | {c.object.id for c in period_claims}
+        )
         before_sources = {c.provenance.source_id for c in before_claims}
         period_sources = {c.provenance.source_id for c in period_claims}
 
@@ -3700,7 +3841,10 @@ class AttestDB:
                         sources = {c.provenance.source_id for c in claims}
                         source_types = sorted({c.provenance.source_type for c in claims})
                         corr = count_independent_sources(claims)
-                        avg_conf = sum(tier1_confidence(c.provenance.source_type) for c in claims) / len(claims)
+                        avg_conf = (
+                            sum(tier1_confidence(c.provenance.source_type) for c in claims)
+                            / len(claims)
+                        )
                         newest = max(c.timestamp for c in claims)
                         rec = recency_factor(newest)
                         weight = (
@@ -3725,24 +3869,37 @@ class AttestDB:
 
                     margin = abs(side_a.evidence_weight - side_b.evidence_weight)
                     if margin >= 0.15:
-                        winner = "side_a" if side_a.evidence_weight > side_b.evidence_weight else "side_b"
+                        winner = (
+                            "side_a"
+                            if side_a.evidence_weight > side_b.evidence_weight
+                            else "side_b"
+                        )
                         resolution = "a_preferred" if winner == "side_a" else "b_preferred"
                     else:
                         winner = "ambiguous"
                         resolution = "unresolved"
 
                     explanation = (
-                        f"{pred_a} ({side_a.claim_count} claims, weight={side_a.evidence_weight:.2f}) "
-                        f"vs {opp} ({side_b.claim_count} claims, weight={side_b.evidence_weight:.2f})"
+                        f"{pred_a} ({side_a.claim_count} claims,"
+                        f" weight={side_a.evidence_weight:.2f})"
+                        f" vs {opp} ({side_b.claim_count} claims,"
+                        f" weight={side_b.evidence_weight:.2f})"
                     )
 
                     # LLM adjudication for ambiguous cases
                     if winner == "ambiguous" and use_llm:
                         prompt = (
-                            f"Two contradicting claims about {subj} and {obj}:\n"
-                            f"Side A: '{pred_a}' — {side_a.claim_count} claims from {side_a.source_count} sources\n"
-                            f"Side B: '{opp}' — {side_b.claim_count} claims from {side_b.source_count} sources\n"
-                            f"Which is more likely correct? Reply with just 'A' or 'B' or 'ambiguous'."
+                            f"Two contradicting claims about"
+                            f" {subj} and {obj}:\n"
+                            f"Side A: '{pred_a}' — "
+                            f"{side_a.claim_count} claims from "
+                            f"{side_a.source_count} sources\n"
+                            f"Side B: '{opp}' — "
+                            f"{side_b.claim_count} claims from "
+                            f"{side_b.source_count} sources\n"
+                            f"Which is more likely correct?"
+                            f" Reply with just 'A' or 'B'"
+                            f" or 'ambiguous'."
                         )
                         llm_resp = self._llm_call(prompt, max_tokens=32)
                         if llm_resp:
@@ -3784,7 +3941,11 @@ class AttestDB:
             for a in analyses:
                 if a.resolution == "unresolved":
                     continue
-                winning_pred = a.side_a.predicate if a.resolution == "a_preferred" else a.side_b.predicate
+                winning_pred = (
+                    a.side_a.predicate
+                    if a.resolution == "a_preferred"
+                    else a.side_b.predicate
+                )
                 self.ingest(
                     subject=(a.subject, "entity"),
                     predicate=("contradiction_resolved", "contradiction_resolved"),
@@ -3831,11 +3992,6 @@ class AttestDB:
         Returns:
             SimulationReport with impact analysis.
         """
-        from attestdb.core.confidence import tier2_confidence
-        from attestdb.core.hashing import compute_content_id
-        from attestdb.core.normalization import normalize_entity_id
-        from attestdb.core.vocabulary import OPPOSITE_PREDICATES
-
         if retract_source:
             return self._simulate_retract_source(retract_source)
         elif add_claim:
@@ -4031,7 +4187,8 @@ class AttestDB:
             for c in all_subj_claims:
                 if c.predicate.id == opp and c.object.id == obj_id:
                     new_contradictions.append(
-                        f"{subj_id} {pred_id} {obj_id} contradicts existing {subj_id} {opp} {obj_id}"
+                        f"{subj_id} {pred_id} {obj_id} contradicts"
+                        f" existing {subj_id} {opp} {obj_id}"
                     )
                     break
 
@@ -4127,7 +4284,12 @@ class AttestDB:
         claims_fraction = len(removed_ids) / max(total_active, 1)
         total_pairs = len(edge_before)
         conn_loss_fraction = len(connection_losses) / max(total_pairs, 1)
-        risk_score = min(0.4 * claims_fraction + 0.4 * conn_loss_fraction + 0.2 * (len(degraded_ids) / max(total_active, 1)), 1.0)
+        risk_score = min(
+            0.4 * claims_fraction
+            + 0.4 * conn_loss_fraction
+            + 0.2 * (len(degraded_ids) / max(total_active, 1)),
+            1.0,
+        )
 
         if risk_score > 0.5:
             risk_level = "critical"
@@ -4170,7 +4332,6 @@ class AttestDB:
         Returns:
             KnowledgeBrief with structured sections.
         """
-        from attestdb.core.confidence import tier1_confidence
         from attestdb.core.vocabulary import OPPOSITE_PREDICATES
 
         # Search for entities matching the topic
@@ -4235,7 +4396,10 @@ class AttestDB:
             # Dedupe citations by content_id, keep highest confidence
             content_id_best: dict[str, Claim] = {}
             for c in cluster_claims:
-                if c.content_id not in content_id_best or c.confidence > content_id_best[c.content_id].confidence:
+                if (
+                    c.content_id not in content_id_best
+                    or c.confidence > content_id_best[c.content_id].confidence
+                ):
                     content_id_best[c.content_id] = c
 
             for cid, c in content_id_best.items():
@@ -4258,7 +4422,10 @@ class AttestDB:
             # Key findings: top 5 by confidence
             key_findings: list[str] = []
             for ct in citations[:5]:
-                corr_str = f", {ct.corroboration_count} sources" if ct.corroboration_count > 1 else ""
+                corr_str = (
+                    f", {ct.corroboration_count} sources"
+                    if ct.corroboration_count > 1 else ""
+                )
                 key_findings.append(
                     f"{ct.subject} {ct.predicate} {ct.object} "
                     f"(confidence: {ct.confidence:.2f}{corr_str})"
@@ -4285,14 +4452,24 @@ class AttestDB:
             # Detect gaps: single-source entities in cluster
             section_gaps: list[str] = []
             for eid in cluster:
-                eid_claims = [c for c in cluster_claims if c.subject.id == eid or c.object.id == eid]
+                eid_claims = [
+                    c for c in cluster_claims
+                    if c.subject.id == eid or c.object.id == eid
+                ]
                 sources = {c.provenance.source_id for c in eid_claims}
                 if len(sources) == 1 and len(eid_claims) > 0:
-                    section_gaps.append(f"{eid}: single source ({next(iter(sources))})")
+                    section_gaps.append(
+                        f"{eid}: single source"
+                        f" ({next(iter(sources))})"
+                    )
             all_gaps.extend(section_gaps)
 
             # Section confidence
-            avg_conf = sum(c.confidence for c in cluster_claims) / len(cluster_claims) if cluster_claims else 0.0
+            avg_conf = (
+                (sum(c.confidence for c in cluster_claims)
+                 / len(cluster_claims))
+                if cluster_claims else 0.0
+            )
 
             sections.append(BriefSection(
                 title=title,
@@ -4308,18 +4485,27 @@ class AttestDB:
         sections.sort(key=lambda s: -len(s.citations))
 
         # Overall metrics
-        avg_confidence = sum(s.avg_confidence for s in sections) / len(sections) if sections else 0.0
+        avg_confidence = (
+            (sum(s.avg_confidence for s in sections) / len(sections))
+            if sections else 0.0
+        )
 
         # Strongest findings: top 3 by confidence * corroboration
         all_citations.sort(key=lambda ct: -(ct.confidence * ct.corroboration_count))
         strongest = [
-            f"{ct.subject} {ct.predicate} {ct.object} (conf={ct.confidence:.2f}, {ct.corroboration_count} sources)"
+            f"{ct.subject} {ct.predicate} {ct.object}"
+            f" (conf={ct.confidence:.2f},"
+            f" {ct.corroboration_count} sources)"
             for ct in all_citations[:3]
         ]
 
         # Weakest areas: sections with lowest avg_confidence or most gaps
         weak_sections = sorted(sections, key=lambda s: s.avg_confidence)
-        weakest = [f"{s.title} (avg confidence: {s.avg_confidence:.2f}, {len(s.gaps)} gaps)" for s in weak_sections[:3]]
+        weakest = [
+            f"{s.title} (avg confidence:"
+            f" {s.avg_confidence:.2f}, {len(s.gaps)} gaps)"
+            for s in weak_sections[:3]
+        ]
 
         # Executive summary
         if use_llm:
@@ -4333,9 +4519,15 @@ class AttestDB:
             )
             exec_summary = self._llm_call(prompt, max_tokens=256)
             if not exec_summary:
-                exec_summary = self._template_summary(topic, entities, sections, all_contradictions, all_gaps, strongest)
+                exec_summary = self._template_summary(
+                    topic, entities, sections,
+                    all_contradictions, all_gaps, strongest,
+                )
         else:
-            exec_summary = self._template_summary(topic, entities, sections, all_contradictions, all_gaps, strongest)
+            exec_summary = self._template_summary(
+                topic, entities, sections,
+                all_contradictions, all_gaps, strongest,
+            )
 
         return KnowledgeBrief(
             topic=topic,
@@ -4352,7 +4544,8 @@ class AttestDB:
         )
 
     def _template_summary(
-        self, topic: str, entities: list, sections: list, contradictions: list, gaps: list, strongest: list
+        self, topic: str, entities: list, sections: list,
+        contradictions: list, gaps: list, strongest: list,
     ) -> str:
         """Generate a template-based executive summary."""
         parts = [f"Brief on '{topic}': {len(entities)} entities across {len(sections)} clusters."]
@@ -4391,7 +4584,10 @@ class AttestDB:
                 entity_a=a_norm,
                 entity_b=b_norm,
                 connected=False,
-                narrative=f"No connection found between '{a_norm}' and '{b_norm}' within {max_depth} hops.",
+                narrative=(
+                    f"No connection found between '{a_norm}'"
+                    f" and '{b_norm}' within {max_depth} hops."
+                ),
             )
 
         best = chains[0]
@@ -4399,7 +4595,6 @@ class AttestDB:
         all_sources: set[str] = set()
 
         for hop in best.hops:
-            source_types = hop.source_types or []
             source_ids = hop.source_ids or []
             all_sources.update(source_ids)
 
@@ -4420,9 +4615,16 @@ class AttestDB:
             ))
 
         # Build template narrative
-        narrative_parts = [f"Connection: {a_norm} → {b_norm} ({len(steps)} hops, confidence={best.chain_confidence:.2f})"]
+        narrative_parts = [
+            f"Connection: {a_norm} → {b_norm}"
+            f" ({len(steps)} hops,"
+            f" confidence={best.chain_confidence:.2f})"
+        ]
         for i, step in enumerate(steps, 1):
-            line = f"  {i}. {step.from_entity} —[{step.predicate}]→ {step.to_entity} (conf={step.confidence:.2f})"
+            line = (
+                f"  {i}. {step.from_entity} —[{step.predicate}]→"
+                f" {step.to_entity} (conf={step.confidence:.2f})"
+            )
             if step.source_summary:
                 line += f" [{step.source_summary}]"
             if step.has_contradiction:
@@ -4630,7 +4832,6 @@ class AttestDB:
                     and oc.predicate.id == pred
                 ]
                 if other_pred_claims:
-                    conflict_key = f"{c.subject.id}|{c.object.id}|{pred}|{opp}"
                     # Avoid duplicate conflicts
                     if not any(
                         mc.subject == c.subject.id and mc.object == c.object.id
@@ -4646,14 +4847,20 @@ class AttestDB:
                             self_confidence=self_conf,
                             other_confidence=other_conf,
                             self_sources=len({sc.provenance.source_id for sc in self_opp_claims}),
-                            other_sources=len({oc.provenance.source_id for oc in other_pred_claims}),
+                            other_sources=len(
+                                {oc.provenance.source_id for oc in other_pred_claims}
+                            ),
                         ))
 
         # Summary
         parts = []
         parts.append(f"Self: {len(self_unique)} unique beliefs, {len(self_entities)} entities")
         parts.append(f"Other: {len(other_unique)} unique beliefs, {len(other_entities)} entities")
-        parts.append(f"Shared: {len(shared)} beliefs, {len(self_entities & other_entities)} entities")
+        shared_ents = len(self_entities & other_entities)
+        parts.append(
+            f"Shared: {len(shared)} beliefs,"
+            f" {shared_ents} entities"
+        )
         if conflicts:
             parts.append(f"{len(conflicts)} conflicts")
         summary = "; ".join(parts)

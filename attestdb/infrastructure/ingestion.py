@@ -29,7 +29,11 @@ from attestdb.core.types import (
     PredicateRef,
     Provenance,
 )
-from attestdb.core.vocabulary import BUILT_IN_ENTITY_TYPES, BUILT_IN_PREDICATE_TYPES, BUILT_IN_SOURCE_TYPES
+from attestdb.core.vocabulary import (
+    BUILT_IN_ENTITY_TYPES,
+    BUILT_IN_PREDICATE_TYPES,
+    BUILT_IN_SOURCE_TYPES,
+)
 from attestdb.infrastructure.embedding_index import EmbeddingIndex
 
 logger = logging.getLogger(__name__)
@@ -49,7 +53,8 @@ class IngestionPipeline:
         self._embedding_index = embedding_index
         self._embedding_dim = embedding_dim
         self._strict = strict
-        self._resolver = None  # Optional EntityResolver, set via AttestDB.enable_entity_resolution()
+        # Optional EntityResolver, set via AttestDB.enable_entity_resolution()
+        self._resolver = None
         # Vocabulary caches (invalidated via invalidate_vocab_caches)
         self._valid_entity_types: set[str] | None = None
         self._valid_pred_types: set[str] | None = None
@@ -235,9 +240,15 @@ class IngestionPipeline:
         claim = Claim(
             claim_id=claim_id,
             content_id=content_id,
-            subject=EntityRef(id=subj_canonical, entity_type=subj_type, display_name=subj_display, external_ids=subj_ext),
+            subject=EntityRef(
+                id=subj_canonical, entity_type=subj_type,
+                display_name=subj_display, external_ids=subj_ext,
+            ),
             predicate=PredicateRef(id=pred_id, predicate_type=pred_type),
-            object=EntityRef(id=obj_canonical, entity_type=obj_type, display_name=obj_display, external_ids=obj_ext),
+            object=EntityRef(
+                id=obj_canonical, entity_type=obj_type,
+                display_name=obj_display, external_ids=obj_ext,
+            ),
             confidence=confidence,
             provenance=Provenance(
                 source_type=source_type,
@@ -309,7 +320,7 @@ class IngestionPipeline:
     def ingest_batch(
         self,
         claims: list[ClaimInput],
-        on_ingested: Callable[[str], None] | None = None,
+        on_ingested: "Callable[[str], None] | None" = None,  # noqa: F821
     ) -> BatchResult:
         """Batch ingestion — validates and persists without per-claim corroboration tracking.
 

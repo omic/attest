@@ -248,7 +248,10 @@ class SchemaDescriptor:
         if self.relationship_patterns:
             lines.append("Relationship patterns:")
             for rp in sorted(self.relationship_patterns, key=lambda x: -x.count)[:20]:
-                lines.append(f"  ({rp.subject_type})-[{rp.predicate}]->({rp.object_type}): {rp.count}")
+                lines.append(
+                    f"  ({rp.subject_type})-[{rp.predicate}]"
+                    f"->({rp.object_type}): {rp.count}"
+                )
         if self.source_types:
             lines.append("Source types:")
             for s, c in sorted(self.source_types.items(), key=lambda x: -x[1]):
@@ -455,7 +458,8 @@ class ConfidenceGap:
 class HypothesisVerdict:
     """Result of evaluating a natural-language hypothesis against the graph."""
     hypothesis: str
-    verdict: str = "unsupported"  # "supported" | "contradicted" | "partial" | "unsupported" | "insufficient_data"
+    # "supported" | "contradicted" | "partial" | "unsupported" | "insufficient_data"
+    verdict: str = "unsupported"
     verdict_confidence: float = 0.0
     supporting_chains: list[EvidenceChain] = field(default_factory=list)
     contradicting_chains: list[EvidenceChain] = field(default_factory=list)
@@ -501,7 +505,9 @@ class Investigation:
     entity_id: str
     entity_type: str
     reason: str
-    signal_type: str  # "single_source" | "confidence_gap" | "missing_predicate" | "predicted_link" | "stale"
+    # "single_source" | "confidence_gap" | "missing_predicate"
+    # | "predicted_link" | "stale"
+    signal_type: str
     priority_score: float = 0.0
     affected_downstream: int = 0
     suggested_action: str = ""

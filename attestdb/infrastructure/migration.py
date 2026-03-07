@@ -8,18 +8,18 @@ Export format (one JSON object per line):
 Metadata record comes first, then entities, then claims.
 """
 
+from __future__ import annotations
+
+import json
+import time
+
 # Current export format version. Bump when the NDJSON schema changes.
 FORMAT_VERSION = 1
 
 # Set of versions this code can import (forward-compat window).
 SUPPORTED_VERSIONS = {1}
 
-from __future__ import annotations
-
-import json
-import time
-
-from attestdb.core.types import (
+from attestdb.core.types import (  # noqa: E402
     Claim,
     ClaimStatus,
     EntityRef,

@@ -380,7 +380,10 @@ class BulkLoader:
             for row in reader:
                 if len(row) < 7:
                     continue
-                ensp, symbol, doid, disease_name = row[0].strip(), row[1].strip(), row[2].strip(), row[3].strip()
+                ensp = row[0].strip()
+                symbol = row[1].strip()
+                doid = row[2].strip()
+                disease_name = row[3].strip()
 
                 if not doid or not ensp:
                     continue
@@ -406,22 +409,27 @@ class BulkLoader:
                         gene_ext["ensembl_protein"] = ensp
                     if symbol:
                         gene_ext["symbol"] = symbol
-                    entities[gene_canonical] = ("gene", gene_id, json.dumps(gene_ext) if gene_ext else "{}")
+                    ext_json = json.dumps(gene_ext) if gene_ext else "{}"
+                    entities[gene_canonical] = ("gene", gene_id, ext_json)
                 if disease_canonical not in entities:
                     disease_ext = _extract_external_ids(disease_entity, "disease")
-                    entities[disease_canonical] = ("disease", disease_name or disease_entity, json.dumps(disease_ext) if disease_ext else "{}")
+                    d_name = disease_name or disease_entity
+                    d_ext = json.dumps(disease_ext) if disease_ext else "{}"
+                    entities[disease_canonical] = ("disease", d_name, d_ext)
 
                 pred_id = "associates"
                 source_id = "diseases_knowledge"
                 source_type = "database_import"
 
                 claim_id = compute_claim_id(
-                    gene_canonical, pred_id, disease_canonical, source_id, source_type, timestamp,
+                    gene_canonical, pred_id, disease_canonical,
+                    source_id, source_type, timestamp,
                 )
                 if claim_id in seen_claim_ids:
                     timestamp += 1
                     claim_id = compute_claim_id(
-                        gene_canonical, pred_id, disease_canonical, source_id, source_type, timestamp,
+                        gene_canonical, pred_id, disease_canonical,
+                        source_id, source_type, timestamp,
                     )
                 seen_claim_ids.add(claim_id)
 
@@ -467,7 +475,7 @@ class BulkLoader:
         unmapped = 0
 
         with open(path, "r") as f:
-            header = f.readline()  # Skip header
+            f.readline()  # Skip header
             for line in f:
                 parts = line.strip().split()
                 if len(parts) < 3:
@@ -514,7 +522,8 @@ class BulkLoader:
                 if claim_id in seen_claim_ids:
                     timestamp += 1
                     claim_id = compute_claim_id(
-                        gene_a_canonical, pred_id, gene_b_canonical, source_id, source_type, timestamp,
+                        gene_a_canonical, pred_id, gene_b_canonical,
+                        source_id, source_type, timestamp,
                     )
                 seen_claim_ids.add(claim_id)
 
@@ -592,7 +601,8 @@ class BulkLoader:
                 if claim_id in seen_claim_ids:
                     timestamp += 1
                     claim_id = compute_claim_id(
-                        gene_canonical, pred_id, pathway_canonical, source_id, source_type, timestamp,
+                        gene_canonical, pred_id, pathway_canonical,
+                        source_id, source_type, timestamp,
                     )
                 seen_claim_ids.add(claim_id)
 

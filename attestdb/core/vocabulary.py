@@ -27,7 +27,8 @@ OPPOSITE_PREDICATES: dict[str, str] = {
 }
 
 # Predicate composition rules — (pred_A_to_C, pred_C_to_B) → predicted_A_to_B
-# Causal logic: inhibits + promotes → inhibits, inhibits + inhibits → activates (double negative), etc.
+# Causal logic: inhibits + promotes → inhibits,
+# inhibits + inhibits → activates (double negative), etc.
 PREDICATE_COMPOSITION: dict[tuple[str, str], str] = {
     # activates chains
     ("activates", "activates"): "activates",

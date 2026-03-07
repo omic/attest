@@ -15,13 +15,17 @@ from attestdb.core.types import (
     EntitySummary,
     PathResult,
     PathStep,
-    QueryProfile,
     QuantitativeClaim,
+    QueryProfile,
     Relationship,
     claim_from_dict,
     entity_summary_from_dict,
 )
-from attestdb.core.vocabulary import CONTRADICTION_PREDICATES, OPPOSITE_PREDICATES, QUANTITATIVE_SCHEMAS, SYMMETRIC_PREDICATES
+from attestdb.core.vocabulary import (
+    OPPOSITE_PREDICATES,
+    QUANTITATIVE_SCHEMAS,
+    SYMMETRIC_PREDICATES,
+)
 
 # Recency bonus: 7-day half-life
 RECENCY_HALF_LIFE_SECONDS = 7 * 24 * 3600
@@ -84,7 +88,7 @@ class QueryEngine:
         max_tokens: int = 4000,
         confidence_threshold: float = 0.0,
         predicate_types: list[str] | None = None,
-        claim_filter: "Callable[[Claim], bool] | None" = None,
+        claim_filter: "Callable[[Claim], bool] | None" = None,  # noqa: F821
         include_quantitative: bool = True,
         include_contradictions: bool = True,
         include_narrative: bool = True,
@@ -152,8 +156,10 @@ class QueryEngine:
         for claim, hop, from_eid in candidates:
             # Tier 2: corroboration-boosted confidence
             if claim.content_id not in _content_cache:
-                _content_cache[claim.content_id] = [
-                    self._convert_claim(d) for d in self._store.claims_by_content_id(claim.content_id)
+                cid = claim.content_id
+                _content_cache[cid] = [
+                    self._convert_claim(d)
+                    for d in self._store.claims_by_content_id(cid)
                 ]
             corroborating = _content_cache[claim.content_id]
             conf = tier2_confidence(claim, corroborating)
@@ -266,7 +272,10 @@ class QueryEngine:
                             Contradiction(
                                 claim_a=cid_a,
                                 claim_b=cid_b,
-                                description=f"{subj} has both '{p1}' and '{p2}' relationship with {obj}",
+                                description=(
+                            f"{subj} has both '{p1}' and "
+                            f"'{p2}' relationship with {obj}"
+                        ),
                                 status="unresolved",
                             )
                         )
@@ -438,7 +447,8 @@ class QueryEngine:
                 break
             next_frontier: set[str] = set()
             for eid in list(frontier):
-                claims = [self._convert_claim(d) for d in self._store.claims_for(eid, None, None, 0.0)]
+                raw = self._store.claims_for(eid, None, None, 0.0)
+                claims = [self._convert_claim(d) for d in raw]
                 for claim in claims:
                     other = claim.object.id if claim.subject.id == eid else claim.subject.id
                     if other == rb:

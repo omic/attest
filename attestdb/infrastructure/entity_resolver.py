@@ -91,7 +91,10 @@ class EntityResolver:
 
         # 3. Text search fuzzy match (modes: fuzzy, full)
         if self._mode in ("fuzzy", "full") and hasattr(self._store, "search_entities"):
-            candidates = [entity_summary_from_dict(d) for d in self._store.search_entities(normalized, top_k=5)]
+            candidates = [
+                entity_summary_from_dict(d)
+                for d in self._store.search_entities(normalized, top_k=5)
+            ]
             best_id = None
             best_score = 0.0
             for candidate in candidates:
@@ -136,7 +139,10 @@ class EntityResolver:
         if self._mode in ("fuzzy", "full") and hasattr(self._store, "search_entities"):
             entities = [entity_summary_from_dict(d) for d in self._store.list_entities()]
             for entity in entities:
-                candidates = [entity_summary_from_dict(d) for d in self._store.search_entities(entity.id, top_k=5)]
+                candidates = [
+                    entity_summary_from_dict(d)
+                    for d in self._store.search_entities(entity.id, top_k=5)
+                ]
                 for candidate in candidates:
                     if candidate.id == entity.id:
                         continue

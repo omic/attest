@@ -29,7 +29,10 @@ def _register_vocabs(db, vocabs):
             mod = importlib.import_module(module_path)
             getattr(mod, func_name)(db)
         except ImportError:
-            print(f"Warning: '{v}' vocabulary requires attestdb-intelligence (pip install attestdb-enterprise)")
+            print(
+                f"Warning: '{v}' vocabulary requires "
+                "attestdb-intelligence (pip install attestdb-enterprise)"
+            )
 
 
 def cmd_ingest(args):
@@ -163,7 +166,10 @@ def main():
     )
     p_ingest.add_argument(
         "--extraction", choices=["llm", "heuristic", "smart"], default="heuristic",
-        help="Extraction mode: heuristic (default, no API key), llm, or smart (heuristic + LLM for novel)",
+        help=(
+            "Extraction mode: heuristic (default, no API key),"
+            " llm, or smart (heuristic + LLM for novel)"
+        ),
     )
     p_ingest.add_argument(
         "--curator", default=None,

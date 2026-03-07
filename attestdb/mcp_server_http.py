@@ -29,7 +29,7 @@ try:
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.middleware.cors import CORSMiddleware
     from starlette.requests import Request
-    from starlette.responses import JSONResponse, Response
+    from starlette.responses import JSONResponse
     from starlette.routing import Mount, Route
 except ImportError:
     raise ImportError(
@@ -136,15 +136,24 @@ def main():
     parser.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8893, help="Bind port (default: 8893)")
     parser.add_argument("--db", default=None, help="DB path (overrides ATTEST_DB_PATH)")
-    parser.add_argument("--api-key", default=None, help="Bearer token for auth (overrides ATTEST_API_KEY)")
+    parser.add_argument(
+        "--api-key", default=None,
+        help="Bearer token for auth (overrides ATTEST_API_KEY)",
+    )
     args = parser.parse_args()
 
-    db_path = args.db or os.environ.get("ATTEST_DB_PATH", os.environ.get("SUBSTRATE_DB_PATH", "attest.db"))
+    db_path = args.db or os.environ.get(
+        "ATTEST_DB_PATH",
+        os.environ.get("SUBSTRATE_DB_PATH", "attest.db"),
+    )
     api_key = args.api_key or os.environ.get("ATTEST_API_KEY")
 
     app = create_http_app(db_path=db_path, api_key=api_key)
     if not api_key:
-        logger.warning("Starting without authentication. Set ATTEST_API_KEY or --api-key for production use.")
+        logger.warning(
+            "Starting without authentication. "
+            "Set ATTEST_API_KEY or --api-key for production use."
+        )
     uvicorn.run(app, host=args.host, port=args.port)
 
 

@@ -141,7 +141,11 @@ def ingest_batch(claims: list[dict]) -> str:
         for c in claims
     ]
     result = db.ingest_batch(claim_inputs)
-    return json.dumps({"ingested": result.ingested, "duplicates": result.duplicates, "errors": result.errors})
+    return json.dumps({
+        "ingested": result.ingested,
+        "duplicates": result.duplicates,
+        "errors": result.errors,
+    })
 
 
 @mcp.tool()
@@ -182,11 +186,18 @@ def get_entity(entity_id: str) -> str:
     e = db.get_entity(entity_id)
     if e is None:
         return json.dumps({"error": f"Entity not found: {entity_id}"})
-    return json.dumps({"id": e.id, "name": e.name, "type": e.entity_type, "claim_count": e.claim_count})
+    return json.dumps({
+        "id": e.id, "name": e.name,
+        "type": e.entity_type, "claim_count": e.claim_count,
+    })
 
 
 @mcp.tool()
-def claims_for(entity_id: str, predicate_type: Optional[str] = None, min_confidence: float = 0.0) -> str:
+def claims_for(
+    entity_id: str,
+    predicate_type: Optional[str] = None,
+    min_confidence: float = 0.0,
+) -> str:
     """Get claims about an entity, optionally filtered."""
     db = _get_db()
     claims = db.claims_for(entity_id, predicate_type=predicate_type, min_confidence=min_confidence)
@@ -214,7 +225,12 @@ def find_paths(entity_a: str, entity_b: str, max_depth: int = 3, top_k: int = 5)
             "length": p.length,
             "total_confidence": p.total_confidence,
             "steps": [
-                {"entity": s.entity_id, "type": s.entity_type, "predicate": s.predicate, "confidence": s.confidence}
+                {
+                    "entity": s.entity_id,
+                    "type": s.entity_type,
+                    "predicate": s.predicate,
+                    "confidence": s.confidence,
+                }
                 for s in p.steps
             ],
         }
@@ -496,7 +512,8 @@ def _retrieve_candidates(db, query: str, context: str, tenant_id: str) -> list[s
         for claim in db.claims_for(entity.id):
             if claim.claim_id not in seen:
                 # Tenant filter: check provenance.organization if tenant scoping
-                if tenant_id and claim.provenance.organization and claim.provenance.organization != tenant_id:
+                prov_org = claim.provenance.organization
+                if tenant_id and prov_org and prov_org != tenant_id:
                     continue
                 seen.add(claim.claim_id)
                 claim_ids.append(claim.claim_id)
@@ -585,7 +602,10 @@ def attest_observe_session(
     if outcome != "unknown":
         valid_outcomes = {"success", "partial", "failure", "unknown"}
         if outcome not in valid_outcomes:
-            return json.dumps({"error": f"Invalid outcome: {outcome!r}. Must be one of {sorted(valid_outcomes)}."})
+            return json.dumps({
+                "error": f"Invalid outcome: {outcome!r}. "
+                f"Must be one of {sorted(valid_outcomes)}.",
+            })
         _record_outcome_impl(
             db, session_id, tenant_id, outcome, task_description, notes,
         )
@@ -696,7 +716,10 @@ def attest_record_outcome(
     db = _get_db()
 
     if outcome not in ("success", "partial", "failure"):
-        return json.dumps({"error": f"Invalid outcome: {outcome!r}. Must be success, partial, or failure."})
+        return json.dumps({
+            "error": f"Invalid outcome: {outcome!r}. "
+            "Must be success, partial, or failure.",
+        })
 
     deltas = {"success": 0.15, "partial": 0.05, "failure": -0.20}
     updated = _record_outcome_impl(db, session_id, tenant_id, outcome, task_description, notes)
@@ -767,7 +790,8 @@ def attest_get_prior_approaches(
             if outcome_filter and outcome != outcome_filter:
                 continue
 
-            age_days = (now_ns - session_claims[0].timestamp) / (86400 * 1e9) if session_claims[0].timestamp else 0
+            ts = session_claims[0].timestamp
+            age_days = (now_ns - ts) / (86400 * 1e9) if ts else 0
             score = _score_approach(session_confidence, outcome, age_days)
 
             # Collect predicates from session
@@ -854,7 +878,8 @@ def attest_confidence_trail(
     sessions: dict[str, dict] = {}
     for claim in all_claims:
         # Tenant isolation: skip claims from other tenants
-        if tenant_id and claim.provenance.organization and claim.provenance.organization != tenant_id:
+        prov_org = claim.provenance.organization
+        if tenant_id and prov_org and prov_org != tenant_id:
             continue
         sid = claim.provenance.source_id
         if not sid:
@@ -905,8 +930,15 @@ def attest_confidence_trail(
         "sessions_contributing": list(sessions.values()),
         "evolution_summary": evolution_summary,
         "diff_summary": diff_summary,
-        "token_estimate": _estimate_tokens(json.dumps(current_state) + json.dumps(list(sessions.values()))),
-        "message": f"Confidence trail for '{topic}': {len(sessions)} sessions, trajectory={evolution.trajectory}",
+        "token_estimate": _estimate_tokens(
+            json.dumps(current_state)
+            + json.dumps(list(sessions.values()))
+        ),
+        "message": (
+            f"Confidence trail for '{topic}': "
+            f"{len(sessions)} sessions, "
+            f"trajectory={evolution.trajectory}"
+        ),
     }
     return json.dumps(result)
 
@@ -951,15 +983,24 @@ def main():
         default="stdio",
         help="Transport protocol (default: stdio)",
     )
-    parser.add_argument("--host", default="127.0.0.1", help="Bind host for SSE/HTTP (default: 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=8892, help="Bind port for SSE/HTTP (default: 8892)")
+    parser.add_argument(
+        "--host", default="127.0.0.1",
+        help="Bind host for SSE/HTTP (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port", type=int, default=8892,
+        help="Bind port for SSE/HTTP (default: 8892)",
+    )
     parser.add_argument("--db", default=None, help="DB path (overrides ATTEST_DB_PATH)")
     args = parser.parse_args()
 
     global _db
     from attestdb.infrastructure.attest_db import AttestDB
 
-    db_path = args.db or os.environ.get("ATTEST_DB_PATH", os.environ.get("SUBSTRATE_DB_PATH", "attest.db"))
+    db_path = args.db or os.environ.get(
+        "ATTEST_DB_PATH",
+        os.environ.get("SUBSTRATE_DB_PATH", "attest.db"),
+    )
     _db = AttestDB(db_path, embedding_dim=None)
 
     try:

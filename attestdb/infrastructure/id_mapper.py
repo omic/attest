@@ -59,7 +59,8 @@ class GeneIDMapper:
                 f.write(resp.content)
             logger.info("Downloaded gene2ensembl.gz (%d bytes)", len(resp.content))
 
-        # Parse: columns are tax_id, GeneID, Ensembl_gene, RNA_nuc_acc, Ensembl_rna, protein_acc, Ensembl_prot
+        # Parse: columns are tax_id, GeneID, Ensembl_gene,
+        # RNA_nuc_acc, Ensembl_rna, protein_acc, Ensembl_prot
         with gzip.open(dest, "rt") as f:
             reader = csv.reader(f, delimiter="\t")
             next(reader, None)  # Skip header
