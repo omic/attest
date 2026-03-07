@@ -47,6 +47,17 @@ jobs:
           source .venv/bin/activate
           pytest tests/cross_lang/ -v --tb=short
 
+      - name: Smoke test wheel install
+        run: |
+          python -m venv /tmp/smoke-venv
+          source /tmp/smoke-venv/bin/activate
+          pip install maturin
+          cd rust/attest-py && maturin build --release
+          pip install ../../rust/target/wheels/attest_py-*.whl
+          python -c "import attest_rust; print('attest_rust import OK')"
+          pip install -e ../..
+          python -c "from attestdb import open; db = open(':memory:'); db.close(); print('attestdb smoke test OK')"
+
   rust-tests:
     runs-on: ubuntu-latest
     steps:

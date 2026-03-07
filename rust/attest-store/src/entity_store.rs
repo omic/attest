@@ -311,4 +311,38 @@ mod tests {
         assert_eq!(counts["gene"], 2);
         assert_eq!(counts["compound"], 1);
     }
+
+    #[test]
+    fn test_search_single_char_tokens() {
+        let mut store = EntityStore::new();
+        store.upsert("brca1", "gene", "BRCA1 DNA repair", None, 0);
+        store.upsert("tp53", "gene", "TP53 tumor protein", None, 0);
+
+        // Single-char query "a" should be filtered out by tokenize() (len < 2)
+        let results = store.search("a", 10);
+        assert!(results.is_empty(), "single-char token should yield no results");
+    }
+
+    #[test]
+    fn test_search_numeric_entities() {
+        let mut store = EntityStore::new();
+        store.upsert("gene123", "gene", "Gene 123 variant", None, 0);
+        store.upsert("tp53", "gene", "TP53 tumor protein", None, 0);
+
+        // "123" is 3 chars, should be tokenized and found
+        let results = store.search("123", 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "gene123");
+    }
+
+    #[test]
+    fn test_search_top_k_larger_than_matches() {
+        let mut store = EntityStore::new();
+        store.upsert("brca1", "gene", "BRCA1 DNA repair", None, 0);
+        store.upsert("brca2", "gene", "BRCA2 DNA repair", None, 0);
+
+        // top_k=100 but only 2 entities match "dna" — should return 2 without error
+        let results = store.search("dna", 100);
+        assert_eq!(results.len(), 2);
+    }
 }

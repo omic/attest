@@ -1162,4 +1162,138 @@ mod tests {
         let _ = std::fs::remove_file(dir.with_extension("attest.lock"));
         crate::wal::Wal::remove(&dir);
     }
+
+    #[test]
+    fn test_claims_in_range_boundary() {
+        let mut store = RustStore::in_memory();
+        store.upsert_entity("a", "entity", "A", None, 0);
+        store.upsert_entity("b", "entity", "B", None, 0);
+
+        let mut c1 = make_claim("c1", "a", "rel", "b", "obs");
+        c1.timestamp = 1000;
+        let mut c2 = make_claim("c2", "a", "rel", "b", "obs");
+        c2.claim_id = "c2".to_string();
+        c2.timestamp = 2000;
+        let mut c3 = make_claim("c3", "a", "rel", "b", "obs");
+        c3.claim_id = "c3".to_string();
+        c3.timestamp = 3000;
+
+        store.insert_claim(c1);
+        store.insert_claim(c2);
+        store.insert_claim(c3);
+
+        // Exact boundary: single timestamp range should be inclusive
+        let results = store.claims_in_range(1000, 1000);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].timestamp, 1000);
+
+        // Range [2000, 3000] should return 2 claims (inclusive boundaries)
+        let results = store.claims_in_range(2000, 3000);
+        assert_eq!(results.len(), 2);
+
+        // Empty store returns empty
+        let empty_store = RustStore::in_memory();
+        let mut empty_store = empty_store;
+        assert!(empty_store.claims_in_range(0, 9999).is_empty());
+    }
+
+    #[test]
+    fn test_most_recent_claims_edge_cases() {
+        let mut store = RustStore::in_memory();
+        store.upsert_entity("a", "entity", "A", None, 0);
+        store.upsert_entity("b", "entity", "B", None, 0);
+
+        for i in 0..3 {
+            let mut c = make_claim(&format!("mr{i}"), "a", "rel", "b", "obs");
+            c.timestamp = (i + 1) * 1000;
+            store.insert_claim(c);
+        }
+
+        // n=0 should return empty
+        assert!(store.most_recent_claims(0).is_empty());
+
+        // n > total should return all
+        let all = store.most_recent_claims(100);
+        assert_eq!(all.len(), 3);
+
+        // Empty store returns empty
+        let mut empty_store = RustStore::in_memory();
+        assert!(empty_store.most_recent_claims(5).is_empty());
+    }
+
+    #[test]
+    fn test_bfs_depth_zero() {
+        let mut store = RustStore::in_memory();
+        store.upsert_entity("a", "entity", "A", None, 0);
+        store.upsert_entity("b", "entity", "B", None, 0);
+        store.upsert_entity("c", "entity", "C", None, 0);
+
+        store.insert_claim(make_claim("c1", "a", "rel", "b", "obs"));
+        store.insert_claim(make_claim("c2", "b", "rel", "c", "obs"));
+
+        // depth=0 should return no claims (no traversal)
+        let results = store.bfs_claims("a", 0);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_bfs_cyclic_graph() {
+        let mut store = RustStore::in_memory();
+        store.upsert_entity("a", "entity", "A", None, 0);
+        store.upsert_entity("b", "entity", "B", None, 0);
+        store.upsert_entity("c", "entity", "C", None, 0);
+
+        // Create A→B→C→A cycle
+        store.insert_claim(make_claim("c1", "a", "rel", "b", "obs"));
+        store.insert_claim(make_claim("c2", "b", "rel", "c", "obs"));
+        store.insert_claim(make_claim("c3", "c", "rel", "a", "obs"));
+
+        // BFS with depth=3 should not infinite loop and should return claims
+        let results = store.bfs_claims("a", 3);
+        // Should find all 3 claims (no infinite loop)
+        let claim_ids: Vec<&str> = results.iter().map(|(c, _)| c.claim_id.as_str()).collect();
+        assert!(claim_ids.contains(&"c1"));
+        assert!(claim_ids.contains(&"c2"));
+        assert!(claim_ids.contains(&"c3"));
+    }
+
+    #[test]
+    fn test_path_exists_same_entity() {
+        let mut store = setup_store();
+        // Path from entity to itself should handle gracefully
+        let result = store.path_exists("brca1", "brca1", 1);
+        // Should return true (entity is trivially reachable from itself)
+        assert!(result);
+    }
+
+    #[test]
+    fn test_path_exists_nonexistent() {
+        let mut store = setup_store();
+        // Path with nonexistent entity should return false, not panic
+        assert!(!store.path_exists("nonexistent", "brca1", 5));
+        assert!(!store.path_exists("brca1", "nonexistent", 5));
+        assert!(!store.path_exists("nonexistent", "also_nonexistent", 5));
+    }
+
+    #[test]
+    fn test_search_entities_empty_query() {
+        let mut store = RustStore::in_memory();
+        store.upsert_entity("brca1", "gene", "BRCA1", None, 0);
+        store.upsert_entity("tp53", "gene", "TP53", None, 0);
+
+        // Empty query should return empty or all — just should not panic
+        let results = store.search_entities("", 10);
+        // Implementation-dependent: empty query typically returns nothing
+        assert!(results.len() <= 2);
+    }
+
+    #[test]
+    fn test_search_entities_top_k_zero() {
+        let mut store = RustStore::in_memory();
+        store.upsert_entity("brca1", "gene", "BRCA1", None, 0);
+
+        // top_k=0 should return empty
+        let results = store.search_entities("brca1", 0);
+        assert!(results.is_empty());
+    }
 }

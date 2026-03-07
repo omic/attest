@@ -393,4 +393,73 @@ mod tests {
         let entries = Wal::read_entries(&dir).unwrap();
         assert_eq!(entries.len(), 0);
     }
+
+    #[test]
+    fn test_wal_multiple_entries_roundtrip() {
+        let dir = std::env::temp_dir().join("wal_multi_roundtrip_3entry_test.attest");
+        let _ = std::fs::remove_file(&dir);
+        Wal::remove(&dir);
+
+        // Write 3 entries
+        {
+            let mut wal = Wal::open(&dir).unwrap();
+            wal.append_claim(&make_test_claim("m1")).unwrap();
+            wal.append_claim(&make_test_claim("m2")).unwrap();
+            wal.append_claim(&make_test_claim("m3")).unwrap();
+            assert_eq!(wal.entry_count(), 3);
+        }
+
+        // Read all back, verify order and content
+        let entries = Wal::read_entries(&dir).unwrap();
+        assert_eq!(entries.len(), 3);
+        let ids: Vec<&str> = entries
+            .iter()
+            .map(|e| match e {
+                WalEntry::InsertClaim(c) => c.claim_id.as_str(),
+            })
+            .collect();
+        assert_eq!(ids, vec!["m1", "m2", "m3"]);
+
+        Wal::remove(&dir);
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn test_wal_crc_mismatch() {
+        let dir = std::env::temp_dir().join("wal_crc_mismatch_precise_test.attest");
+        let _ = std::fs::remove_file(&dir);
+        Wal::remove(&dir);
+
+        // Write 2 entries
+        {
+            let mut wal = Wal::open(&dir).unwrap();
+            wal.append_claim(&make_test_claim("good")).unwrap();
+            wal.append_claim(&make_test_claim("bad")).unwrap();
+        }
+
+        // Corrupt the CRC of the second entry by reading the file and
+        // overwriting the last 4 bytes (which are the CRC of the second entry).
+        // Entry format after 16-byte header: [4-byte len][data][4-byte CRC]
+        {
+            let wal_path = wal_path_for(&dir);
+            let mut data = std::fs::read(&wal_path).unwrap();
+            let len = data.len();
+            // Last 4 bytes are the CRC of the second entry — flip all bits
+            data[len - 4] ^= 0xFF;
+            data[len - 3] ^= 0xFF;
+            data[len - 2] ^= 0xFF;
+            data[len - 1] ^= 0xFF;
+            std::fs::write(&wal_path, &data).unwrap();
+        }
+
+        // Should recover the first entry only; second is corrupt
+        let entries = Wal::read_entries(&dir).unwrap();
+        assert_eq!(entries.len(), 1);
+        match &entries[0] {
+            WalEntry::InsertClaim(c) => assert_eq!(c.claim_id, "good"),
+        }
+
+        Wal::remove(&dir);
+        let _ = std::fs::remove_file(&dir);
+    }
 }

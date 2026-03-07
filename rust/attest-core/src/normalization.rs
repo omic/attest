@@ -103,4 +103,35 @@ mod tests {
     fn test_already_normalized() {
         assert_eq!(normalize_entity_id("brca1"), "brca1");
     }
+
+    #[test]
+    fn test_uppercase_greek() {
+        // Uppercase Greek alpha (U+0391) → NFKD → lowercase → α (U+03B1) → "alpha"
+        assert_eq!(normalize_entity_id("\u{0391}-synuclein"), "alpha-synuclein");
+    }
+
+    #[test]
+    fn test_non_mapped_greek() {
+        // σ (sigma), φ (phi), ψ (psi) are NOT in GREEK_MAP — left as-is after lowercasing
+        assert_eq!(normalize_entity_id("σ-factor"), "\u{03C3}-factor");
+        assert_eq!(normalize_entity_id("φ-value"), "\u{03C6}-value");
+        assert_eq!(normalize_entity_id("ψ-angle"), "\u{03C8}-angle");
+    }
+
+    #[test]
+    fn test_mixed_greek_latin() {
+        assert_eq!(normalize_entity_id("TNFα receptor"), "tnfalpha receptor");
+    }
+
+    #[test]
+    fn test_unicode_non_breaking_space() {
+        // Non-breaking space (U+00A0) should be collapsed like regular whitespace
+        assert_eq!(normalize_entity_id("hello\u{00A0}world"), "hello world");
+    }
+
+    #[test]
+    fn test_all_whitespace_input() {
+        // Input of only whitespace should normalize to empty string
+        assert_eq!(normalize_entity_id("   \t\n  "), "");
+    }
 }

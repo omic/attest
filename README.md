@@ -1,5 +1,11 @@
 # Attest
 
+[![PyPI - attestdb](https://img.shields.io/pypi/v/attestdb?label=attestdb)](https://pypi.org/project/attestdb/)
+[![PyPI - attest-py](https://img.shields.io/pypi/v/attest-py?label=attest-py)](https://pypi.org/project/attest-py/)
+[![Tests](https://github.com/omic/attest/actions/workflows/test.yml/badge.svg)](https://github.com/omic/attest/actions/workflows/test.yml)
+[![Python 3.11+](https://img.shields.io/pypi/pyversions/attestdb)](https://pypi.org/project/attestdb/)
+[![License: BSL-1.1](https://img.shields.io/badge/license-BSL--1.1-blue)](LICENSE)
+
 > Licensed under the [Business Source License 1.1](LICENSE). Free to use, modify, and self-host. Cannot be offered as a competing managed service. Converts to Apache 2.0 after 4 years.
 
 A **claim-native database** for building reality models -- structured, provenanced, continuously-learning representations of organizational knowledge.
