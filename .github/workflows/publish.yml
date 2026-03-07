@@ -68,7 +68,7 @@ jobs:
         with:
           working-directory: rust/attest-py
           target: ${{ matrix.target }}
-          args: --release --out dist
+          args: --release --out dist -i python3.12
           manylinux: auto
 
       - name: Upload artifact
@@ -96,6 +96,7 @@ jobs:
   publish-rust:
     name: Publish attest-py to PyPI
     needs: build-rust
+    if: always() && !cancelled()
     runs-on: ubuntu-latest
     environment: pypi
     steps:
