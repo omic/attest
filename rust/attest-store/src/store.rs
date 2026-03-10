@@ -1,43 +1,20 @@
 //! RustStore — drop-in replacement for KuzuStore.
 //!
-//! In-memory store backed by append-only claim log with persistence
-//! to a single file. Implements the full 22-method KuzuStore interface.
+//! Thin dispatcher over storage backends. All business logic
+//! lives in the backend modules (`backend::memory`, `backend::redb`).
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 
 use attest_core::errors::AttestError;
-use attest_core::normalization::normalize_entity_id;
 use attest_core::types::{Claim, EntitySummary};
-use attest_core::vocabulary::ALIAS_PREDICATES;
 
-use crate::claim_log::ClaimLog;
-use crate::entity_store::EntityStore;
-use crate::file_format;
-use crate::metadata::{MetadataStore, Vocabulary};
-use crate::union_find::UnionFind;
-use crate::wal::{Wal, WalEntry};
-
-/// Serializable snapshot of the entire store state (owned, for deserialization).
-#[derive(Debug, Clone, serde::Deserialize)]
-struct StoreState {
-    claims: ClaimLog,
-    entities: EntityStore,
-    metadata: MetadataStore,
-    aliases: UnionFind,
-}
-
-/// Borrowed view of store state for serialization (avoids cloning).
-#[derive(Debug, serde::Serialize)]
-struct StoreStateRef<'a> {
-    claims: &'a ClaimLog,
-    entities: &'a EntityStore,
-    metadata: &'a MetadataStore,
-    aliases: &'a UnionFind,
-}
+use crate::backend::memory::DEFAULT_CHECKPOINT_INTERVAL;
+use crate::backend::migration;
+use crate::backend::{Backend, MemoryBackend, RedbBackend};
+use crate::metadata::Vocabulary;
 
 /// Store statistics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct StoreStats {
     pub total_claims: usize,
     pub entity_count: usize,
@@ -46,25 +23,12 @@ pub struct StoreStats {
     pub source_types: HashMap<String, usize>,
 }
 
-/// In-memory claim-native store with file persistence.
+/// Claim-native store with pluggable backend.
 ///
 /// Concurrency model: single-writer via advisory file lock.
 /// The lock is acquired on `new()` and released on `close()`.
-/// Attempting to open the same database from another process will fail
-/// with `AttestError::Provenance("database is locked ...")`.
-/// Default: auto-checkpoint after this many WAL entries.
-const DEFAULT_CHECKPOINT_INTERVAL: u64 = 1000;
-
 pub struct RustStore {
-    db_path: PathBuf,
-    claims: ClaimLog,
-    entities: EntityStore,
-    metadata: MetadataStore,
-    aliases: UnionFind,
-    /// Held for the lifetime of the store to enforce single-writer.
-    _lock_file: Option<std::fs::File>,
-    /// Write-ahead log for crash durability (None for in-memory stores).
-    wal: Option<Wal>,
+    backend: Backend,
     /// Auto-checkpoint after this many WAL entries. 0 = disabled.
     checkpoint_interval: u64,
 }
@@ -76,110 +40,41 @@ impl RustStore {
     /// has a checksum mismatch (crash during write), the store starts
     /// empty with a warning — the corrupted file is not trusted.
     pub fn new(db_path: &str) -> Result<Self, AttestError> {
-        let path = PathBuf::from(db_path);
+        let path = std::path::Path::new(db_path);
 
-        // Acquire exclusive lock
-        let lock_file = file_format::acquire_lock(&path)
-            .map_err(|e| AttestError::Provenance(format!("failed to lock database: {e}")))?;
-
-        let mut store = if path.exists() && file_format::is_attest_file(&path) {
-            match file_format::read_store::<StoreState>(&path) {
-                Ok(state) => {
-                    let mut claims = state.claims;
-                    let mut entities = state.entities;
-                    let mut aliases = state.aliases;
-                    // Rebuild indexes that may be empty from older file formats
-                    claims.rebuild_derived_indexes();
-                    entities.rebuild_text_index();
-                    aliases.rebuild_groups();
-                    Self {
-                        db_path: path.clone(),
-                        claims,
-                        entities,
-                        metadata: state.metadata,
-                        aliases,
-                        _lock_file: Some(lock_file),
-                        wal: None,
-                        checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
-                    }
-                }
-                Err(file_format::FileError::ChecksumMismatch { expected, actual }) => {
-                    // Crash recovery: checkpoint is corrupted, WAL replay below
-                    // may still recover data
-                    log::warn!(
-                        "Database file corrupted (checksum {actual:#010x} != {expected:#010x}). \
-                         Starting with empty store, will attempt WAL replay."
-                    );
-                    Self {
-                        db_path: path.clone(),
-                        claims: ClaimLog::new(),
-                        entities: EntityStore::new(),
-                        metadata: MetadataStore::new(),
-                        aliases: UnionFind::new(),
-                        _lock_file: Some(lock_file),
-                        wal: None,
-                        checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
-                    }
-                }
-                Err(e) => {
-                    file_format::release_lock(&lock_file);
-                    return Err(AttestError::Provenance(
-                        format!("failed to open database: {e}"),
-                    ));
-                }
-            }
-        } else {
-            Self {
-                db_path: path.clone(),
-                claims: ClaimLog::new(),
-                entities: EntityStore::new(),
-                metadata: MetadataStore::new(),
-                aliases: UnionFind::new(),
-                _lock_file: Some(lock_file),
-                wal: None,
+        // If file exists with old SUBSTRT\0 format → auto-migrate to redb
+        if migration::needs_migration(path) {
+            log::info!("Detected old format database, migrating to redb...");
+            let backend = migration::migrate_to_redb(db_path)?;
+            return Ok(Self {
+                backend: Backend::File(backend),
                 checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
-            }
-        };
-
-        // Replay WAL entries (claims recorded after last checkpoint)
-        match Wal::read_entries(&path) {
-            Ok(entries) => {
-                let count = entries.len();
-                for entry in entries {
-                    match entry {
-                        WalEntry::InsertClaim(claim) => {
-                            store.insert_claim_no_wal(claim);
-                        }
-                    }
-                }
-                if count > 0 {
-                    log::info!("Replayed {count} WAL entries");
-                }
-            }
-            Err(e) => {
-                log::warn!("Failed to read WAL: {e}");
-            }
+            });
         }
 
-        // Open WAL for future writes
-        store.wal = Some(
-            Wal::open(&path)
-                .map_err(|e| AttestError::Provenance(format!("failed to open WAL: {e}")))?
-        );
+        // Otherwise → use RedbBackend (handles non-existent, valid redb, and corrupted files)
+        let backend = RedbBackend::open(db_path)?;
+        Ok(Self {
+            backend: Backend::File(backend),
+            checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
+        })
+    }
 
-        Ok(store)
+    /// Open or create a store using the legacy in-memory backend.
+    /// This is used for `:memory:` stores and for opening old SUBSTRT\0 format files.
+    #[cfg(test)]
+    pub fn new_memory_backend(db_path: &str) -> Result<Self, AttestError> {
+        let backend = MemoryBackend::open(db_path)?;
+        Ok(Self {
+            backend: Backend::InMemory(backend),
+            checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
+        })
     }
 
     /// Create a purely in-memory store (no file path, no persistence, no lock, no WAL).
     pub fn in_memory() -> Self {
         Self {
-            db_path: PathBuf::new(),
-            claims: ClaimLog::new(),
-            entities: EntityStore::new(),
-            metadata: MetadataStore::new(),
-            aliases: UnionFind::new(),
-            _lock_file: None,
-            wal: None,
+            backend: Backend::InMemory(MemoryBackend::new_empty()),
             checkpoint_interval: 0,
         }
     }
@@ -187,108 +82,92 @@ impl RustStore {
     // ── Lifecycle ──────────────────────────────────────────────────────
 
     /// Persist state and close. Releases the file lock.
-    ///
-    /// Writes a full checkpoint (`.attest` file), truncates the WAL,
-    /// then releases the lock.
     pub fn close(&mut self) -> Result<(), AttestError> {
-        if self.db_path.as_os_str().is_empty() || self._lock_file.is_none() {
-            return Ok(()); // in-memory or already closed
+        match &mut self.backend {
+            Backend::InMemory(m) => m.close(),
+            Backend::File(r) => r.close(),
         }
-        let state = StoreStateRef {
-            claims: &self.claims,
-            entities: &self.entities,
-            metadata: &self.metadata,
-            aliases: &self.aliases,
-        };
-        let write_result = file_format::write_store(&self.db_path, &state);
-
-        // Truncate WAL after successful checkpoint
-        if write_result.is_ok() {
-            if let Some(ref mut wal) = self.wal {
-                if let Err(e) = wal.truncate() {
-                    log::warn!("Failed to truncate WAL after checkpoint: {e}");
-                }
-            }
-        }
-
-        // Always release the lock, even if write failed — holding it wedges the DB
-        if let Some(lock) = self._lock_file.take() {
-            file_format::release_lock(&lock);
-        }
-        self.wal = None;
-
-        write_result
-            .map_err(|e| AttestError::Provenance(format!("failed to save database: {e}")))
     }
 
     /// Write a full checkpoint without releasing the lock.
-    ///
-    /// Flushes all in-memory state to the `.attest` file and truncates
-    /// the WAL. The store remains open for further operations.
     pub fn checkpoint(&mut self) -> Result<(), AttestError> {
-        if self.db_path.as_os_str().is_empty() || self._lock_file.is_none() {
-            return Ok(());
+        match &mut self.backend {
+            Backend::InMemory(m) => m.checkpoint(),
+            Backend::File(r) => r.checkpoint(),
         }
-        let state = StoreStateRef {
-            claims: &self.claims,
-            entities: &self.entities,
-            metadata: &self.metadata,
-            aliases: &self.aliases,
-        };
-        file_format::write_store(&self.db_path, &state)
-            .map_err(|e| AttestError::Provenance(format!("checkpoint failed: {e}")))?;
-
-        if let Some(ref mut wal) = self.wal {
-            wal.truncate()
-                .map_err(|e| AttestError::Provenance(format!("WAL truncate failed: {e}")))?;
-        }
-        Ok(())
     }
 
     // ── Metadata ───────────────────────────────────────────────────────
 
     pub fn register_vocabulary(&mut self, namespace: &str, vocab: Vocabulary) {
-        self.metadata.register_vocabulary(namespace, vocab);
+        match &mut self.backend {
+            Backend::InMemory(m) => m.register_vocabulary(namespace, vocab),
+            Backend::File(r) => r.register_vocabulary(namespace, vocab),
+        }
     }
 
     pub fn register_predicate(&mut self, predicate_id: &str, constraints: serde_json::Value) {
-        self.metadata.register_predicate(predicate_id, constraints);
+        match &mut self.backend {
+            Backend::InMemory(m) => m.register_predicate(predicate_id, constraints),
+            Backend::File(r) => r.register_predicate(predicate_id, constraints),
+        }
     }
 
     pub fn register_payload_schema(&mut self, schema_id: &str, schema: serde_json::Value) {
-        self.metadata.register_payload_schema(schema_id, schema);
+        match &mut self.backend {
+            Backend::InMemory(m) => m.register_payload_schema(schema_id, schema),
+            Backend::File(r) => r.register_payload_schema(schema_id, schema),
+        }
     }
 
     pub fn get_registered_vocabularies(&self) -> &HashMap<String, Vocabulary> {
-        self.metadata.vocabularies()
+        match &self.backend {
+            Backend::InMemory(m) => m.get_registered_vocabularies(),
+            Backend::File(r) => r.get_registered_vocabularies(),
+        }
     }
 
     pub fn get_predicate_constraints(&self) -> HashMap<String, serde_json::Value> {
-        self.metadata.predicate_constraints()
+        match &self.backend {
+            Backend::InMemory(m) => m.get_predicate_constraints(),
+            Backend::File(r) => r.get_predicate_constraints(),
+        }
     }
 
     pub fn get_payload_schemas(&self) -> HashMap<String, serde_json::Value> {
-        self.metadata.payload_schemas()
+        match &self.backend {
+            Backend::InMemory(m) => m.get_payload_schemas(),
+            Backend::File(r) => r.get_payload_schemas(),
+        }
     }
 
     // ── Alias resolution ───────────────────────────────────────────────
 
     /// Resolve entity ID through alias chain.
     pub fn resolve(&mut self, entity_id: &str) -> String {
-        let canonical = normalize_entity_id(entity_id);
-        self.aliases.find(&canonical)
+        match &mut self.backend {
+            Backend::InMemory(m) => m.resolve(entity_id),
+            Backend::File(r) => r.resolve(entity_id),
+        }
     }
 
     /// Get all entity IDs that resolve to the same canonical.
     pub fn get_alias_group(&mut self, entity_id: &str) -> HashSet<String> {
-        let canonical = normalize_entity_id(entity_id);
-        self.aliases.get_group(&canonical)
+        match &mut self.backend {
+            Backend::InMemory(m) => m.get_alias_group(entity_id),
+            Backend::File(r) => r.get_alias_group(entity_id),
+        }
     }
 
     // ── Cache management ───────────────────────────────────────────────
 
     /// No-op in Rust — everything is already in memory.
-    pub fn warm_caches(&self) {}
+    pub fn warm_caches(&self) {
+        match &self.backend {
+            Backend::InMemory(m) => m.warm_caches(),
+            Backend::File(r) => r.warm_caches(),
+        }
+    }
 
     // ── Entity CRUD ────────────────────────────────────────────────────
 
@@ -300,13 +179,21 @@ impl RustStore {
         external_ids: Option<&HashMap<String, String>>,
         timestamp: i64,
     ) {
-        self.entities
-            .upsert(entity_id, entity_type, display_name, external_ids, timestamp);
+        match &mut self.backend {
+            Backend::InMemory(m) => {
+                m.upsert_entity(entity_id, entity_type, display_name, external_ids, timestamp)
+            }
+            Backend::File(r) => {
+                r.upsert_entity(entity_id, entity_type, display_name, external_ids, timestamp)
+            }
+        }
     }
 
     pub fn get_entity(&self, entity_id: &str) -> Option<EntitySummary> {
-        let claim_count = self.claims.count_for_entity(entity_id);
-        self.entities.get_summary(entity_id, claim_count)
+        match &self.backend {
+            Backend::InMemory(m) => m.get_entity(entity_id),
+            Backend::File(r) => r.get_entity(entity_id),
+        }
     }
 
     pub fn list_entities(
@@ -314,24 +201,10 @@ impl RustStore {
         entity_type: Option<&str>,
         min_claims: usize,
     ) -> Vec<EntitySummary> {
-        self.entities
-            .list(entity_type)
-            .into_iter()
-            .filter_map(|e| {
-                let count = self.claims.count_for_entity(&e.id);
-                if count >= min_claims {
-                    Some(EntitySummary {
-                        id: e.id.clone(),
-                        name: e.display_name.clone(),
-                        entity_type: e.entity_type.clone(),
-                        external_ids: e.external_ids.clone(),
-                        claim_count: count,
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect()
+        match &self.backend {
+            Backend::InMemory(m) => m.list_entities(entity_type, min_claims),
+            Backend::File(r) => r.list_entities(entity_type, min_claims),
+        }
     }
 
     // ── Claim operations ───────────────────────────────────────────────
@@ -341,135 +214,58 @@ impl RustStore {
     /// The claim is appended to the WAL and fsynced BEFORE being applied
     /// to in-memory state. Returns `false` if the claim_id already exists.
     pub fn insert_claim(&mut self, claim: Claim) -> bool {
-        if self.claims.contains(&claim.claim_id) {
-            return false;
+        let interval = self.checkpoint_interval;
+        match &mut self.backend {
+            Backend::InMemory(m) => m.insert_claim(claim, interval),
+            Backend::File(r) => r.insert_claim(claim, interval),
         }
-
-        // Write to WAL first (durability before visibility)
-        if let Some(ref mut wal) = self.wal {
-            if let Err(e) = wal.append_claim(&claim) {
-                log::error!("WAL write failed for claim {}: {e}", claim.claim_id);
-                return false;
-            }
-        }
-
-        self.apply_claim(claim);
-
-        // Auto-checkpoint if interval reached
-        if self.checkpoint_interval > 0 {
-            if let Some(ref wal) = self.wal {
-                if wal.entry_count() >= self.checkpoint_interval {
-                    if let Err(e) = self.checkpoint() {
-                        log::warn!("Auto-checkpoint failed: {e}");
-                    }
-                }
-            }
-        }
-
-        true
     }
 
     /// Insert a batch of claims with a single WAL sync at the end.
-    ///
-    /// Much faster than calling `insert_claim` in a loop because it avoids
-    /// per-claim fsync. Claims are written to WAL without sync, then a single
-    /// sync + checkpoint is done at the end.
     pub fn insert_claims_batch(&mut self, claims: Vec<Claim>) -> usize {
-        let mut inserted = 0usize;
-        for claim in claims {
-            if self.claims.contains(&claim.claim_id) {
-                continue;
-            }
-
-            // Write to WAL without fsync
-            if let Some(ref mut wal) = self.wal {
-                if let Err(e) = wal.append_claim_no_sync(&claim) {
-                    log::error!("WAL write failed for claim {}: {e}", claim.claim_id);
-                    continue; // Skip claim — not durable
-                }
-            }
-
-            self.apply_claim(claim);
-            inserted += 1;
-        }
-
-        // Single sync + checkpoint at end of batch
-        if let Some(ref mut wal) = self.wal {
-            if let Err(e) = wal.sync() {
-                log::error!("WAL sync failed after batch insert: {e}");
-            }
-        }
-        if self.checkpoint_interval > 0 {
-            if let Some(ref wal) = self.wal {
-                if wal.entry_count() >= self.checkpoint_interval {
-                    if let Err(e) = self.checkpoint() {
-                        log::warn!("Auto-checkpoint failed after batch: {e}");
-                    }
-                }
-            }
-        }
-
-        inserted
-    }
-
-    /// Insert a claim without WAL write (used during WAL replay).
-    fn insert_claim_no_wal(&mut self, claim: Claim) -> bool {
-        if self.claims.contains(&claim.claim_id) {
-            return false;
-        }
-        self.apply_claim(claim);
-        true
-    }
-
-    /// Apply a claim to in-memory state (indexes + aliases).
-    fn apply_claim(&mut self, claim: Claim) {
-        let pred_id = claim.predicate.id.clone();
-        let subj_id = claim.subject.id.clone();
-        let obj_id = claim.object.id.clone();
-
-        self.claims.append(claim);
-
-        if ALIAS_PREDICATES.contains(pred_id.as_str()) {
-            if pred_id == "same_as" {
-                self.aliases.union(&subj_id, &obj_id);
-            } else if pred_id == "not_same_as" {
-                self.aliases.split(&subj_id);
-            }
+        let interval = self.checkpoint_interval;
+        match &mut self.backend {
+            Backend::InMemory(m) => m.insert_claims_batch(claims, interval),
+            Backend::File(r) => r.insert_claims_batch(claims, interval),
         }
     }
 
     pub fn claim_exists(&self, claim_id: &str) -> bool {
-        self.claims.contains(claim_id)
+        match &self.backend {
+            Backend::InMemory(m) => m.claim_exists(claim_id),
+            Backend::File(r) => r.claim_exists(claim_id),
+        }
     }
 
     pub fn claims_by_content_id(&self, content_id: &str) -> Vec<Claim> {
-        self.claims
-            .by_content_id(content_id)
-            .into_iter()
-            .cloned()
-            .collect()
+        match &self.backend {
+            Backend::InMemory(m) => m.claims_by_content_id(content_id),
+            Backend::File(r) => r.claims_by_content_id(content_id),
+        }
+    }
+
+    /// Get all claims.
+    pub fn all_claims(&self) -> Vec<Claim> {
+        match &self.backend {
+            Backend::InMemory(m) => m.all_claims(),
+            Backend::File(r) => r.all_claims(),
+        }
     }
 
     /// Get all claims matching a source_id.
-    pub fn all_claims(&self) -> Vec<Claim> {
-        self.claims.all_claims().to_vec()
-    }
-
     pub fn claims_by_source_id(&self, source_id: &str) -> Vec<Claim> {
-        self.claims
-            .by_source_id(source_id)
-            .into_iter()
-            .cloned()
-            .collect()
+        match &self.backend {
+            Backend::InMemory(m) => m.claims_by_source_id(source_id),
+            Backend::File(r) => r.claims_by_source_id(source_id),
+        }
     }
 
     /// Get all claims matching a predicate_id.
     pub fn claims_by_predicate_id(&self, predicate_id: &str) -> Vec<Claim> {
-        self.claims
-            .by_predicate_id(predicate_id)
-            .into_iter()
-            .cloned()
-            .collect()
+        match &self.backend {
+            Backend::InMemory(m) => m.claims_by_predicate_id(predicate_id),
+            Backend::File(r) => r.claims_by_predicate_id(predicate_id),
+        }
     }
 
     pub fn claims_for(
@@ -479,169 +275,80 @@ impl RustStore {
         source_type: Option<&str>,
         min_confidence: f64,
     ) -> Vec<Claim> {
-        let resolved = self.resolve(entity_id);
-        let aliases = self.get_alias_group(&resolved);
-        self.claims
-            .for_entity_filtered(&aliases, predicate_type, source_type, min_confidence)
-            .into_iter()
-            .cloned()
-            .collect()
+        match &mut self.backend {
+            Backend::InMemory(m) => {
+                m.claims_for(entity_id, predicate_type, source_type, min_confidence)
+            }
+            Backend::File(r) => {
+                r.claims_for(entity_id, predicate_type, source_type, min_confidence)
+            }
+        }
     }
 
     /// Get the provenance chain for a claim.
     pub fn get_claim_provenance_chain(&self, claim_id: &str) -> Vec<String> {
-        self.claims
-            .get(claim_id)
-            .map(|c| c.provenance.chain.clone())
-            .unwrap_or_default()
+        match &self.backend {
+            Backend::InMemory(m) => m.get_claim_provenance_chain(claim_id),
+            Backend::File(r) => r.get_claim_provenance_chain(claim_id),
+        }
     }
 
     // ── Graph traversal ────────────────────────────────────────────────
 
     /// BFS traversal collecting claims at each hop depth.
     pub fn bfs_claims(&mut self, entity_id: &str, max_depth: usize) -> Vec<(Claim, usize)> {
-        let resolved = self.resolve(entity_id);
-        let aliases = self.get_alias_group(&resolved);
-        let mut visited: HashSet<String> = aliases.clone();
-        let mut frontier: HashSet<String> = aliases;
-        let mut results: Vec<(Claim, usize)> = Vec::new();
-
-        for hop in 1..=max_depth {
-            if frontier.is_empty() {
-                break;
-            }
-
-            let claims = self.claims.for_entities(&frontier);
-            let mut next_frontier = HashSet::new();
-
-            for claim in claims {
-                results.push((claim.clone(), hop));
-                for eid in [&claim.subject.id, &claim.object.id] {
-                    if !visited.contains(eid) {
-                        next_frontier.insert(eid.clone());
-                        visited.insert(eid.clone());
-                    }
-                }
-            }
-
-            frontier = next_frontier;
+        match &mut self.backend {
+            Backend::InMemory(m) => m.bfs_claims(entity_id, max_depth),
+            Backend::File(r) => r.bfs_claims(entity_id, max_depth),
         }
-
-        results
     }
 
     /// Check if a path exists between two entities within max_depth hops.
     pub fn path_exists(&mut self, entity_a: &str, entity_b: &str, max_depth: usize) -> bool {
-        let ra = self.resolve(entity_a);
-        let rb = self.resolve(entity_b);
-
-        if ra == rb {
-            return true;
+        match &mut self.backend {
+            Backend::InMemory(m) => m.path_exists(entity_a, entity_b, max_depth),
+            Backend::File(r) => r.path_exists(entity_a, entity_b, max_depth),
         }
-
-        // BFS from ra
-        let mut visited = HashSet::new();
-        visited.insert(ra.clone());
-        let mut frontier = HashSet::new();
-        frontier.insert(ra);
-
-        for _ in 0..max_depth {
-            if frontier.is_empty() {
-                break;
-            }
-
-            let claims = self.claims.for_entities(&frontier);
-            let mut next_frontier = HashSet::new();
-
-            for claim in claims {
-                for eid in [&claim.subject.id, &claim.object.id] {
-                    if *eid == rb {
-                        return true;
-                    }
-                    if !visited.contains(eid) {
-                        next_frontier.insert(eid.clone());
-                        visited.insert(eid.clone());
-                    }
-                }
-            }
-
-            frontier = next_frontier;
-        }
-
-        false
     }
 
-    /// Get the bidirectional adjacency list. O(1) — returns a clone of the
-    /// maintained index (updated on every insert_claim).
+    /// Get the bidirectional adjacency list.
     pub fn get_adjacency_list(&self) -> HashMap<String, HashSet<String>> {
-        self.claims.adjacency_list().clone()
+        match &self.backend {
+            Backend::InMemory(m) => m.get_adjacency_list(),
+            Backend::File(r) => r.get_adjacency_list(),
+        }
     }
 
     /// Get claims within a timestamp range [min_ts, max_ts] (inclusive).
     pub fn claims_in_range(&mut self, min_ts: i64, max_ts: i64) -> Vec<Claim> {
-        self.claims
-            .in_time_range(min_ts, max_ts)
-            .into_iter()
-            .cloned()
-            .collect()
+        match &mut self.backend {
+            Backend::InMemory(m) => m.claims_in_range(min_ts, max_ts),
+            Backend::File(r) => r.claims_in_range(min_ts, max_ts),
+        }
     }
 
     /// Get the most recent N claims by timestamp.
     pub fn most_recent_claims(&mut self, n: usize) -> Vec<Claim> {
-        self.claims.most_recent(n).into_iter().cloned().collect()
+        match &mut self.backend {
+            Backend::InMemory(m) => m.most_recent_claims(n),
+            Backend::File(r) => r.most_recent_claims(n),
+        }
     }
 
-    /// Search entities by text query. Returns entity summaries matching the query,
-    /// ranked by relevance (number of matching tokens).
+    /// Search entities by text query.
     pub fn search_entities(&self, query: &str, top_k: usize) -> Vec<EntitySummary> {
-        self.entities
-            .search(query, top_k)
-            .into_iter()
-            .map(|e| {
-                let count = self.claims.count_for_entity(&e.id);
-                EntitySummary {
-                    id: e.id.clone(),
-                    name: e.display_name.clone(),
-                    entity_type: e.entity_type.clone(),
-                    external_ids: e.external_ids.clone(),
-                    claim_count: count,
-                }
-            })
-            .collect()
+        match &self.backend {
+            Backend::InMemory(m) => m.search_entities(query, top_k),
+            Backend::File(r) => r.search_entities(query, top_k),
+        }
     }
 
     // ── Stats ──────────────────────────────────────────────────────────
 
     pub fn stats(&self) -> StoreStats {
-        StoreStats {
-            total_claims: self.claims.len(),
-            entity_count: self.entities.len(),
-            entity_types: self.entities.count_by_type(),
-            predicate_types: self.claims.count_by_predicate_type(),
-            source_types: self.claims.count_by_source_type(),
-        }
-    }
-}
-
-impl Drop for RustStore {
-    fn drop(&mut self) {
-        if self._lock_file.is_some() {
-            // close() was never called — but WAL has durable entries.
-            // Best-effort: try to checkpoint before releasing lock.
-            log::warn!(
-                "RustStore dropped without calling close() — \
-                 attempting best-effort checkpoint."
-            );
-            if let Err(e) = self.checkpoint() {
-                log::error!(
-                    "Best-effort checkpoint in Drop failed: {e}. \
-                     WAL entries are still durable and will replay on next open."
-                );
-            }
-            self.wal = None;
-            if let Some(lock) = self._lock_file.take() {
-                file_format::release_lock(&lock);
-            }
+        match &self.backend {
+            Backend::InMemory(m) => m.stats(),
+            Backend::File(r) => r.stats(),
         }
     }
 }
@@ -959,12 +666,13 @@ mod tests {
             store.close().unwrap();
         }
 
-        // Corrupt the file by flipping a byte in the data section
+        // Corrupt the file by overwriting the magic bytes (detected by both backends)
         {
             let mut data = std::fs::read(&dir).unwrap();
-            // Flip a byte in the data section (after 32-byte header)
-            if data.len() > 40 {
-                data[40] ^= 0xFF;
+            // Overwrite first 16 bytes — triggers magic number check in both
+            // the old SUBSTRT\0 format and redb's file header
+            for i in 0..std::cmp::min(16, data.len()) {
+                data[i] = 0xFF;
             }
             std::fs::write(&dir, &data).unwrap();
         }

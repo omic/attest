@@ -13,6 +13,7 @@ bincode = "1"
 crc32fast = "1"
 fs2 = "0.4"
 log = "0.4"
+redb = "2"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

@@ -7,11 +7,25 @@ BUILT_IN_ENTITY_TYPES: set[str] = {
 BUILT_IN_PREDICATE_TYPES: set[str] = {
     "relates_to", "caused", "observed", "derived_from", "contradicts",
     "same_as", "not_same_as", "retracted", "contradiction_resolved", "inquiry",
+    "no_evidence_for", "superseded_by",
+}
+
+# Research predicates — used by multi-agent collaborative research
+RESEARCH_PREDICATES: set[str] = {
+    "has_finding", "has_gap", "investigating",
+    "no_evidence_for", "superseded_by", "has_strategy",
+}
+
+# Opposing research predicates — evidence vs absence
+OPPOSITE_RESEARCH_PREDICATES: dict[str, str] = {
+    "no_evidence_for": "supports",
+    "supports": "no_evidence_for",
 }
 
 BUILT_IN_SOURCE_TYPES: set[str] = {
     "observation", "computation", "document_extraction",
     "llm_inference", "human_annotation", "chat_extraction",
+    "agent",
 }
 
 # Predicates with special engine semantics

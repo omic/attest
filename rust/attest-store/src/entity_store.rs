@@ -5,6 +5,15 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use attest_core::types::EntitySummary;
 
+/// Tokenize a string for the text index: lowercase, split on non-alphanumeric, min 2 chars.
+pub(crate) fn tokenize(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 2)
+        .map(|t| t.to_string())
+        .collect()
+}
+
 /// Stored entity data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntityData {
@@ -13,6 +22,19 @@ pub struct EntityData {
     pub display_name: String,
     pub external_ids: HashMap<String, String>,
     pub created_at: i64,
+}
+
+impl EntityData {
+    /// Convert to an EntitySummary with the given claim count.
+    pub fn to_summary(&self, claim_count: usize) -> EntitySummary {
+        EntitySummary {
+            id: self.id.clone(),
+            name: self.display_name.clone(),
+            entity_type: self.entity_type.clone(),
+            external_ids: self.external_ids.clone(),
+            claim_count,
+        }
+    }
 }
 
 /// Entity storage with type-based indexing and text search.
@@ -37,15 +59,6 @@ impl EntityStore {
             type_index: HashMap::new(),
             text_index: HashMap::new(),
         }
-    }
-
-    /// Tokenize a string for the text index: lowercase, split on non-alphanumeric.
-    fn tokenize(text: &str) -> Vec<String> {
-        text.to_lowercase()
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|t| t.len() >= 2)
-            .map(|t| t.to_string())
-            .collect()
     }
 
     /// Insert or update an entity. Merges external_ids if entity already exists.
@@ -75,7 +88,7 @@ impl EntityStore {
 
         // Index tokens from display_name and entity_id (deduplicated)
         let mut seen = HashSet::new();
-        for token in Self::tokenize(display).into_iter().chain(Self::tokenize(entity_id)) {
+        for token in tokenize(display).into_iter().chain(tokenize(entity_id)) {
             if seen.insert(token.clone()) {
                 self.text_index
                     .entry(token)
@@ -112,13 +125,7 @@ impl EntityStore {
 
     /// Get entity as summary (claim_count must be provided by caller from claim_log).
     pub fn get_summary(&self, entity_id: &str, claim_count: usize) -> Option<EntitySummary> {
-        self.entities.get(entity_id).map(|e| EntitySummary {
-            id: e.id.clone(),
-            name: e.display_name.clone(),
-            entity_type: e.entity_type.clone(),
-            external_ids: e.external_ids.clone(),
-            claim_count,
-        })
+        self.entities.get(entity_id).map(|e| e.to_summary(claim_count))
     }
 
     /// List all entities, optionally filtered by type.
@@ -140,7 +147,7 @@ impl EntityStore {
     /// Search entities by text query. Returns entities matching any query token,
     /// ranked by number of matching tokens (BM25-lite).
     pub fn search(&self, query: &str, top_k: usize) -> Vec<&EntityData> {
-        let tokens = Self::tokenize(query);
+        let tokens = tokenize(query);
         if tokens.is_empty() {
             return Vec::new();
         }
@@ -178,7 +185,7 @@ impl EntityStore {
                 data.display_name.as_str()
             };
             let mut seen = HashSet::new();
-            for token in Self::tokenize(display) {
+            for token in tokenize(display) {
                 if seen.insert(token.clone()) {
                     self.text_index
                         .entry(token)
@@ -186,7 +193,7 @@ impl EntityStore {
                         .push(entity_id.clone());
                 }
             }
-            for token in Self::tokenize(entity_id) {
+            for token in tokenize(entity_id) {
                 if seen.insert(token.clone()) {
                     self.text_index
                         .entry(token)

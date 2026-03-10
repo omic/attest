@@ -1090,7 +1090,7 @@ def attest_learned(
     Args:
         subject: What it's about — file path, module name, concept, tool name
         insight: What you learned, in plain English
-        insight_type: One of: bug, fix, pattern, decision, warning, tip
+        insight_type: One of: bug, fix, pattern, decision, warning, tip, negative_result
         confidence: How confident you are (0.0-1.0, default 0.8)
 
     Examples:
@@ -1108,6 +1108,7 @@ def attest_learned(
         "decision": "has_decision",
         "warning": "has_warning",
         "tip": "has_tip",
+        "negative_result": "no_evidence_for",
     }
     predicate = type_to_predicate.get(insight_type, "has_pattern")
 
@@ -1267,6 +1268,124 @@ def attest_session_end(
         "files_recorded": len(files_changed or []),
         "message": f"Session {sid[:12]}... recorded as {outcome}",
     })
+
+
+@mcp.tool()
+def attest_negative_result(
+    subject: str,
+    hypothesis: str,
+    search_strategy: str = "",
+    confidence: float = 0.7,
+) -> str:
+    """Record that you investigated something and found NO evidence for it.
+
+    This is critical for collaborative research — negative results prune the
+    search tree for future sessions and other agents. Every failed investigation
+    is data that prevents wasted effort.
+
+    Args:
+        subject: What entity you investigated (file, module, concept)
+        hypothesis: What you were looking for and didn't find
+        search_strategy: How you searched (e.g. "grep + read 5 files + tested")
+        confidence: How thorough your search was (0.0-1.0, higher = more exhaustive)
+
+    Examples:
+        attest_negative_result("attest_db.py", "thread-safe concurrent writes", "tested with ThreadPoolExecutor")
+        attest_negative_result("RustStore", "streaming query API", "read all 27 PyO3 methods")
+        attest_negative_result("bincode", "serde_json::Value serialization support", "tested + read docs", 0.95)
+    """
+    db = _get_db()
+
+    if "/" in subject or subject.endswith((".py", ".rs", ".ts")):
+        entity_type = "source_file"
+    elif subject.endswith("()") or "::" in subject:
+        entity_type = "function"
+    else:
+        entity_type = "concept"
+
+    sid = _session_tracker["session_id"] if _session_tracker else "manual"
+
+    payload = None
+    if search_strategy:
+        payload = {
+            "schema_ref": "negative_result",
+            "data": {"search_strategy": search_strategy},
+        }
+
+    claim_id = db.ingest(
+        subject=(subject, entity_type),
+        predicate=("no_evidence_for", "research"),
+        object=(hypothesis, "hypothesis"),
+        provenance={"source_type": "agent_learning", "source_id": sid},
+        confidence=confidence,
+        payload=payload,
+    )
+
+    _track_claims_ingested(1)
+
+    return json.dumps({
+        "claim_id": claim_id,
+        "recorded": f"[negative] {subject}: no evidence for '{hypothesis}'",
+        "search_strategy": search_strategy or "(not specified)",
+        "confidence": confidence,
+        "note": "This will deprioritize future investigations of this hypothesis.",
+    })
+
+
+@mcp.tool()
+def attest_research_context(entity_or_topic: str) -> str:
+    """Get full research context for a topic: what's been tried, what failed, what strategies exist.
+
+    Use this before starting a research task to avoid duplicating work.
+    Returns negative results, prior findings, active strategies, and who has investigated before.
+
+    Args:
+        entity_or_topic: Entity ID or topic to get context for
+    """
+    _track_tool_call("attest_research_context", entity_or_topic)
+    db = _get_db()
+
+    from attestdb.infrastructure.agents import get_negative_results, get_task_context
+
+    context = get_task_context(db, entity_or_topic)
+
+    sections = []
+
+    if context["negative_results"]:
+        lines = []
+        for nr in context["negative_results"]:
+            agents = ", ".join(nr["agents"])
+            strats = "; ".join(nr["search_strategies"]) if nr["search_strategies"] else "unspecified"
+            lines.append(
+                f"  - '{nr['hypothesis']}' — {nr['corroboration_count']} agent(s) found nothing "
+                f"(searched: {strats})"
+            )
+        sections.append("## Dead ends (no evidence found)\n" + "\n".join(lines))
+
+    if context["strategies"]:
+        lines = []
+        for s in context["strategies"]:
+            lines.append(f"  - {s['strategy']} (confidence: {s['confidence']}, from: {s['agent']})")
+        sections.append("## Active strategies\n" + "\n".join(lines))
+
+    if context["findings"]:
+        lines = []
+        for f in context["findings"]:
+            narrative = f["narrative"] or "(no narrative)"
+            lines.append(f"  - [{f['agent']}] {narrative}")
+        sections.append("## Prior findings\n" + "\n".join(lines))
+
+    if context["prior_investigators"]:
+        lines = []
+        for inv in context["prior_investigators"]:
+            lines.append(f"  - {inv['agent']} (status: {inv['status']})")
+        sections.append("## Prior investigators\n" + "\n".join(lines))
+
+    if not sections:
+        return f"No research context found for '{entity_or_topic}'. This is unexplored territory."
+
+    header = f"# Research context: {entity_or_topic}\n"
+    return header + "\n\n".join(sections)
 
 
 # ---------------------------------------------------------------------------

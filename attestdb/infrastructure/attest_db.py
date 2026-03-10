@@ -1257,14 +1257,9 @@ class AttestDB:
     def _build_reverse_provenance_index(self) -> dict[str, list[str]]:
         """Scan all claims, build {claim_id: [dependent_claim_ids]}."""
         reverse_index: dict[str, list[str]] = {}
-        seen: set[str] = set()
-        for entity in self.list_entities():
-            for claim in self.claims_for(entity.id):
-                if claim.claim_id in seen:
-                    continue
-                seen.add(claim.claim_id)
-                for upstream_id in claim.provenance.chain:
-                    reverse_index.setdefault(upstream_id, []).append(claim.claim_id)
+        for claim in self._all_claims():
+            for upstream_id in claim.provenance.chain:
+                reverse_index.setdefault(upstream_id, []).append(claim.claim_id)
         return reverse_index
 
     def retract_cascade(self, source_id: str, reason: str) -> CascadeResult:
@@ -1415,30 +1410,24 @@ class AttestDB:
         where entity_a < entity_b (canonical ordering).
         """
         adj: dict[tuple[str, str], dict] = {}
-        entities = self.list_entities()
-        seen_claims: set[str] = set()
-        for entity in entities:
-            for claim in self.claims_for(entity.id):
-                if claim.claim_id in seen_claims:
-                    continue
-                seen_claims.add(claim.claim_id)
-                pair = (
-                    min(claim.subject.id, claim.object.id),
-                    max(claim.subject.id, claim.object.id),
-                )
-                if pair not in adj:
-                    adj[pair] = {
-                        "max_confidence": claim.confidence,
-                        "source_types": {claim.provenance.source_type},
-                        "claim_count": 1,
-                        "predicates": {claim.predicate.id},
-                    }
-                else:
-                    info = adj[pair]
-                    info["max_confidence"] = max(info["max_confidence"], claim.confidence)
-                    info["source_types"].add(claim.provenance.source_type)
-                    info["claim_count"] += 1
-                    info["predicates"].add(claim.predicate.id)
+        for claim in self._all_claims():
+            pair = (
+                min(claim.subject.id, claim.object.id),
+                max(claim.subject.id, claim.object.id),
+            )
+            if pair not in adj:
+                adj[pair] = {
+                    "max_confidence": claim.confidence,
+                    "source_types": {claim.provenance.source_type},
+                    "claim_count": 1,
+                    "predicates": {claim.predicate.id},
+                }
+            else:
+                info = adj[pair]
+                info["max_confidence"] = max(info["max_confidence"], claim.confidence)
+                info["source_types"].add(claim.provenance.source_type)
+                info["claim_count"] += 1
+                info["predicates"].add(claim.predicate.id)
         return adj
 
     # --- Knowledge topology ---
@@ -2163,7 +2152,6 @@ class AttestDB:
         entities = self.list_entities()
         desc.total_entities = len(entities)
 
-        seen_claim_ids: set[str] = set()
         pattern_counts: dict[tuple[str, str, str], int] = {}
 
         for entity in entities:
@@ -2171,23 +2159,20 @@ class AttestDB:
                 desc.entity_types.get(entity.entity_type, 0) + 1
             )
 
-            for claim in self.claims_for(entity.id):
-                if claim.claim_id in seen_claim_ids:
-                    continue
-                seen_claim_ids.add(claim.claim_id)
-                desc.total_claims += 1
+        for claim in self._all_claims():
+            desc.total_claims += 1
 
-                pred = claim.predicate.id
-                desc.predicate_types[pred] = desc.predicate_types.get(pred, 0) + 1
+            pred = claim.predicate.id
+            desc.predicate_types[pred] = desc.predicate_types.get(pred, 0) + 1
 
-                st = claim.provenance.source_type
-                desc.source_types[st] = desc.source_types.get(st, 0) + 1
+            st = claim.provenance.source_type
+            desc.source_types[st] = desc.source_types.get(st, 0) + 1
 
-                # Track relationship patterns
-                subj_type = claim.subject.entity_type
-                obj_type = claim.object.entity_type
-                key = (subj_type, pred, obj_type)
-                pattern_counts[key] = pattern_counts.get(key, 0) + 1
+            # Track relationship patterns
+            subj_type = claim.subject.entity_type
+            obj_type = claim.object.entity_type
+            key = (subj_type, pred, obj_type)
+            pattern_counts[key] = pattern_counts.get(key, 0) + 1
 
         # Build sorted relationship patterns
         desc.relationship_patterns = [
@@ -2406,15 +2391,11 @@ class AttestDB:
         """Build a full audit trail for a claim."""
         from attestdb.core.types import AuditTrail
 
-        # Find the claim via content_id
-        # First scan to find the claim
+        # Single-pass scan to find the claim by ID
         found = None
-        for entity in self.list_entities():
-            for claim in self.claims_for(entity.id):
-                if claim.claim_id == claim_id:
-                    found = claim
-                    break
-            if found:
+        for claim in self._all_claims():
+            if claim.claim_id == claim_id:
+                found = claim
                 break
 
         if found is None:
