@@ -167,7 +167,7 @@ def install(tools: list[str] | None = None, scope: str = "project") -> list[str]
 
 
 def _install_claude_hooks(scope: str) -> None:
-    """Add SessionStart, PreToolUse, and PostToolUse hooks."""
+    """Add SessionStart, PreToolUse, PostToolUse, and Stop hooks."""
     hook_paths = TOOLS["claude"].get("hooks_path", {})
     hook_path_fn = hook_paths.get(scope) or hook_paths.get("user")
     if not hook_path_fn:
@@ -183,11 +183,13 @@ def _install_claude_hooks(scope: str) -> None:
         recall_cmd = f"{attest_mcp} recall"
         pre_edit_cmd = f"{attest_mcp} pre-edit-check"
         post_test_cmd = f"{attest_mcp} post-test-check"
+        stop_cmd = f"{attest_mcp} stop"
     else:
         base = f"{sys.executable} -m attestdb.mcp_install"
         recall_cmd = f"{base} recall"
         pre_edit_cmd = f"{base} pre-edit-check"
         post_test_cmd = f"{base} post-test-check"
+        stop_cmd = f"{base} stop"
 
     def _is_attest_hook(h: dict) -> bool:
         """Check if a hook entry is an attest hook."""
@@ -223,6 +225,15 @@ def _install_claude_hooks(scope: str) -> None:
         "hooks": [{"type": "command", "command": post_test_cmd, "timeout": 10}],
     })
     hooks["PostToolUse"] = post_hooks
+
+    # --- Stop: lightweight session summary signal ---
+    stop_hooks = hooks.get("Stop", [])
+    stop_hooks = [h for h in stop_hooks if not _is_attest_hook(h)]
+    stop_hooks.append({
+        "matcher": "",
+        "hooks": [{"type": "command", "command": stop_cmd, "timeout": 5}],
+    })
+    hooks["Stop"] = stop_hooks
 
     _write_json(hook_path, existing)
     print(f"  Claude Code hooks: {hook_path}")
@@ -818,6 +829,56 @@ def post_test_check() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Stop hook — lightweight session summary signal
+# ---------------------------------------------------------------------------
+
+def stop_session_summary() -> None:
+    """Stop hook: log a lightweight session signal when Claude finishes responding.
+
+    Reads JSON from stdin (Claude Code hook format), extracts the project
+    from cwd, gets recently modified files via git, and logs a metric.
+    This is NOT a full session_end — just a fast signal that work happened.
+    """
+    try:
+        import subprocess
+
+        try:
+            hook_input = json.loads(sys.stdin.read())
+        except (json.JSONDecodeError, ValueError):
+            hook_input = {}
+
+        cwd = hook_input.get("cwd", os.getcwd())
+
+        _t0 = time.monotonic()
+
+        # Get recently changed files (quick git check)
+        changed_files: list[str] = []
+        try:
+            result = subprocess.run(
+                ["git", "diff", "--name-only", "HEAD~1"],
+                capture_output=True, text=True, timeout=3, cwd=cwd,
+            )
+            if result.returncode == 0:
+                changed_files = [
+                    f for f in result.stdout.strip().split("\n") if f.strip()
+                ]
+        except Exception:
+            pass
+
+        _latency_ms = (time.monotonic() - _t0) * 1000
+
+        _log_hook_metric(
+            hook="stop",
+            file=json.dumps(changed_files[:20]) if changed_files else "[]",
+            fired=True,
+            n_items=len(changed_files),
+            latency_ms=_latency_ms,
+        )
+    except Exception:
+        pass  # Never fail — this is a lightweight signal
+
+
+# ---------------------------------------------------------------------------
 # Metrics — summarize hook instrumentation data
 # ---------------------------------------------------------------------------
 
@@ -900,7 +961,7 @@ def uninstall(tools: list[str] | None = None) -> list[str]:
                     removed.append(tool_key)
                 print(f"  Removed from {tool['name']}: {path}")
 
-    # Remove hooks (SessionStart, PreToolUse, PostToolUse)
+    # Remove hooks (SessionStart, PreToolUse, PostToolUse, Stop)
     def _is_attest_hook(h: dict) -> bool:
         return any(
             "attest-mcp" in (hk.get("command", "") or "")
@@ -919,7 +980,7 @@ def uninstall(tools: list[str] | None = None) -> list[str]:
         data = _read_json(hook_path)
         hooks_dict = data.get("hooks", {})
         changed = False
-        for event in ("SessionStart", "PreToolUse", "PostToolUse"):
+        for event in ("SessionStart", "PreToolUse", "PostToolUse", "Stop"):
             event_hooks = hooks_dict.get(event, [])
             filtered = [h for h in event_hooks if not _is_attest_hook(h)]
             if len(filtered) != len(event_hooks):
@@ -980,6 +1041,9 @@ def main():
     # post-test-check (used by PostToolUse hooks)
     sub.add_parser("post-test-check", help="Surface prior fixes on test failure (PostToolUse hook)")
 
+    # stop (used by Stop hooks)
+    sub.add_parser("stop", help="Stop hook handler (lightweight session signal)")
+
     # metrics
     sub.add_parser("metrics", help="Show hook instrumentation metrics summary")
 
@@ -995,7 +1059,7 @@ def main():
     # This preserves backward compat for: attest-mcp, attest-mcp --transport stdio, etc.
     raw_args = sys.argv[1:]
     mcp_flags = {"--transport", "--host", "--port", "--db", "stdio", "sse", "streamable-http"}
-    subcommands = {"install", "recall", "uninstall", "pre-edit-check", "post-test-check", "metrics"}
+    subcommands = {"install", "recall", "uninstall", "pre-edit-check", "post-test-check", "stop", "metrics"}
     if not raw_args or (raw_args[0] not in subcommands and raw_args[0] != "-h" and raw_args[0] != "--help"):
         from attestdb.mcp_server import main as mcp_main
         mcp_main()
@@ -1023,6 +1087,9 @@ def main():
 
     elif args.command == "post-test-check":
         post_test_check()
+
+    elif args.command == "stop":
+        stop_session_summary()
 
     elif args.command == "metrics":
         metrics()
