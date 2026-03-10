@@ -1,6 +1,6 @@
 [package]
 name = "attest-py"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 rust-version = "1.80"
 description = "PyO3 bindings for Attest Rust storage engine"
