@@ -18,13 +18,22 @@ use crate::metadata::{MetadataStore, Vocabulary};
 use crate::union_find::UnionFind;
 use crate::wal::{Wal, WalEntry};
 
-/// Serializable snapshot of the entire store state.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Serializable snapshot of the entire store state (owned, for deserialization).
+#[derive(Debug, Clone, serde::Deserialize)]
 struct StoreState {
     claims: ClaimLog,
     entities: EntityStore,
     metadata: MetadataStore,
     aliases: UnionFind,
+}
+
+/// Borrowed view of store state for serialization (avoids cloning).
+#[derive(Debug, serde::Serialize)]
+struct StoreStateRef<'a> {
+    claims: &'a ClaimLog,
+    entities: &'a EntityStore,
+    metadata: &'a MetadataStore,
+    aliases: &'a UnionFind,
 }
 
 /// Store statistics.
@@ -185,11 +194,11 @@ impl RustStore {
         if self.db_path.as_os_str().is_empty() || self._lock_file.is_none() {
             return Ok(()); // in-memory or already closed
         }
-        let state = StoreState {
-            claims: self.claims.clone(),
-            entities: self.entities.clone(),
-            metadata: self.metadata.clone(),
-            aliases: self.aliases.clone(),
+        let state = StoreStateRef {
+            claims: &self.claims,
+            entities: &self.entities,
+            metadata: &self.metadata,
+            aliases: &self.aliases,
         };
         let write_result = file_format::write_store(&self.db_path, &state);
 
@@ -220,11 +229,11 @@ impl RustStore {
         if self.db_path.as_os_str().is_empty() || self._lock_file.is_none() {
             return Ok(());
         }
-        let state = StoreState {
-            claims: self.claims.clone(),
-            entities: self.entities.clone(),
-            metadata: self.metadata.clone(),
-            aliases: self.aliases.clone(),
+        let state = StoreStateRef {
+            claims: &self.claims,
+            entities: &self.entities,
+            metadata: &self.metadata,
+            aliases: &self.aliases,
         };
         file_format::write_store(&self.db_path, &state)
             .map_err(|e| AttestError::Provenance(format!("checkpoint failed: {e}")))?;
@@ -340,8 +349,7 @@ impl RustStore {
         if let Some(ref mut wal) = self.wal {
             if let Err(e) = wal.append_claim(&claim) {
                 log::error!("WAL write failed for claim {}: {e}", claim.claim_id);
-                // WAL failure = durability failure. Still apply in-memory
-                // so the current session isn't broken, but log loudly.
+                return false;
             }
         }
 
@@ -359,6 +367,49 @@ impl RustStore {
         }
 
         true
+    }
+
+    /// Insert a batch of claims with a single WAL sync at the end.
+    ///
+    /// Much faster than calling `insert_claim` in a loop because it avoids
+    /// per-claim fsync. Claims are written to WAL without sync, then a single
+    /// sync + checkpoint is done at the end.
+    pub fn insert_claims_batch(&mut self, claims: Vec<Claim>) -> usize {
+        let mut inserted = 0usize;
+        for claim in claims {
+            if self.claims.contains(&claim.claim_id) {
+                continue;
+            }
+
+            // Write to WAL without fsync
+            if let Some(ref mut wal) = self.wal {
+                if let Err(e) = wal.append_claim_no_sync(&claim) {
+                    log::error!("WAL write failed for claim {}: {e}", claim.claim_id);
+                    continue; // Skip claim — not durable
+                }
+            }
+
+            self.apply_claim(claim);
+            inserted += 1;
+        }
+
+        // Single sync + checkpoint at end of batch
+        if let Some(ref mut wal) = self.wal {
+            if let Err(e) = wal.sync() {
+                log::error!("WAL sync failed after batch insert: {e}");
+            }
+        }
+        if self.checkpoint_interval > 0 {
+            if let Some(ref wal) = self.wal {
+                if wal.entry_count() >= self.checkpoint_interval {
+                    if let Err(e) = self.checkpoint() {
+                        log::warn!("Auto-checkpoint failed after batch: {e}");
+                    }
+                }
+            }
+        }
+
+        inserted
     }
 
     /// Insert a claim without WAL write (used during WAL replay).
@@ -394,6 +445,28 @@ impl RustStore {
     pub fn claims_by_content_id(&self, content_id: &str) -> Vec<Claim> {
         self.claims
             .by_content_id(content_id)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Get all claims matching a source_id.
+    pub fn all_claims(&self) -> Vec<Claim> {
+        self.claims.all_claims().to_vec()
+    }
+
+    pub fn claims_by_source_id(&self, source_id: &str) -> Vec<Claim> {
+        self.claims
+            .by_source_id(source_id)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Get all claims matching a predicate_id.
+    pub fn claims_by_predicate_id(&self, predicate_id: &str) -> Vec<Claim> {
+        self.claims
+            .by_predicate_id(predicate_id)
             .into_iter()
             .cloned()
             .collect()

@@ -48,16 +48,29 @@ class AttestDBSnapshot:
         return self._query_engine.query(focal_entity, **kwargs)
 
     def stats(self) -> dict:
-        """Point-in-time stats: count claims at or before the timestamp."""
-        base_stats = self._db._store.stats()
+        """Point-in-time stats: count claims and entities at or before the timestamp."""
         # For Rust backend with claims_in_range
         if hasattr(self._db._store, "claims_in_range"):
             claims = self._db._store.claims_in_range(0, self._timestamp)
+            entities: set[str] = set()
+            for c in claims:
+                subj = c.get("subject")
+                obj = c.get("object")
+                if isinstance(subj, dict):
+                    entities.add(subj.get("id", ""))
+                elif isinstance(subj, str):
+                    entities.add(subj)
+                if isinstance(obj, dict):
+                    entities.add(obj.get("id", ""))
+                elif isinstance(obj, str):
+                    entities.add(obj)
+            entities.discard("")
             return {
                 "total_claims": len(claims),
-                "entity_count": base_stats.get("entity_count", 0),
+                "entity_count": len(entities),
                 "timestamp": self._timestamp,
             }
+        base_stats = self._db._store.stats()
         return {
             "total_claims": base_stats.get("total_claims", 0),
             "entity_count": base_stats.get("entity_count", 0),

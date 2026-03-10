@@ -35,6 +35,14 @@ pub struct ClaimLog {
     /// Whether the timestamp index is known to be sorted.
     #[serde(default)]
     ts_sorted: bool,
+
+    /// source_id → list of claim indices.
+    #[serde(default)]
+    source_index: HashMap<String, Vec<usize>>,
+
+    /// predicate_id → list of claim indices.
+    #[serde(default)]
+    predicate_index: HashMap<String, Vec<usize>>,
 }
 
 impl ClaimLog {
@@ -47,6 +55,8 @@ impl ClaimLog {
             adjacency: HashMap::new(),
             timestamp_index: Vec::new(),
             ts_sorted: true, // empty is sorted
+            source_index: HashMap::new(),
+            predicate_index: HashMap::new(),
         }
     }
 
@@ -87,6 +97,18 @@ impl ClaimLog {
                 .or_default()
                 .insert(claim.subject.id.clone());
         }
+
+        // Maintain source_id index
+        self.source_index
+            .entry(claim.provenance.source_id.clone())
+            .or_default()
+            .push(idx);
+
+        // Maintain predicate_id index
+        self.predicate_index
+            .entry(claim.predicate.id.clone())
+            .or_default()
+            .push(idx);
 
         // Maintain timestamp index
         // Track whether insertion preserves sort order
@@ -227,12 +249,9 @@ impl ClaimLog {
             .collect()
     }
 
-    /// Rebuild derived indexes (adjacency, timestamp) from claim data.
+    /// Rebuild derived indexes (adjacency, timestamp, source, predicate) from claim data.
     /// Called after deserialization when `#[serde(default)]` fields may be empty.
     pub fn rebuild_derived_indexes(&mut self) {
-        if !self.adjacency.is_empty() && !self.timestamp_index.is_empty() {
-            return; // Already populated
-        }
         if self.claims.is_empty() {
             return;
         }
@@ -263,6 +282,31 @@ impl ClaimLog {
                 .collect();
             self.ts_sorted = false;
         }
+
+        // Rebuild source_id index
+        if self.source_index.is_empty() {
+            for (idx, claim) in self.claims.iter().enumerate() {
+                self.source_index
+                    .entry(claim.provenance.source_id.clone())
+                    .or_default()
+                    .push(idx);
+            }
+        }
+
+        // Rebuild predicate_id index
+        if self.predicate_index.is_empty() {
+            for (idx, claim) in self.claims.iter().enumerate() {
+                self.predicate_index
+                    .entry(claim.predicate.id.clone())
+                    .or_default()
+                    .push(idx);
+            }
+        }
+    }
+
+    /// Return a slice of all claims.
+    pub fn all_claims(&self) -> &[Claim] {
+        &self.claims
     }
 
     /// Total number of claims.
@@ -282,6 +326,22 @@ impl ClaimLog {
     /// Get all unique entity IDs that appear as subjects or objects.
     pub fn all_entity_ids(&self) -> HashSet<&str> {
         self.entity_index.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// Get all claims with a given source_id.
+    pub fn by_source_id(&self, source_id: &str) -> Vec<&Claim> {
+        self.source_index
+            .get(source_id)
+            .map(|indices| indices.iter().filter_map(|&idx| self.claims.get(idx)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Get all claims with a given predicate_id.
+    pub fn by_predicate_id(&self, predicate_id: &str) -> Vec<&Claim> {
+        self.predicate_index
+            .get(predicate_id)
+            .map(|indices| indices.iter().filter_map(|&idx| self.claims.get(idx)).collect())
+            .unwrap_or_default()
     }
 
     /// Count claims by predicate_type.

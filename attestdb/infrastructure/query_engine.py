@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import time
+
+logger = logging.getLogger(__name__)
 
 from attestdb.core.confidence import count_independent_sources, tier2_confidence
 from attestdb.core.errors import EntityNotFoundError
@@ -262,10 +265,15 @@ class QueryEngine:
                     subj_obj_predicates[so_key] = []
                 subj_obj_predicates[so_key].append((claim.predicate.id, claim.claim_id))
 
+            seen_contradiction_pairs: set[tuple[str, str]] = set()
             for (subj, obj), preds in subj_obj_predicates.items():
                 pred_set = {p for p, _ in preds}
                 for p1, p2 in OPPOSITE_PREDICATES.items():
+                    pair_key = (min(p1, p2), max(p1, p2))
+                    if pair_key in seen_contradiction_pairs:
+                        continue
                     if p1 in pred_set and p2 in pred_set:
+                        seen_contradiction_pairs.add(pair_key)
                         cid_a = next(cid for p, cid in preds if p == p1)
                         cid_b = next(cid for p, cid in preds if p == p2)
                         contradictions.append(
@@ -312,7 +320,7 @@ class QueryEngine:
                 if ic.predicate.id == "inquiry" and ic.status == ClaimStatus.ACTIVE:
                     inquiry_ids.append(ic.claim_id)
         except Exception:
-            pass
+            logger.warning("Failed to query inquiries for %s", canonical, exc_info=True)
 
         frame = ContextFrame(
             focal_entity=entity_summary,

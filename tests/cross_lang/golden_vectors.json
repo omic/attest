@@ -256,6 +256,46 @@
       "input": "µ",
       "expected": "mu",
       "description": "micro sign U+00B5 (NFKD → μ → mu)"
+    },
+    {
+      "input": "TREM2​",
+      "expected": "trem2",
+      "description": "zero-width space after gene"
+    },
+    {
+      "input": "foo‌bar",
+      "expected": "foobar",
+      "description": "zero-width non-joiner between words"
+    },
+    {
+      "input": "foo‍bar",
+      "expected": "foobar",
+      "description": "zero-width joiner between words"
+    },
+    {
+      "input": "﻿protein",
+      "expected": "protein",
+      "description": "BOM before word"
+    },
+    {
+      "input": "hello‎world",
+      "expected": "helloworld",
+      "description": "left-to-right mark"
+    },
+    {
+      "input": "hello‏world",
+      "expected": "helloworld",
+      "description": "right-to-left mark"
+    },
+    {
+      "input": "​‌‍TREM2﻿",
+      "expected": "trem2",
+      "description": "multiple Cf chars around gene"
+    },
+    {
+      "input": "fibro­nectin",
+      "expected": "fibronectin",
+      "description": "soft hyphen in word"
     }
   ],
   "hashing": [

@@ -37,7 +37,7 @@ class TestNormalizationVectors:
             )
 
     def test_vector_count(self, vectors):
-        assert len(vectors["normalization"]) == 51
+        assert len(vectors["normalization"]) == 59
 
 
 class TestHashingVectors:
@@ -98,4 +98,4 @@ class TestVectorIntegrity:
             + len(vectors["chain_hash"])
             + len(vectors["confidence"])
         )
-        assert total == 110
+        assert total == 118

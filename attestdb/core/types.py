@@ -325,6 +325,7 @@ class BlindspotMap:
     single_source_entities: list[str] = field(default_factory=list)
     knowledge_gaps: list[dict] = field(default_factory=list)
     low_confidence_areas: list[dict] = field(default_factory=list)
+    unresolved_warnings: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -834,6 +835,17 @@ class MergeReport:
 
 def claim_from_dict(d: dict) -> Claim:
     """Convert a dict from the Rust store into a Claim dataclass."""
+    try:
+        return _claim_from_dict_inner(d)
+    except KeyError as exc:
+        raise ValueError(
+            f"claim_from_dict: missing required key {exc} in claim dict "
+            f"(keys present: {sorted(d.keys())})"
+        ) from exc
+
+
+def _claim_from_dict_inner(d: dict) -> Claim:
+    """Inner implementation — raises KeyError on missing fields."""
     subj = d["subject"]
     subject = EntityRef(
         id=subj["id"],
@@ -867,7 +879,13 @@ def claim_from_dict(d: dict) -> Claim:
     if d.get("payload") is not None:
         pl = d["payload"]
         if "schema_ref" in pl:
-            data = json.loads(pl["data_json"]) if "data_json" in pl else pl.get("data", {})
+            if "data_json" in pl:
+                try:
+                    data = json.loads(pl["data_json"])
+                except (json.JSONDecodeError, TypeError):
+                    data = {}
+            else:
+                data = pl.get("data", {})
             payload = Payload(schema_ref=pl["schema_ref"], data=data)
 
     status_str = d.get("status", "active")

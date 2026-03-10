@@ -23,13 +23,15 @@ def normalize_entity_id(raw: str) -> str:
     """Deterministic entity ID normalization. Once shipped, never changes."""
     # 1. Unicode normalize (NFKD decomposition)
     s = unicodedata.normalize("NFKD", raw)
-    # 2. Lowercase
+    # 2. Strip zero-width / invisible format characters (Unicode category Cf)
+    s = "".join(c for c in s if unicodedata.category(c) != "Cf")
+    # 3. Lowercase
     s = s.lower()
-    # 3. Collapse whitespace
+    # 4. Collapse whitespace
     s = " ".join(s.split())
-    # 4. Strip leading/trailing whitespace
+    # 5. Strip leading/trailing whitespace
     s = s.strip()
-    # 5. Replace common Greek letters with spelled-out forms
+    # 6. Replace common Greek letters with spelled-out forms
     for char, name in GREEK_MAP.items():
         s = s.replace(char, name)
     return s

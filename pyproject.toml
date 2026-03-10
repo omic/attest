@@ -1,6 +1,6 @@
 [project]
 name = "attestdb"
-version = "0.1.3"
+version = "0.1.4"
 description = "The database for knowledge you can verify"
 readme = "README.md"
 license = {text = "BSL-1.1"}
@@ -45,7 +45,7 @@ Documentation = "https://attestdb.com/quickstart.html"
 Repository = "https://github.com/omic/attest"
 
 [project.scripts]
-attest-mcp = "attestdb.mcp_server:main"
+attest-mcp = "attestdb.mcp_install:main"
 attest-mcp-http = "attestdb.mcp_server_http:main"
 attest = "attestdb.__main__:main"
 

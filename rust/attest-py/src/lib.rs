@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PySet};
+use pyo3::types::{PyDict, PyList, PySet, PyTuple};
 use pyo3::IntoPyObjectExt;
 
 use attest_core::types::{
@@ -143,15 +143,16 @@ fn claim_from_py(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Claim> {
         // Convert Python dict to serde_json::Value via JSON roundtrip
         let json_mod = py.import("json")?;
         let json_str: String = json_mod.call_method1("dumps", (&data_obj,))?.extract()?;
-        let data: serde_json::Value =
-            serde_json::from_str(&json_str).unwrap_or(serde_json::Value::Object(Default::default()));
+        let data: serde_json::Value = serde_json::from_str(&json_str)
+            .map_err(|e| PyValueError::new_err(format!("invalid payload JSON: {e}")))?;
         Some(Payload { schema_ref, data })
     };
 
     // Status
     let status_obj = obj.getattr("status")?;
     let status_str: String = status_obj.getattr("value")?.extract()?;
-    let status = status_str.parse::<ClaimStatus>().unwrap_or(ClaimStatus::Active);
+    let status = status_str.parse::<ClaimStatus>()
+        .map_err(|_| PyValueError::new_err(format!("invalid claim status: {status_str}")))?;
 
     Ok(Claim {
         claim_id,
@@ -423,6 +424,41 @@ impl PyRustStore {
         self.inner.get_claim_provenance_chain(claim_id)
     }
 
+    fn all_claims<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
+        let claims = self.inner.all_claims();
+        let list = PyList::empty(py);
+        for c in &claims {
+            list.append(claim_to_dict(py, c)?)?;
+        }
+        Ok(list.into())
+    }
+
+    fn claims_by_source_id<'py>(
+        &self,
+        source_id: &str,
+        py: Python<'py>,
+    ) -> PyResult<PyObject> {
+        let claims = self.inner.claims_by_source_id(source_id);
+        let list = PyList::empty(py);
+        for c in &claims {
+            list.append(claim_to_dict(py, c)?)?;
+        }
+        Ok(list.into())
+    }
+
+    fn claims_by_predicate_id<'py>(
+        &self,
+        predicate_id: &str,
+        py: Python<'py>,
+    ) -> PyResult<PyObject> {
+        let claims = self.inner.claims_by_predicate_id(predicate_id);
+        let list = PyList::empty(py);
+        for c in &claims {
+            list.append(claim_to_dict(py, c)?)?;
+        }
+        Ok(list.into())
+    }
+
     // ── Graph traversal ────────────────────────────────────────────
 
     #[pyo3(signature = (entity_id, max_depth=2))]
@@ -509,6 +545,143 @@ impl PyRustStore {
         dict.set_item("predicate_types", s.predicate_types.clone().into_py_any(py)?)?;
         dict.set_item("source_types", s.source_types.clone().into_py_any(py)?)?;
         Ok(dict.into())
+    }
+
+    // ── Batch insert (bulk loader fast path) ─────────────────────
+
+    /// Batch-insert entities and claims from pre-computed Python data.
+    ///
+    /// Accepts the same tuple formats used by `_ingest_append_direct`:
+    /// - entities: {entity_id: (entity_type, display_name, ext_ids_json)}
+    /// - claim_rows: list of 16-element tuples matching bulk loader format
+    ///
+    /// This avoids constructing Python Claim dataclass objects per row,
+    /// extracting all data in one pass then inserting without GIL.
+    ///
+    /// Returns the number of claims inserted.
+    fn insert_bulk(
+        &mut self,
+        entities: &Bound<'_, PyDict>,
+        claim_rows: &Bound<'_, PyList>,
+        timestamp: i64,
+        py: Python<'_>,
+    ) -> PyResult<usize> {
+        // Phase 1: Extract all data from Python into Rust-native types (with GIL)
+
+        // Extract entities: {id: (type, display, ext_ids_json)}
+        let mut entity_vec: Vec<(String, String, String, HashMap<String, String>)> =
+            Vec::with_capacity(entities.len());
+        for (key, value) in entities.iter() {
+            let entity_id: String = key.extract()?;
+            let tuple: &Bound<'_, PyTuple> = value.downcast()?;
+            let entity_type: String = tuple.get_item(0)?.extract()?;
+            let display_name: String = tuple.get_item(1)?.extract()?;
+            let ext_ids_json: String = tuple.get_item(2)?.extract()?;
+            let ext_ids: HashMap<String, String> = if ext_ids_json.is_empty() || ext_ids_json == "{}" {
+                HashMap::new()
+            } else {
+                serde_json::from_str(&ext_ids_json).unwrap_or_default()
+            };
+            entity_vec.push((entity_id, entity_type, display_name, ext_ids));
+        }
+
+        // Build entity lookup for Claim construction
+        let entity_map: HashMap<String, (String, String)> = entity_vec
+            .iter()
+            .map(|(id, etype, display, _)| (id.clone(), (etype.clone(), display.clone())))
+            .collect();
+
+        // Extract claim rows: (subj, obj, claim_id, content_id, pred_id, pred_type,
+        //                      confidence, source_type, source_id, ..., timestamp, status)
+        struct BulkRow {
+            subj_id: String,
+            obj_id: String,
+            claim_id: String,
+            content_id: String,
+            pred_id: String,
+            pred_type: String,
+            confidence: f64,
+            source_type: String,
+            source_id: String,
+            ts: i64,
+        }
+
+        let n_rows = claim_rows.len();
+        let mut rows: Vec<BulkRow> = Vec::with_capacity(n_rows);
+        for item in claim_rows.iter() {
+            rows.push(BulkRow {
+                subj_id: item.get_item(0)?.extract()?,
+                obj_id: item.get_item(1)?.extract()?,
+                claim_id: item.get_item(2)?.extract()?,
+                content_id: item.get_item(3)?.extract()?,
+                pred_id: item.get_item(4)?.extract()?,
+                pred_type: item.get_item(5)?.extract()?,
+                confidence: item.get_item(6)?.extract()?,
+                source_type: item.get_item(7)?.extract()?,
+                source_id: item.get_item(8)?.extract()?,
+                ts: item.get_item(14)?.extract()?,
+            });
+        }
+
+        // Phase 2: Insert in Rust (GIL held — mutation must be single-threaded)
+        // Upsert all entities
+        for (id, etype, display, ext_ids) in &entity_vec {
+            self.inner.upsert_entity(id, etype, display, Some(ext_ids), timestamp);
+        }
+
+        // Build all Claim structs
+        let claims: Vec<Claim> = rows
+            .into_iter()
+            .map(|row| {
+                let (subj_type, subj_display) = entity_map
+                    .get(&row.subj_id)
+                    .cloned()
+                    .unwrap_or(("entity".into(), row.subj_id.clone()));
+                let (obj_type, obj_display) = entity_map
+                    .get(&row.obj_id)
+                    .cloned()
+                    .unwrap_or(("entity".into(), row.obj_id.clone()));
+
+                Claim {
+                    claim_id: row.claim_id,
+                    content_id: row.content_id,
+                    subject: EntityRef {
+                        id: row.subj_id,
+                        entity_type: subj_type,
+                        display_name: subj_display,
+                        external_ids: HashMap::new(),
+                    },
+                    predicate: PredicateRef {
+                        id: row.pred_id,
+                        predicate_type: row.pred_type,
+                    },
+                    object: EntityRef {
+                        id: row.obj_id,
+                        entity_type: obj_type,
+                        display_name: obj_display,
+                        external_ids: HashMap::new(),
+                    },
+                    confidence: row.confidence,
+                    provenance: Provenance {
+                        source_type: row.source_type,
+                        source_id: row.source_id,
+                        method: None,
+                        chain: vec![],
+                        model_version: None,
+                        organization: None,
+                    },
+                    embedding: None,
+                    payload: None,
+                    timestamp: row.ts,
+                    status: ClaimStatus::Active,
+                }
+            })
+            .collect();
+
+        // Batch insert with single WAL sync
+        let count = self.inner.insert_claims_batch(claims);
+
+        Ok(count)
     }
 
     // ── Raw query (not applicable for Rust backend) ────────────────

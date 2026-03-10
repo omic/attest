@@ -41,6 +41,9 @@ def _init_session_tracker():
         "session_id": str(uuid.uuid4()),
         "tool_calls": [],
         "start_time": time.time(),
+        "entities_queried": set(),  # entities looked up during session
+        "claims_ingested": 0,  # count of claims ingested
+        "learnings_recorded": 0,  # count of attest_learned calls
     }
     atexit.register(_flush_session)
 
@@ -56,21 +59,51 @@ def _track_tool_call(tool_name: str, args_summary: str = ""):
     })
 
 
+def _track_entity_queried(entity_id: str):
+    """Record an entity lookup."""
+    if _session_tracker is not None:
+        _session_tracker["entities_queried"].add(entity_id)
+
+
+def _track_claims_ingested(count: int):
+    """Record claims ingested."""
+    if _session_tracker is not None:
+        _session_tracker["claims_ingested"] += count
+
+
 def _flush_session():
-    """On process exit, record the accumulated session."""
+    """On process exit, record session summary as structured claims."""
     if _session_tracker is None or not _session_tracker["tool_calls"]:
         return
     try:
         db = _get_db()
-        messages = [
-            {"role": "assistant", "content": f"Called {tc['tool']}: {tc['args_summary']}"}
-            for tc in _session_tracker["tool_calls"]
-        ]
-        db.ingest_chat(
-            messages,
-            conversation_id=_session_tracker["session_id"],
-            platform="mcp-auto-observe",
-            extraction="heuristic",
+        sid = _session_tracker["session_id"]
+        prov = {"source_type": "auto_observe", "source_id": sid}
+        elapsed = round(time.time() - _session_tracker["start_time"], 1)
+        n_calls = len(_session_tracker["tool_calls"])
+        n_ingested = _session_tracker["claims_ingested"]
+        n_learned = _session_tracker["learnings_recorded"]
+        entities = _session_tracker["entities_queried"]
+
+        # Single summary claim with payload (not N claims per tool)
+        tools_used = sorted({tc["tool"] for tc in _session_tracker["tool_calls"]})
+        db.ingest(
+            subject=(sid, "tool_session"),
+            predicate=("has_status", "predicate"),
+            object=("completed", "status"),
+            provenance=prov,
+            confidence=0.7,
+            payload={
+                "schema_ref": "session_summary",
+                "data": {
+                    "duration_s": elapsed,
+                    "tool_calls": n_calls,
+                    "tools_used": tools_used,
+                    "claims_ingested": n_ingested,
+                    "learnings_recorded": n_learned,
+                    "entities_queried": sorted(entities)[:20],
+                },
+            },
         )
     except Exception:
         pass  # Best-effort — process is exiting
@@ -89,7 +122,7 @@ def _get_db():
 
 
 # ---------------------------------------------------------------------------
-# Tools (31)
+# Tools (33)
 # ---------------------------------------------------------------------------
 
 
@@ -104,6 +137,7 @@ def ingest_claim(
 ) -> str:
     """Add a claim to the knowledge graph. Returns claim_id."""
     _track_tool_call("ingest_claim", f"{subject_id} {predicate_id} {object_id}")
+    _track_claims_ingested(1)
     db = _get_db()
     return db.ingest(
         subject=(subject_id, subject_type),
@@ -123,6 +157,19 @@ def ingest_text(text: str, source_id: str = "") -> str:
     return json.dumps(result, default=str)
 
 
+def _to_pair(val: str | list | tuple, default_type: str = "entity") -> tuple[str, str]:
+    """Coerce subject/predicate/object to (id, type) tuple.
+
+    Accepts:
+      - "entity_name"           → ("entity_name", default_type)
+      - ["entity_name", "type"] → ("entity_name", "type")
+      - ("entity_name", "type") → ("entity_name", "type")
+    """
+    if isinstance(val, str):
+        return (val, default_type)
+    return (val[0], val[1])
+
+
 @mcp.tool()
 def ingest_batch(claims: list[dict]) -> str:
     """Bulk-ingest a list of claims. Each dict needs: subject, predicate, object, provenance."""
@@ -131,9 +178,9 @@ def ingest_batch(claims: list[dict]) -> str:
     db = _get_db()
     claim_inputs = [
         ClaimInput(
-            subject=tuple(c["subject"]),
-            predicate=tuple(c["predicate"]),
-            object=tuple(c["object"]),
+            subject=_to_pair(c["subject"]),
+            predicate=_to_pair(c["predicate"], "predicate"),
+            object=_to_pair(c["object"]),
             provenance=c["provenance"],
             confidence=c.get("confidence"),
             payload=c.get("payload"),
@@ -141,6 +188,7 @@ def ingest_batch(claims: list[dict]) -> str:
         for c in claims
     ]
     result = db.ingest_batch(claim_inputs)
+    _track_claims_ingested(result.ingested)
     return json.dumps({
         "ingested": result.ingested,
         "duplicates": result.duplicates,
@@ -152,6 +200,7 @@ def ingest_batch(claims: list[dict]) -> str:
 def query_entity(entity_id: str, depth: int = 1) -> str:
     """Query the knowledge graph around an entity. Returns narrative + relationships."""
     _track_tool_call("query_entity", entity_id)
+    _track_entity_queried(entity_id)
     db = _get_db()
     frame = db.query(entity_id, depth=depth)
     return json.dumps({
@@ -309,6 +358,15 @@ def stats() -> str:
     return json.dumps(db.stats(), default=str)
 
 
+_ASK_STOP_WORDS = frozenset({
+    "what", "who", "how", "why", "where", "which", "does", "the", "are",
+    "for", "and", "is", "was", "has", "have", "been", "this", "that",
+    "with", "from", "about", "tell", "me", "show", "find", "get", "list",
+    "of", "in", "on", "at", "by", "an", "a", "do", "did", "any", "all",
+    "to", "it", "be", "not", "no", "or", "but", "if", "can", "will",
+})
+
+
 @mcp.tool()
 def attest_ask(question: str, top_k: int = 10) -> str:
     """Answer a natural-language question using the knowledge graph.
@@ -317,25 +375,64 @@ def attest_ask(question: str, top_k: int = 10) -> str:
     """
     _track_tool_call("attest_ask", question[:100])
     db = _get_db()
-    result = db.ask(question, top_k=top_k)
+
+    # Try full ask() first (uses LLM + embeddings if available)
+    try:
+        result = db.ask(question, top_k=top_k)
+        if result.answer:
+            return json.dumps({
+                "answer": result.answer,
+                "citations": [
+                    {
+                        "claim_id": c.claim_id, "subject": c.subject,
+                        "predicate": c.predicate, "object": c.object,
+                        "confidence": c.confidence, "source_type": c.source_type,
+                        "source_id": c.source_id,
+                    }
+                    for c in result.citations
+                ],
+                "contradictions": result.contradictions,
+                "gaps": result.gaps,
+                "entities": [
+                    {"id": e.id, "name": e.name, "type": e.entity_type}
+                    for e in result.entities
+                ],
+                "meta": result.meta,
+            })
+    except Exception:
+        pass
+
+    # Fallback: text search when ask() returns empty (no LLM / no embeddings)
+    from attestdb.core.vocabulary import knowledge_label, knowledge_sort_key
+
+    words = [w.strip("?.,!\"'()[]{}:;") for w in question.lower().split()]
+    query_terms = [w for w in words if w and len(w) >= 2 and w not in _ASK_STOP_WORDS]
+
+    candidates = _retrieve_candidates(db, " ".join(query_terms), "", "")
+
+    # Sort by knowledge priority (warnings first) then confidence
+    candidates.sort(key=lambda c: knowledge_sort_key(c.predicate.id, c.confidence))
+
+    lines = []
+    for c in candidates[:top_k]:
+        label = knowledge_label(c.predicate.id)
+        lines.append(f"[{label}] {c.subject.id}: {c.object.id} (conf={c.confidence:.2f})")
+
     return json.dumps({
-        "answer": result.answer,
+        "answer": "\n".join(lines) if lines else "No relevant claims found.",
         "citations": [
             {
-                "claim_id": c.claim_id, "subject": c.subject,
-                "predicate": c.predicate, "object": c.object,
-                "confidence": c.confidence, "source_type": c.source_type,
-                "source_id": c.source_id,
+                "claim_id": c.claim_id, "subject": c.subject.id,
+                "predicate": c.predicate.id, "object": c.object.id,
+                "confidence": c.confidence, "source_type": c.provenance.source_type,
+                "source_id": c.provenance.source_id,
             }
-            for c in result.citations
+            for c in candidates[:top_k]
         ],
-        "contradictions": result.contradictions,
-        "gaps": result.gaps,
-        "entities": [
-            {"id": e.id, "name": e.name, "type": e.entity_type}
-            for e in result.entities
-        ],
-        "meta": result.meta,
+        "contradictions": [],
+        "gaps": [],
+        "entities": [],
+        "meta": {"fallback": True, "n_search_hits": len(candidates)},
     })
 
 
@@ -354,7 +451,7 @@ def attest_impact(source_id: str) -> str:
 
 @mcp.tool()
 def attest_blindspots(min_claims: int = 5) -> str:
-    """Find single-source entities, knowledge gaps, and low-confidence areas."""
+    """Find single-source entities, knowledge gaps, low-confidence areas, and unresolved warnings."""
     db = _get_db()
     report = db.blindspots(min_claims=min_claims)
     return json.dumps(asdict(report))
@@ -498,26 +595,46 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
-def _retrieve_candidates(db, query: str, context: str, tenant_id: str) -> list[str]:
-    """ISOLATION BOUNDARY for retrieval. Returns claim IDs.
+def _retrieve_candidates(db, query: str, context: str, tenant_id: str) -> list:
+    """ISOLATION BOUNDARY for retrieval. Returns Claim objects.
 
-    Today: keyword search via db.search_entities() + db.claims_for().
-    Tomorrow: ANN vector search. Nothing above this function changes.
+    Searches entity names AND claim content (subject, predicate, object).
     """
-    claim_ids: list[str] = []
+    claims: list = []
     seen: set[str] = set()
-    # Search entities matching the query
+
+    def _add_claim(claim):
+        if claim.claim_id not in seen:
+            prov_org = claim.provenance.organization
+            if tenant_id and prov_org and prov_org != tenant_id:
+                return
+            seen.add(claim.claim_id)
+            claims.append(claim)
+
+    # 1. Entity search: find entities matching query, get their claims
     entities = db.search_entities(query, top_k=20)
     for entity in entities:
         for claim in db.claims_for(entity.id):
-            if claim.claim_id not in seen:
-                # Tenant filter: check provenance.organization if tenant scoping
-                prov_org = claim.provenance.organization
-                if tenant_id and prov_org and prov_org != tenant_id:
-                    continue
-                seen.add(claim.claim_id)
-                claim_ids.append(claim.claim_id)
-    return claim_ids
+            _add_claim(claim)
+
+    # 2. Predicate search: scan knowledge predicates for matching claims
+    from attestdb.core.vocabulary import KNOWLEDGE_PREDICATES
+    knowledge_predicates = KNOWLEDGE_PREDICATES
+    query_lower = query.lower()
+    query_tokens = {w for w in query_lower.split() if len(w) >= 3}
+
+    if query_tokens:
+        for pred in knowledge_predicates:
+            try:
+                for claim in db.claims_for_predicate(pred):
+                    subj = claim.subject.id.lower()
+                    obj = claim.object.id.lower()
+                    if any(tok in subj or tok in obj for tok in query_tokens):
+                        _add_claim(claim)
+            except Exception:
+                pass
+
+    return claims
 
 
 def _score_approach(confidence: float, outcome: str, age_days: float) -> float:
@@ -755,60 +872,78 @@ def attest_get_prior_approaches(
         top_k: Maximum approaches to return
         max_tokens: Token budget for the response
     """
+    from attestdb.core.vocabulary import KNOWLEDGE_PRIORITY
+
     db = _get_db()
     now_ns = time.time_ns()
 
-    candidate_ids = _retrieve_candidates(db, problem_description, context, tenant_id)
+    candidates = _retrieve_candidates(db, problem_description, context, tenant_id)
 
-    # Group candidates by session
+    # Separate into session-linked and direct knowledge claims
     session_approaches: dict[str, dict] = {}
-    for cid in candidate_ids:
-        # candidate_ids are claim_ids — resolve the actual claim to get source_id
-        # The claim's provenance.source_id is the session_id
-        candidate_claims = db.claims_for(cid)
-        if not candidate_claims:
+    direct_knowledge: list[dict] = []
+    session_meta_preds = {"produced_by", "awaiting_outcome", "confidence_updated", "had_outcome"}
+
+    for claim in candidates:
+        source_id = claim.provenance.source_id
+        pred = claim.predicate.id
+
+        # Direct knowledge claims (not session metadata)
+        is_session_entity = claim.subject.entity_type == "tool_session"
+        if pred not in session_meta_preds and not is_session_entity:
+            age_days = (now_ns - claim.timestamp) / (86400 * 1e9) if claim.timestamp else 0
+            # Warnings (priority 0) get full score, lower priority gets less boost
+            priority = KNOWLEDGE_PRIORITY.get(pred, 9)
+            priority_boost = 1.0 if priority <= 2 else 0.7 if priority <= 4 else 0.5
+            base_score = _score_approach(claim.confidence, "success", age_days)
+            direct_knowledge.append({
+                "type": "knowledge",
+                "subject": claim.subject.id,
+                "predicate": pred,
+                "object": claim.object.id,
+                "confidence": round(claim.confidence, 4),
+                "age_days": round(age_days, 1),
+                "source_id": source_id,
+                "score": round(base_score * priority_boost, 4),
+            })
             continue
 
-        for cc in candidate_claims:
-            session_id_resolved = cc.provenance.source_id
-            if not session_id_resolved or session_id_resolved in session_approaches:
-                continue
+        # Session grouping
+        if not source_id or source_id in session_approaches:
+            continue
+        session_claims = db.claims_by_source_id(source_id)
+        if not session_claims:
+            continue
 
-            # Look up all claims for this session
-            session_claims = db.claims_by_source_id(session_id_resolved)
-            if not session_claims:
-                continue
+        outcome = "unknown"
+        session_confidence = 0.5
+        for sc in session_claims:
+            if sc.predicate.id == "had_outcome":
+                outcome = sc.object.id
+            session_confidence = max(session_confidence, sc.confidence)
 
-            # Find outcome for this session
-            outcome = "unknown"
-            session_confidence = 0.5
-            for sc in session_claims:
-                if sc.predicate.id == "had_outcome":
-                    outcome = sc.object.id
-                session_confidence = max(session_confidence, sc.confidence)
+        if outcome_filter and outcome != outcome_filter:
+            continue
 
-            if outcome_filter and outcome != outcome_filter:
-                continue
+        ts = session_claims[0].timestamp
+        age_days = (now_ns - ts) / (86400 * 1e9) if ts else 0
+        score = _score_approach(session_confidence, outcome, age_days)
+        predicates = [sc.predicate.id + " → " + sc.object.id for sc in session_claims[:5]]
 
-            ts = session_claims[0].timestamp
-            age_days = (now_ns - ts) / (86400 * 1e9) if ts else 0
-            score = _score_approach(session_confidence, outcome, age_days)
+        session_approaches[source_id] = {
+            "type": "session",
+            "session_id": source_id,
+            "outcome": outcome,
+            "score": round(score, 4),
+            "confidence": round(session_confidence, 4),
+            "age_days": round(age_days, 1),
+            "claims": predicates,
+            "claim_count": len(session_claims),
+        }
 
-            # Collect predicates from session
-            predicates = [sc.predicate.id + " → " + sc.object.id for sc in session_claims[:5]]
-
-            session_approaches[session_id_resolved] = {
-                "session_id": session_id_resolved,
-                "outcome": outcome,
-                "score": round(score, 4),
-                "confidence": round(session_confidence, 4),
-                "age_days": round(age_days, 1),
-                "claims": predicates,
-                "claim_count": len(session_claims),
-            }
-
-    # Sort by score descending, take top_k
-    approaches = sorted(session_approaches.values(), key=lambda x: x["score"], reverse=True)[:top_k]
+    # Merge and sort by score descending, take top_k
+    all_items = list(session_approaches.values()) + direct_knowledge
+    approaches = sorted(all_items, key=lambda x: x["score"], reverse=True)[:top_k]
 
     # Enforce token budget (~150 tokens per entry)
     truncated = False
@@ -826,10 +961,10 @@ def attest_get_prior_approaches(
         "problem_description": problem_description,
         "tenant_id": tenant_id,
         "approaches": kept,
-        "total_found": len(session_approaches),
+        "total_found": len(session_approaches) + len(direct_knowledge),
         "truncated": truncated,
         "token_estimate": tokens_used,
-        "message": f"Found {len(kept)} prior approaches (of {len(session_approaches)} total)",
+        "message": f"Found {len(kept)} results (of {len(session_approaches) + len(direct_knowledge)} total)",
     })
     return result_text
 
@@ -941,6 +1076,197 @@ def attest_confidence_trail(
         ),
     }
     return json.dumps(result)
+
+
+@mcp.tool()
+def attest_learned(
+    subject: str,
+    insight: str,
+    insight_type: str = "pattern",
+    confidence: float = 0.8,
+) -> str:
+    """Record a learning or finding. Simplest way to teach the knowledge graph.
+
+    Args:
+        subject: What it's about — file path, module name, concept, tool name
+        insight: What you learned, in plain English
+        insight_type: One of: bug, fix, pattern, decision, warning, tip
+        confidence: How confident you are (0.0-1.0, default 0.8)
+
+    Examples:
+        attest_learned("cursor.py", "batch triage fallback was calling per-claim LLM", "bug")
+        attest_learned("normalization", "must strip Unicode Cf chars in both Python and Rust", "pattern")
+        attest_learned("serde_json::Value", "can't use with bincode — calls deserialize_any", "warning")
+    """
+    db = _get_db()
+
+    # Map insight_type to predicate
+    type_to_predicate = {
+        "bug": "had_bug",
+        "fix": "has_fix",
+        "pattern": "has_pattern",
+        "decision": "has_decision",
+        "warning": "has_warning",
+        "tip": "has_tip",
+    }
+    predicate = type_to_predicate.get(insight_type, "has_pattern")
+
+    # Auto-detect entity type from subject
+    if "/" in subject or subject.endswith(".py") or subject.endswith(".rs") or subject.endswith(".ts"):
+        entity_type = "source_file"
+    elif subject.endswith("()") or "::" in subject:
+        entity_type = "function"
+    else:
+        entity_type = "concept"
+
+    sid = _session_tracker["session_id"] if _session_tracker else "manual"
+    claim_id = db.ingest(
+        subject=(subject, entity_type),
+        predicate=(predicate, "predicate"),
+        object=(insight, insight_type),
+        provenance={
+            "source_type": "agent_learning",
+            "source_id": sid,
+        },
+        confidence=confidence,
+    )
+
+    if _session_tracker is not None:
+        _session_tracker["learnings_recorded"] += 1
+    _track_claims_ingested(1)
+
+    return json.dumps({
+        "claim_id": claim_id,
+        "recorded": f"[{insight_type}] {subject}: {insight}",
+        "confidence": confidence,
+    })
+
+
+@mcp.tool()
+def attest_check_file(file_path: str) -> str:
+    """Check the knowledge graph for warnings, bugs, fixes, and patterns about a file.
+
+    Use this before editing a file to see if there are known issues or patterns.
+    This is the explicit-call equivalent of Claude Code's PreToolUse hook —
+    designed for Cursor, Windsurf, Codex, and other tools without hook support.
+
+    Args:
+        file_path: Path to the file to check (absolute or relative)
+    """
+    _track_tool_call("attest_check_file", file_path)
+    db = _get_db()
+
+    from attestdb.core.vocabulary import (
+        KNOWLEDGE_PREDICATES,
+        KNOWLEDGE_PRIORITY,
+        knowledge_label,
+    )
+
+    # Build search terms: basename and last two path segments
+    basename = os.path.basename(file_path)
+    search_terms = [basename]
+    parts = file_path.replace("\\", "/").split("/")
+    if len(parts) >= 2:
+        search_terms.append("/".join(parts[-2:]))
+
+    warnings: list[tuple[int, str]] = []  # (priority, formatted_line)
+    seen: set[str] = set()
+
+    for term in search_terms:
+        entities = db.search_entities(term, top_k=3)
+        for entity in entities:
+            # Only include claims whose subject contains the search term
+            if term.lower() not in entity.id.lower():
+                continue
+            for claim in db.claims_for(entity.id):
+                if claim.claim_id in seen:
+                    continue
+                if claim.predicate.id in KNOWLEDGE_PREDICATES:
+                    seen.add(claim.claim_id)
+                    label = knowledge_label(claim.predicate.id)
+                    pri = KNOWLEDGE_PRIORITY.get(claim.predicate.id, 9)
+                    warnings.append((
+                        pri,
+                        f"[{label}] {claim.subject.id}: {claim.object.id}",
+                    ))
+
+    if not warnings:
+        return f"No prior knowledge found for {basename}"
+
+    # Sort by priority (warnings/patterns first)
+    warnings.sort(key=lambda x: x[0])
+    lines = [w[1] for w in warnings[:10]]
+    return f"Attest knowledge for {basename}:\n" + "\n".join(f"  - {l}" for l in lines)
+
+
+@mcp.tool()
+def attest_session_end(
+    outcome: str,
+    summary: str,
+    next_steps: str = "",
+    files_changed: list[str] | None = None,
+) -> str:
+    """Record session outcome and what was accomplished. Call when work is done.
+
+    Args:
+        outcome: "success", "partial", or "failure"
+        summary: Brief description of what was accomplished
+        next_steps: What should happen next (picked up by recall in next session)
+        files_changed: Key files that were modified
+    """
+    db = _get_db()
+
+    if outcome not in ("success", "partial", "failure"):
+        return json.dumps({"error": f"Invalid outcome: {outcome!r}. Use success/partial/failure."})
+
+    sid = _session_tracker["session_id"] if _session_tracker else str(uuid.uuid4())
+
+    # Record outcome with rich payload
+    db.ingest(
+        subject=(sid, "tool_session"),
+        predicate=("had_outcome", "predicate"),
+        object=(outcome, "outcome_value"),
+        provenance={"source_type": "session_end", "source_id": sid},
+        confidence=0.9,
+        payload={
+            "schema_ref": "session_outcome",
+            "data": {
+                "outcome": outcome,
+                "summary": summary,
+                "next_steps": next_steps,
+                "files_changed": files_changed or [],
+            },
+        },
+    )
+
+    # Record next_steps as a separate claim so recall can find it
+    if next_steps:
+        db.ingest(
+            subject=(sid, "tool_session"),
+            predicate=("has_next_steps", "predicate"),
+            object=(next_steps, "continuation"),
+            provenance={"source_type": "session_end", "source_id": sid},
+            confidence=0.85,
+        )
+
+    # Record files changed
+    for f in (files_changed or []):
+        db.ingest(
+            subject=(sid, "tool_session"),
+            predicate=("modified", "predicate"),
+            object=(f, "source_file"),
+            provenance={"source_type": "session_end", "source_id": sid},
+            confidence=0.9,
+        )
+
+    return json.dumps({
+        "session_id": sid,
+        "outcome": outcome,
+        "summary": summary,
+        "next_steps": next_steps or "(none)",
+        "files_recorded": len(files_changed or []),
+        "message": f"Session {sid[:12]}... recorded as {outcome}",
+    })
 
 
 # ---------------------------------------------------------------------------

@@ -104,6 +104,14 @@ impl Wal {
 
     /// Append a claim to the WAL and fsync.
     pub fn append_claim(&mut self, claim: &Claim) -> Result<(), io::Error> {
+        self.append_claim_no_sync(claim)?;
+        self.file.sync_all()?;
+        Ok(())
+    }
+
+    /// Append a claim to the WAL without fsyncing (for batch inserts).
+    /// Caller must call `sync()` after the batch is complete.
+    pub fn append_claim_no_sync(&mut self, claim: &Claim) -> Result<(), io::Error> {
         let entry = WalEntry::InsertClaim(claim.clone());
         let data = bincode::serialize(&entry)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -113,10 +121,14 @@ impl Wal {
         self.file.write_all(&(data.len() as u32).to_le_bytes())?;
         self.file.write_all(&data)?;
         self.file.write_all(&crc.to_le_bytes())?;
-        self.file.sync_all()?;
 
         self.entry_count += 1;
         Ok(())
+    }
+
+    /// Flush and fsync the WAL file.
+    pub fn sync(&mut self) -> Result<(), io::Error> {
+        self.file.sync_all()
     }
 
     /// Read all valid entries from the WAL file. Stops at first corrupt entry.

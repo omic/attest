@@ -30,6 +30,7 @@ class GeneIDMapper:
         self._ensp_to_entrez: dict[str, int] = {}
         self._symbol_to_entrez: dict[str, int] = {}
         self._entrez_to_symbol: dict[int, str] = {}
+        self._uniprot_to_entrez: dict[str, int] = {}
 
     def load(self, hetionet_nodes_path: str | None = None) -> None:
         """Download gene2ensembl.gz and parse Hetionet nodes. Build lookup tables.
@@ -137,4 +138,60 @@ class GeneIDMapper:
         if entrez is not None:
             return f"Gene_{entrez}"
         return None
+
+    def uniprot_to_gene_entity_id(self, uniprot_id: str) -> str | None:
+        """Map a UniProt accession to a Hetionet Gene entity ID.
+
+        'P24941' -> 'Gene_1017' or None
+        """
+        entrez = self._uniprot_to_entrez.get(uniprot_id)
+        if entrez is not None:
+            return f"Gene_{entrez}"
+        return None
+
+    def load_uniprot_mapping(self, path: str | None = None) -> None:
+        """Load UniProt-to-Entrez mapping from idmapping_selected.tab.gz.
+
+        Downloads HUMAN_9606_idmapping_selected.tab.gz from UniProt FTP if
+        not cached. Only needs columns 1 (UniProt-AC) and 3 (GeneID).
+        """
+        import requests
+
+        if path is None:
+            path = os.path.join(self._cache_dir, "HUMAN_9606_idmapping_selected.tab.gz")
+
+        if not os.path.exists(path):
+            url = (
+                "https://ftp.uniprot.org/pub/databases/uniprot/"
+                "current_release/knowledgebase/idmapping/by_organism/"
+                "HUMAN_9606_idmapping_selected.tab.gz"
+            )
+            logger.info("Downloading UniProt ID mapping (~100MB)...")
+            resp = requests.get(url, timeout=300, stream=True)
+            resp.raise_for_status()
+            with open(path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            logger.info("Downloaded UniProt mapping to %s", path)
+
+        count = 0
+        with gzip.open(path, "rt") as f:
+            for line in f:
+                parts = line.split("\t")
+                if len(parts) < 3:
+                    continue
+                uniprot_ac = parts[0].strip()
+                gene_id_str = parts[2].strip()
+                if uniprot_ac and gene_id_str:
+                    # gene_id_str can be semicolon-separated; take first
+                    for gid in gene_id_str.split(";"):
+                        gid = gid.strip()
+                        if gid:
+                            try:
+                                self._uniprot_to_entrez[uniprot_ac] = int(gid)
+                                count += 1
+                            except ValueError:
+                                pass
+                            break
+        logger.info("UniProt mapping: %d accessions -> Entrez", count)
 

@@ -205,6 +205,18 @@ def main():
     p_schema = sub.add_parser("schema", help="Show knowledge graph schema")
     p_schema.add_argument("db", help="Database path")
 
+    # --- install ---
+    p_install = sub.add_parser("install", help="Configure Attest MCP for coding tools")
+    p_install.add_argument(
+        "--tool", choices=["claude", "cursor", "windsurf", "codex"],
+        action="append", dest="tools",
+        help="Specific tool (default: auto-detect all)",
+    )
+    p_install.add_argument(
+        "--global", dest="scope", action="store_const", const="user", default="project",
+        help="Install for all projects (user scope)",
+    )
+
     # --- serve ---
     p_serve = sub.add_parser("serve", help="Start MCP server (SSE/HTTP)")
     p_serve.add_argument(
@@ -230,6 +242,9 @@ def main():
         cmd_query(args)
     elif args.command == "schema":
         cmd_schema(args)
+    elif args.command == "install":
+        from attestdb.mcp_install import install
+        install(tools=args.tools, scope=args.scope)
     elif args.command == "serve":
         cmd_serve(args)
 

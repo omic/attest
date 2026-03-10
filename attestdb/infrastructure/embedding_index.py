@@ -92,8 +92,11 @@ class EmbeddingIndex:
                 data = json.load(f)
             self._ndim = data["ndim"]
             self._id_to_key = data["id_to_key"]
-            self._key_to_id = {int(v): k for k, v in self._id_to_key.items()}
             self._next_key = data["next_key"]
+        else:
+            logger.warning("Embedding index sidecar missing at %s", sidecar)
+        # Always rebuild reverse mapping from id_to_key
+        self._key_to_id = {int(v): k for k, v in self._id_to_key.items()}
 
     @classmethod
     def load_from(cls, path: str) -> EmbeddingIndex:

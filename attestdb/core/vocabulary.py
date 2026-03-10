@@ -103,6 +103,76 @@ def predict_predicate_from_paths(
     return (best, fraction)
 
 
+# ---------------------------------------------------------------------------
+# Knowledge predicates — used by learning layer, recall, and retrieval
+# ---------------------------------------------------------------------------
+
+# All predicates that represent recorded knowledge (learnings, bugs, fixes, etc.)
+KNOWLEDGE_PREDICATES: set[str] = {
+    "has_warning", "has_vulnerability",
+    "has_pattern", "has_decision",
+    "has_tip",
+    "had_bug", "has_issue", "failed_on",
+    "has_fix", "resolved",
+    "has_status",
+    "had_outcome", "produced_by",
+    "has_next_steps",
+}
+
+# Priority ordering for knowledge predicates (lower = surface first).
+# Warnings and vulnerabilities are most actionable and should always appear
+# before historical bug reports.
+KNOWLEDGE_PRIORITY: dict[str, int] = {
+    "has_warning": 0,
+    "has_vulnerability": 0,
+    "has_pattern": 1,
+    "has_decision": 1,
+    "has_tip": 2,
+    "had_bug": 3,
+    "has_issue": 3,
+    "failed_on": 3,
+    "has_fix": 4,
+    "resolved": 5,
+    "has_status": 5,
+    "had_outcome": 6,
+    "produced_by": 7,
+    "has_next_steps": 8,
+}
+
+
+# Display labels for knowledge predicates (replaces string-hacking with replace())
+KNOWLEDGE_LABEL: dict[str, str] = {
+    "has_warning": "warning",
+    "has_vulnerability": "vulnerability",
+    "has_pattern": "pattern",
+    "has_decision": "decision",
+    "has_tip": "tip",
+    "had_bug": "bug",
+    "has_issue": "issue",
+    "failed_on": "failed",
+    "has_fix": "fix",
+    "resolved": "resolved",
+    "has_status": "status",
+    "had_outcome": "outcome",
+    "produced_by": "source",
+    "has_next_steps": "next_steps",
+}
+
+# Priority threshold: predicates at or below this are "high priority"
+# (warnings, patterns, decisions, tips) vs "history" (bugs, fixes, status)
+KNOWLEDGE_HIGH_PRIORITY_THRESHOLD = 2
+
+
+def knowledge_label(predicate_id: str) -> str:
+    """Human-readable label for a knowledge predicate."""
+    return KNOWLEDGE_LABEL.get(predicate_id, predicate_id)
+
+
+def knowledge_sort_key(predicate_id: str, confidence: float = 0.5) -> tuple:
+    """Sort key for knowledge claims: priority first, then confidence descending."""
+    return (KNOWLEDGE_PRIORITY.get(predicate_id, 9), -confidence)
+
+
 # Quantitative payload schemas — schemas whose data has {value, unit}
 QUANTITATIVE_SCHEMAS: set[str] = {
     "binding_affinity",

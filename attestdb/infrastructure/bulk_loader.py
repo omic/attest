@@ -28,6 +28,431 @@ DISEASES_URL = "https://download.jensenlab.org/human_disease_knowledge_full.tsv"
 STRING_LINKS_URL = "https://stringdb-downloads.org/download/protein.links.v12.0/9606.protein.links.v12.0.txt.gz"
 REACTOME_URL = "https://reactome.org/download/current/NCBI2Reactome.txt"
 
+# Additional data sources (auth may be required)
+DISGENET_CURATED_URL = "https://www.disgenet.org/static/disgenet_ap1/files/downloads/curated_gene_disease_associations.tsv.gz"
+CHEMBL_SQLITE_BASE_URL = "https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/latest/"
+
+# Open data sources (no auth required)
+GOA_HUMAN_URL = "https://ftp.ebi.ac.uk/pub/databases/GO/goa/HUMAN/goa_human.gaf.gz"
+CTD_CHEM_GENE_URL = "https://ctdbase.org/reports/CTD_chem_gene_ixns.tsv.gz"
+CTD_GENE_DISEASE_URL = "https://ctdbase.org/reports/CTD_genes_diseases.tsv.gz"
+
+# GO evidence code -> confidence mapping (experimental > curated computational > electronic)
+GO_EVIDENCE_CONFIDENCE = {
+    # Experimental (high confidence)
+    "EXP": 0.95, "IDA": 0.95, "IPI": 0.93, "IMP": 0.92, "IGI": 0.90, "IEP": 0.88,
+    # Curated computational (medium confidence)
+    "ISS": 0.80, "ISO": 0.80, "ISA": 0.78, "ISM": 0.78, "RCA": 0.78, "IC": 0.75,
+    # Automated computational (lower confidence)
+    "IBA": 0.70, "IBD": 0.68, "IGC": 0.65, "IKR": 0.65, "IRD": 0.65,
+    # Electronic annotation (lowest)
+    "IEA": 0.55,
+}
+
+# GO aspect code -> entity type
+GO_ASPECT_MAP = {
+    "P": "biological_process",
+    "F": "molecular_function",
+    "C": "cellular_component",
+}
+
+# BioGRID and ClinVar URLs (fully open, no auth)
+BIOGRID_ORGANISM_URL = "https://downloads.thebiogrid.org/Download/BioGRID/Latest-Release/BIOGRID-ORGANISM-LATEST.tab3.zip"
+CLINVAR_GENE_CONDITION_URL = "https://ftp.ncbi.nlm.nih.gov/pub/clinvar/gene_condition_source_id"
+
+# New open data sources (no auth required)
+PRIMEKG_URL = "https://dataverse.harvard.edu/api/access/datafile/6180620"
+DRKG_URL = "https://dgl-data.s3-us-west-2.amazonaws.com/dataset/DRKG/drkg.tar.gz"
+SIDER_URL = "http://sideeffects.embl.de/media/download/meddra_all_se.tsv.gz"
+HPO_GENES_URL = "http://purl.obolibrary.org/obo/hp/hpoa/genes_to_phenotype.txt"
+INTACT_URL = "https://ftp.ebi.ac.uk/pub/databases/intact/current/psimitab/intact.zip"
+PHARMGKB_URL = "https://api.pharmgkb.org/v1/download/file/data/relationships.zip"
+MONDO_SSSOM_URL = "https://raw.githubusercontent.com/monarch-initiative/mondo/master/src/ontology/mappings/mondo.sssom.tsv"
+
+# Phase 1+2 data sources
+STITCH_URL = "http://stitch.embl.de/download/chemical_protein.links.v5.0/9606.chemical_protein.links.v5.0.tsv.gz"
+CTD_CHEM_DISEASE_URL = "https://ctdbase.org/reports/CTD_chemicals_diseases.tsv.gz"
+TISSUES_URL = "https://download.jensenlab.org/human_tissue_knowledge_full.tsv"
+OPEN_TARGETS_ASSOC_URL = "https://ftp.ebi.ac.uk/pub/databases/opentargets/platform/latest/output/associationByOverallDirect/"
+SEMMEDDB_PREDICATIONS_URL = "https://data.lhncbc.nlm.nih.gov/public/SemMedDB/semmedVER43_2024_R_PREDICATION.csv.gz"
+
+# Composite knowledge graphs
+KG2C_LITE_URL = "https://media.githubusercontent.com/media/ncats/translator-lfs-artifacts/main/files/kg2c_lite_2.10.0.json.gz"
+MONARCH_KG_URL = "https://data.monarchinitiative.org/monarch-kg/latest/monarch-kg.tar.gz"
+PHARMEBINET_URL = "https://zenodo.org/record/7011027/files/pharmebinet_tsv_2022_08_19_v2.tar.gz"
+
+# BioGRID experimental system type -> confidence
+BIOGRID_CONFIDENCE = {
+    "physical": 0.85,
+    "genetic": 0.75,
+}
+
+# CTD interaction action -> predicate mapping
+CTD_ACTION_MAP = {
+    "increases": "upregulates",
+    "decreases": "downregulates",
+    "affects": "regulates",
+    "increases^expression": "upregulates",
+    "decreases^expression": "downregulates",
+    "increases^activity": "activates",
+    "decreases^activity": "inhibits",
+    "increases^phosphorylation": "upregulates",
+    "decreases^phosphorylation": "downregulates",
+    "affects^binding": "binds",
+    "increases^secretion": "upregulates",
+    "decreases^secretion": "downregulates",
+    "affects^expression": "regulates",
+    "affects^activity": "regulates",
+    "increases^metabolic processing": "upregulates",
+    "decreases^metabolic processing": "downregulates",
+}
+
+# DrugBank action -> predicate mapping
+DRUGBANK_ACTION_MAP = {
+    "inhibitor": "inhibits",
+    "antagonist": "inhibits",
+    "blocker": "inhibits",
+    "negative modulator": "inhibits",
+    "suppressor": "inhibits",
+    "agonist": "activates",
+    "activator": "activates",
+    "inducer": "upregulates",
+    "positive modulator": "activates",
+    "stimulator": "activates",
+    "potentiator": "activates",
+    "substrate": "binds",
+    "binder": "binds",
+    "ligand": "binds",
+    "modulator": "regulates",
+    "cofactor": "binds",
+    "chelator": "binds",
+    "carrier": "binds",
+}
+
+# PrimeKG display_relation -> Attest predicate
+PRIMEKG_PREDICATE_MAP = {
+    "target": "interacts",
+    "enzyme": "interacts",
+    "carrier": "interacts",
+    "transporter": "interacts",
+    "indication": "treats",
+    "contraindication": "contraindicates",
+    "off-label use": "treats",
+    "associated with": "associated_with",
+    "interacts with": "interacts",
+    "phenotype present": "associated_with",
+    "phenotype absent": "associated_with",
+    "pathway": "participates_in",
+    "ppi": "interacts",
+    "side effect": "causes_side_effect",
+    "parent-child": "associated_with",
+    "synergistic interaction": "interacts",
+    "expression present": "expressed_in",
+    "expression absent": "associated_with",
+}
+
+# DRKG relation prefix -> Attest predicate
+DRKG_PREDICATE_MAP = {
+    "DRUGBANK::target": "interacts",
+    "DRUGBANK::enzyme": "interacts",
+    "DRUGBANK::carrier": "interacts",
+    "DRUGBANK::transporter": "interacts",
+    "Hetionet::CtD": "treats",
+    "Hetionet::CpD": "palliates",
+    "Hetionet::CuG": "upregulates",
+    "Hetionet::CdG": "downregulates",
+    "Hetionet::GiG": "interacts",
+    "Hetionet::DaG": "associated_with",
+    "Hetionet::CbG": "binds",
+    "Hetionet::DuG": "upregulates",
+    "Hetionet::DdG": "downregulates",
+    "Hetionet::GpBP": "participates_in",
+    "Hetionet::GpCC": "participates_in",
+    "Hetionet::GpMF": "participates_in",
+    "Hetionet::GpPW": "participates_in",
+    "GNBR::T": "treats",
+    "GNBR::E": "associated_with",
+    "GNBR::B": "binds",
+    "GNBR::A+": "activates",
+    "GNBR::A-": "inhibits",
+    "GNBR::N": "inhibits",
+    "GNBR::Sa": "associated_with",
+    "GNBR::Pr": "associated_with",
+    "GNBR::Pa": "associated_with",
+    "GNBR::J": "associated_with",
+    "GNBR::Mp": "associated_with",
+    "GNBR::K": "associated_with",
+    "GNBR::Z": "associated_with",
+    "GNBR::L": "associated_with",
+    "GNBR::G": "associated_with",
+    "GNBR::Md": "associated_with",
+    "GNBR::C": "associated_with",
+    "GNBR::Te": "treats",
+    "GNBR::D": "associated_with",
+    "GNBR::X": "associated_with",
+    "GNBR::Rg": "regulates",
+    "GNBR::Q": "associated_with",
+    "GNBR::I": "inhibits",
+    "GNBR::Y": "associated_with",
+    "GNBR::W": "associated_with",
+    "GNBR::V+": "activates",
+    "GNBR::U": "associated_with",
+    "GNBR::O": "associated_with",
+    "GNBR::H": "associated_with",
+    "GNBR::in-trial": "treats",
+    "bioarx::HumGenHumGen": "interacts",
+    "bioarx::CcSe": "causes_side_effect",
+    "bioarx::DrDi": "treats",
+    "bioarx::GpDi": "associated_with",
+    "STRING::": "interacts",
+    "INTACT::": "interacts",
+}
+
+# PharmGKB Evidence level -> confidence
+PHARMGKB_EVIDENCE_CONFIDENCE = {
+    "4": 0.90,  # Clinical annotation
+    "3": 0.85,  # Variant annotation
+    "2": 0.80,  # VIP
+    "1A": 0.90, # CPIC guideline
+    "1B": 0.85, # PharmGKB guideline
+    "1": 0.75,  # Pathway
+}
+
+# SemMedDB predicate -> Attest predicate
+SEMMEDDB_PREDICATE_MAP = {
+    "TREATS": "treats",
+    "PREVENTS": "prevents",
+    "CAUSES": "causes",
+    "PREDISPOSES": "predisposes",
+    "ASSOCIATED_WITH": "associated_with",
+    "AFFECTS": "regulates",
+    "AUGMENTS": "upregulates",
+    "DISRUPTS": "inhibits",
+    "INHIBITS": "inhibits",
+    "STIMULATES": "activates",
+    "INTERACTS_WITH": "interacts",
+    "COEXISTS_WITH": "associated_with",
+    "PRODUCES": "associated_with",
+    "CONVERTS_TO": "associated_with",
+    "ISA": "associated_with",
+    "PART_OF": "participates_in",
+    "LOCATION_OF": "expressed_in",
+    "PROCESS_OF": "associated_with",
+    "USES": "associated_with",
+    "DIAGNOSES": "associated_with",
+    "ADMINISTERED_TO": "treats",
+    "METHOD_OF": "associated_with",
+    "MEASURES": "associated_with",
+    "OCCURS_IN": "associated_with",
+    "PRECEDES": "associated_with",
+    "COMPLICATES": "associated_with",
+    "COMPARED_WITH": "associated_with",
+    "HIGHER_THAN": "associated_with",
+    "LOWER_THAN": "associated_with",
+    "SAME_AS": "equivalent_to",
+}
+
+# SemMedDB semantic type -> Attest entity type
+SEMMEDDB_SEMTYPE_MAP = {
+    "gngm": "gene", "aapp": "protein", "enzy": "protein",
+    "phsu": "compound", "orch": "compound", "antb": "compound",
+    "clnd": "compound", "hops": "compound", "strd": "compound",
+    "dsyn": "disease", "neop": "disease", "patf": "disease",
+    "sosy": "phenotype", "fndg": "phenotype", "lbtr": "phenotype",
+    "bpoc": "entity", "tisu": "entity", "cell": "entity",
+    "moft": "biological_process", "biof": "biological_process",
+    "celf": "biological_process", "genf": "biological_process",
+    "orgf": "biological_process", "phsf": "biological_process",
+}
+
+# PharMeBINet edge type verb -> Attest predicate
+# Edge types are like TREATS_CHtD, BINDS_CHbG — we match on the verb prefix
+PHARMEBINET_VERB_MAP = {
+    # Verb forms (from PharMeBINet edge type names)
+    "TREATS": "treats",
+    "PALLIATES": "palliates",
+    "PREVENTS": "prevents",
+    "CONTRAINDICATES": "contraindicates",
+    "CAUSES": "causes_side_effect",
+    "MIGHT_CAUSES": "causes_side_effect",
+    "INDUCES": "causes",
+    "MIGHT_INDUCES": "causes",
+    "BINDS": "binds",
+    "INHIBITS": "inhibits",
+    "INTERACTS": "interacts",
+    "ASSOCIATES": "associated_with",
+    "COVARIES": "associated_with",
+    "RESEMBLES": "associated_with",
+    "PRESENTS": "associated_with",
+    "PRODUCES": "associated_with",
+    "EXPRESSES": "expresses",
+    "LOCALIZES": "localizes",
+    "UPREGULATES": "upregulates",
+    "DOWNREGULATES": "downregulates",
+    "REGULATES": "regulates",
+    "INVOLVED_IN": "participates_in",
+    "ENABLES": "participates_in",
+    "CONTRIBUTES_TO": "participates_in",
+    "PARTICIPATES_IN": "participates_in",
+    "PART_OF": "participates_in",
+    "IS_ACTIVE_IN": "participates_in",
+    "LOCATED_IN": "localizes",
+    "COLOCALIZES_WITH": "localizes",
+    "ACTS_UPSTREAM_OF": "regulates",
+    "IS_A": "associated_with",
+    "EQUAL": "equivalent_to",
+    "LEADS_TO": "causes",
+    "DEGENERATES": "inhibits",
+    "METABOLIZES": "interacts",
+    "INCREASES": "upregulates",
+    "DECREASES": "downregulates",
+    "AFFECTS": "regulates",
+    "HAS": "associated_with",
+    "BELONGS_TO": "associated_with",
+    "INCLUDES": "includes",
+    "MAY_DIAGNOSES": "associated_with",
+    "COMBINATION_CAUSES_ADR": "causes_side_effect",
+    # Noun forms (PharMeBINet uses ASSOCIATION_GaD, INTERACTION_GiG, etc.)
+    "ASSOCIATION": "associated_with",
+    "INTERACTION": "interacts",
+    "SIDE_EFFECT": "causes_side_effect",
+    "TARGET": "interacts",
+    "PARTICIPATES": "participates_in",
+    "INDICATION": "treats",
+    "CONTRAINDICATION": "contraindicates",
+}
+
+# PharMeBINet node label -> Attest entity type
+PHARMEBINET_LABEL_MAP = {
+    "Gene": "gene",
+    "Protein": "protein",
+    "Chemical": "compound",
+    "Compound": "compound",
+    "Drug": "compound",
+    "Salt": "compound",
+    "Disease": "disease",
+    "Phenotype": "phenotype",
+    "Symptom": "phenotype",
+    "SideEffect": "phenotype",
+    "BiologicalProcess": "biological_process",
+    "MolecularFunction": "molecular_function",
+    "CellularComponent": "cellular_component",
+    "Pathway": "pathway",
+    "Anatomy": "entity",
+    "PharmacologicClass": "entity",
+    "GeneVariant": "gene",
+    "Variant": "gene",
+    "Haplotype": "gene",
+    "Reaction": "entity",
+    "ReactionLikeEvent": "entity",
+    "Treatment": "compound",
+    "Product": "compound",
+    "Interaction": "entity",
+    "ClinicalAnnotation": "entity",
+    "VariantAnnotation": "entity",
+    "RNA": "gene",
+    "Target": "protein",
+    "Metabolite": "compound",
+}
+
+# Biolink category -> Attest entity type (shared by KG2c, Monarch KG)
+BIOLINK_CATEGORY_MAP = {
+    "biolink:Gene": "gene",
+    "biolink:Protein": "protein",
+    "biolink:Disease": "disease",
+    "biolink:PhenotypicFeature": "phenotype",
+    "biolink:ChemicalEntity": "compound",
+    "biolink:SmallMolecule": "compound",
+    "biolink:Drug": "compound",
+    "biolink:MolecularMixture": "compound",
+    "biolink:BiologicalProcess": "biological_process",
+    "biolink:MolecularActivity": "molecular_function",
+    "biolink:CellularComponent": "cellular_component",
+    "biolink:Pathway": "pathway",
+    "biolink:Cell": "cell_line",
+    "biolink:AnatomicalEntity": "entity",
+    "biolink:GrossAnatomicalStructure": "entity",
+    "biolink:OrganismTaxon": "organism",
+    "biolink:SequenceVariant": "gene",
+    "biolink:Genotype": "gene",
+    "biolink:ClinicalFinding": "phenotype",
+    "biolink:NamedThing": "entity",
+    "biolink:PhysiologicalProcess": "biological_process",
+    "biolink:NucleicAcidEntity": "gene",
+    "biolink:Treatment": "compound",
+    "biolink:DrugExposure": "compound",
+    "biolink:MolecularEntity": "entity",
+    "biolink:InformationContentEntity": "entity",
+    "biolink:OntologyClass": "entity",
+    "biolink:LifeStage": "entity",
+    "biolink:Case": "entity",
+}
+
+# Biolink predicate -> Attest predicate (shared by KG2c, Monarch KG)
+BIOLINK_PREDICATE_MAP = {
+    # Causal / mechanistic
+    "biolink:treats": "treats",
+    "biolink:treats_or_applied_or_studied_to_treat": "treats",
+    "biolink:ameliorates_condition": "treats",
+    "biolink:preventative_for_condition": "prevents",
+    "biolink:causes": "causes",
+    "biolink:caused_by": "causes",
+    "biolink:contributes_to": "associated_with",
+    "biolink:contraindicated_in": "contraindicates",
+    "biolink:disrupts": "inhibits",
+    # Regulatory
+    "biolink:regulates": "regulates",
+    "biolink:positively_regulates": "upregulates",
+    "biolink:negatively_regulates": "downregulates",
+    "biolink:affects": "regulates",
+    "biolink:acts_upstream_of": "regulates",
+    "biolink:acts_upstream_of_positive_effect": "upregulates",
+    "biolink:acts_upstream_of_negative_effect": "downregulates",
+    "biolink:acts_upstream_of_or_within": "regulates",
+    "biolink:acts_upstream_of_or_within_positive_effect": "upregulates",
+    "biolink:acts_upstream_of_or_within_negative_effect": "downregulates",
+    # Interaction / physical
+    "biolink:interacts_with": "interacts",
+    "biolink:physically_interacts_with": "interacts",
+    "biolink:binds": "binds",
+    # Association
+    "biolink:associated_with": "associated_with",
+    "biolink:correlated_with": "associated_with",
+    "biolink:gene_associated_with_condition": "associated_with",
+    "biolink:associated_with_increased_likelihood_of": "predisposes",
+    "biolink:genetically_associated_with": "associated_with",
+    "biolink:has_phenotype": "associated_with",
+    "biolink:has_disease": "associated_with",
+    "biolink:has_gene": "associated_with",
+    "biolink:disease_has_location": "localizes",
+    "biolink:model_of": "associated_with",
+    "biolink:has_mode_of_inheritance": "associated_with",
+    # Functional / localization
+    "biolink:enables": "participates_in",
+    "biolink:actively_involved_in": "participates_in",
+    "biolink:participates_in": "participates_in",
+    "biolink:is_active_in": "participates_in",
+    "biolink:expressed_in": "expressed_in",
+    "biolink:located_in": "localizes",
+    "biolink:colocalizes_with": "localizes",
+    # Structural / equivalence
+    "biolink:has_part": "includes",
+    "biolink:part_of": "participates_in",
+    "biolink:subclass_of": "associated_with",
+    "biolink:superclass_of": "associated_with",
+    "biolink:same_as": "equivalent_to",
+    "biolink:close_match": "equivalent_to",
+    "biolink:broad_match": "associated_with",
+    "biolink:related_to": "associated_with",
+    # Variant
+    "biolink:is_sequence_variant_of": "variant_of",
+    "biolink:has_sequence_variant": "variant_of",
+    # Orthology
+    "biolink:orthologous_to": "homolog_of",
+    "biolink:homologous_to": "homolog_of",
+    "biolink:has_participant": "interacts",
+}
+
 # Hetionet metaedge abbreviations -> readable predicates
 METAEDGE_MAP = {
     "CbG": "binds",
@@ -200,29 +625,65 @@ class BulkLoader:
 
         Returns (BatchResult for ingested edges, list of withheld ClaimInput).
         """
+        t0 = time.time()
         rng = random.Random(seed)
         raw_edges = self._parse_hetionet_edges(path)
+        timestamp = int(time.time() * 1_000_000_000)
 
         if max_edges and len(raw_edges) > max_edges:
             raw_edges = self._snowball_sample(raw_edges, max_edges, rng)
 
-        claims = self._edges_to_claims(raw_edges)
+        # Split holdout on raw edges before building claim rows
+        rng.shuffle(raw_edges)
+        holdout_count = int(len(raw_edges) * holdout_fraction)
+        withheld_edges = raw_edges[:holdout_count]
+        ingest_edges = raw_edges[holdout_count:]
 
-        # Split holdout
-        rng.shuffle(claims)
-        holdout_count = int(len(claims) * holdout_fraction)
-        withheld = claims[:holdout_count]
-        to_ingest = claims[holdout_count:]
+        # Convert withheld to ClaimInput for eval harness
+        withheld = self._edges_to_claims(withheld_edges)
 
         logger.info(
             "Hetionet: %d total edges, %d to ingest, %d withheld",
-            len(claims),
-            len(to_ingest),
+            len(raw_edges),
+            len(ingest_edges),
             len(withheld),
         )
 
-        result = self._pipeline.ingest_batch(to_ingest)
+        # Build entities dict and claim_rows for fast Rust batch insert
+        entities: dict[str, tuple[str, str, str]] = {}
+        claim_rows: list[tuple] = []
 
+        for src, stype, pred, tgt, ttype, _ in ingest_edges:
+            subj_canonical = normalize_entity_id(src)
+            obj_canonical = normalize_entity_id(tgt)
+
+            ext_ids_src = _extract_external_ids(src, stype)
+            ext_ids_tgt = _extract_external_ids(tgt, ttype)
+
+            entities[subj_canonical] = (stype, src, json.dumps(ext_ids_src) if ext_ids_src else "{}")
+            entities[obj_canonical] = (ttype, tgt, json.dumps(ext_ids_tgt) if ext_ids_tgt else "{}")
+
+            source_id = f"hetionet:{src}:{pred}:{tgt}"
+            claim_id = compute_claim_id(subj_canonical, pred, obj_canonical, source_id, "database_import", timestamp)
+            content_id = compute_content_id(subj_canonical, pred, obj_canonical)
+            confidence = tier1_confidence("database_import")
+
+            claim_rows.append((
+                subj_canonical, obj_canonical, claim_id, content_id,
+                pred, "relates_to", confidence,
+                "database_import", source_id, "", "[]", "", "", "",
+                timestamp, "active",
+            ))
+
+        if not claim_rows:
+            return BatchResult(ingested=0), withheld
+
+        result = self._ingest_append_direct(entities, claim_rows, timestamp)
+        elapsed = time.time() - t0
+        logger.info(
+            "Hetionet loaded: %d entities, %d claims in %.1fs",
+            len(entities), len(claim_rows), elapsed,
+        )
         return result, withheld
 
     @staticmethod
@@ -627,6 +1088,3410 @@ class BulkLoader:
         )
         return result
 
+    # --- New data source downloads ---
+
+    def download_disgenet(self, dest_dir: str) -> str | None:
+        """Download DisGeNET curated gene-disease associations.
+
+        Requires DISGENET_EMAIL + DISGENET_PASSWORD env vars for authentication.
+        Returns path to downloaded TSV file, or None if auth unavailable.
+        """
+        import requests
+
+        dest = os.path.join(dest_dir, "curated_gene_disease_associations.tsv.gz")
+        if os.path.exists(dest):
+            logger.info("DisGeNET already downloaded: %s", dest)
+            return dest
+
+        email = os.environ.get("DISGENET_EMAIL")
+        password = os.environ.get("DISGENET_PASSWORD")
+        api_key = os.environ.get("DISGENET_API_KEY")
+
+        if api_key:
+            # Use API key directly
+            headers = {"Authorization": f"Bearer {api_key}"}
+        elif email and password:
+            # Get auth token via API
+            try:
+                auth_resp = requests.post(
+                    "https://www.disgenet.org/api/auth/",
+                    data={"email": email, "password": password},
+                    timeout=30,
+                )
+                auth_resp.raise_for_status()
+                token = auth_resp.json().get("token")
+                if not token:
+                    logger.warning("DisGeNET auth returned no token")
+                    return None
+                headers = {"Authorization": f"Bearer {token}"}
+            except Exception as e:
+                logger.warning("DisGeNET auth failed: %s", e)
+                return None
+        else:
+            logger.warning(
+                "DisGeNET requires DISGENET_API_KEY or DISGENET_EMAIL+DISGENET_PASSWORD. "
+                "Register at https://www.disgenet.org/ and set env vars."
+            )
+            return None
+
+        logger.info("Downloading DisGeNET curated GDAs...")
+        try:
+            resp = requests.get(DISGENET_CURATED_URL, headers=headers, timeout=300)
+            resp.raise_for_status()
+            with open(dest, "wb") as f:
+                f.write(resp.content)
+            logger.info("Downloaded DisGeNET to %s (%d bytes)", dest, len(resp.content))
+            return dest
+        except Exception as e:
+            logger.warning("DisGeNET download failed: %s", e)
+            return None
+
+    def download_drugbank_targets(self, dest_dir: str) -> str | None:
+        """Download DrugBank target polypeptide CSV.
+
+        Requires DRUGBANK_EMAIL + DRUGBANK_PASSWORD env vars.
+        Returns path to downloaded CSV file, or None if auth unavailable.
+        """
+        import requests
+        import zipfile
+        import io
+
+        dest = os.path.join(dest_dir, "drugbank_targets.csv")
+        if os.path.exists(dest):
+            logger.info("DrugBank targets already downloaded: %s", dest)
+            return dest
+
+        email = os.environ.get("DRUGBANK_EMAIL")
+        password = os.environ.get("DRUGBANK_PASSWORD")
+        if not email or not password:
+            logger.warning(
+                "DrugBank requires DRUGBANK_EMAIL + DRUGBANK_PASSWORD. "
+                "Register at https://go.drugbank.com/academic_research and set env vars."
+            )
+            return None
+
+        url = "https://go.drugbank.com/releases/latest/downloads/target-all-polypeptide-ids"
+        logger.info("Downloading DrugBank targets...")
+        try:
+            resp = requests.get(url, auth=(email, password), timeout=120)
+            resp.raise_for_status()
+
+            # DrugBank downloads are zip files containing CSV
+            if resp.headers.get("content-type", "").startswith("application/zip") or resp.content[:4] == b"PK\x03\x04":
+                with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                    csv_names = [n for n in zf.namelist() if n.endswith(".csv")]
+                    if csv_names:
+                        with open(dest, "wb") as f:
+                            f.write(zf.read(csv_names[0]))
+                    else:
+                        logger.warning("DrugBank zip contains no CSV files")
+                        return None
+            else:
+                with open(dest, "wb") as f:
+                    f.write(resp.content)
+
+            logger.info("Downloaded DrugBank targets to %s", dest)
+            return dest
+        except Exception as e:
+            logger.warning("DrugBank download failed: %s", e)
+            return None
+
+    def download_chembl(self, dest_dir: str) -> str | None:
+        """Download ChEMBL SQLite database (no auth required, ~3-4GB).
+
+        Returns path to extracted SQLite file, or None on failure.
+        """
+        import requests
+        import tarfile
+
+        dest = os.path.join(dest_dir, "chembl.db")
+        if os.path.exists(dest):
+            logger.info("ChEMBL already downloaded: %s", dest)
+            return dest
+
+        # Find the SQLite tar.gz URL from the latest directory
+        tar_path = os.path.join(dest_dir, "chembl_sqlite.tar.gz")
+        if not os.path.exists(tar_path):
+            # Try to find the actual filename from the latest directory listing
+            logger.info("Downloading ChEMBL SQLite (~3-4GB, this will take a while)...")
+            # Try recent ChEMBL versions (latest first)
+            urls_to_try = [
+                f"{CHEMBL_SQLITE_BASE_URL}chembl_36_sqlite.tar.gz",
+                f"{CHEMBL_SQLITE_BASE_URL}chembl_35_sqlite.tar.gz",
+                f"{CHEMBL_SQLITE_BASE_URL}chembl_37_sqlite.tar.gz",
+            ]
+            downloaded = False
+            for url in urls_to_try:
+                try:
+                    resp = requests.get(url, timeout=30, stream=True)
+                    if resp.status_code == 200:
+                        total = int(resp.headers.get("content-length", 0))
+                        logger.info("Downloading %s (%.1f GB)...", url, total / 1e9)
+                        with open(tar_path, "wb") as f:
+                            downloaded_bytes = 0
+                            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                                f.write(chunk)
+                                downloaded_bytes += len(chunk)
+                                if total and downloaded_bytes % (100 * 1024 * 1024) < 1024 * 1024:
+                                    logger.info("  %.0f%%", downloaded_bytes / total * 100)
+                        downloaded = True
+                        break
+                except Exception as e:
+                    logger.warning("ChEMBL download from %s failed: %s", url, e)
+                    continue
+
+            if not downloaded:
+                logger.warning("Could not download ChEMBL SQLite from any URL")
+                return None
+
+        # Extract SQLite from tar.gz
+        logger.info("Extracting ChEMBL SQLite...")
+        try:
+            with tarfile.open(tar_path, "r:gz") as tf:
+                for member in tf.getmembers():
+                    if member.name.endswith(".db"):
+                        member.name = "chembl.db"
+                        tf.extract(member, dest_dir)
+                        break
+                else:
+                    logger.warning("No .db file found in ChEMBL tar.gz")
+                    return None
+        except Exception as e:
+            logger.warning("ChEMBL extraction failed: %s", e)
+            return None
+
+        logger.info("ChEMBL extracted to %s", dest)
+        return dest
+
+    # --- New data source loaders ---
+
+    def load_disgenet(self, path: str) -> BatchResult:
+        """Load DisGeNET curated gene-disease associations via bulk import.
+
+        Format (TSV with header): geneId  geneSymbol  DSI  DPI  diseaseId  diseaseName
+            diseaseType  diseaseClass  diseaseSemanticType  score  EI  YearInitial
+            YearFinal  NofPmids  NofSnps  source
+
+        Gene entities use direct Entrez ID mapping (same as Hetionet).
+        Disease entities use UMLS CUI (Disease_UMLS:{CUI}) — separate namespace
+        from Hetionet DOID entities, enabling cross-source corroboration.
+        """
+        t0 = time.time()
+        timestamp = int(time.time() * 1_000_000_000)
+
+        entities: dict[str, tuple[str, str, str]] = {}
+        claim_rows: list[tuple] = []
+        seen_claim_ids: set[str] = set()
+        count = 0
+
+        opener = gzip.open if path.endswith(".gz") else open
+        with opener(path, "rt") as f:
+            reader = csv.reader(f, delimiter="\t")
+            header = next(reader, None)  # Skip header
+            if not header:
+                return BatchResult(ingested=0)
+
+            for row in reader:
+                if len(row) < 10:
+                    continue
+
+                gene_id_raw = row[0].strip()
+                gene_symbol = row[1].strip()
+                disease_id = row[4].strip()  # UMLS CUI (e.g., C0014544)
+                disease_name = row[5].strip()
+                try:
+                    score = float(row[9].strip())
+                except (ValueError, IndexError):
+                    score = 0.0
+
+                if not gene_id_raw or not disease_id:
+                    continue
+
+                # Gene: direct Entrez ID (same as Hetionet)
+                gene_entity = f"Gene_{gene_id_raw}"
+                # Disease: UMLS CUI namespace
+                disease_entity = f"Disease_UMLS:{disease_id}"
+
+                gene_canonical = normalize_entity_id(gene_entity)
+                disease_canonical = normalize_entity_id(disease_entity)
+
+                if gene_canonical not in entities:
+                    gene_ext = {"ncbi_gene": gene_id_raw}
+                    if gene_symbol:
+                        gene_ext["symbol"] = gene_symbol
+                    entities[gene_canonical] = ("gene", gene_symbol or gene_entity,
+                                                json.dumps(gene_ext))
+                if disease_canonical not in entities:
+                    disease_ext = {"umls_cui": disease_id}
+                    entities[disease_canonical] = ("disease", disease_name or disease_entity,
+                                                    json.dumps(disease_ext))
+
+                pred_id = "associates"
+                source_id = "disgenet_curated"
+                source_type = "database_import"
+
+                claim_id = compute_claim_id(
+                    gene_canonical, pred_id, disease_canonical,
+                    source_id, source_type, timestamp,
+                )
+                if claim_id in seen_claim_ids:
+                    timestamp += 1
+                    claim_id = compute_claim_id(
+                        gene_canonical, pred_id, disease_canonical,
+                        source_id, source_type, timestamp,
+                    )
+                seen_claim_ids.add(claim_id)
+
+                content_id = compute_content_id(gene_canonical, pred_id, disease_canonical)
+
+                claim_rows.append((
+                    gene_canonical, disease_canonical,
+                    claim_id, content_id, pred_id, "relates_to",
+                    tier1_confidence(source_type),
+                    source_type, source_id,
+                    "", "[]", "", "", "", timestamp, "active",
+                ))
+                count += 1
+
+        logger.info("DisGeNET: %d gene-disease associations parsed", count)
+
+        if not claim_rows:
+            return BatchResult(ingested=0)
+
+        result = self._ingest_append_direct(entities, claim_rows, timestamp)
+        elapsed = time.time() - t0
+        logger.info(
+            "DisGeNET loaded: %d entities, %d claims in %.1fs",
+            len(entities), len(claim_rows), elapsed,
+        )
+        return result
+
+    def load_drugbank(self, path: str, mapper: GeneIDMapper) -> BatchResult:
+        """Load DrugBank drug-target interactions via bulk import.
+
+        Parses the target-all-polypeptide-ids CSV. Each row is a target protein
+        with a semicolon-separated list of DrugBank IDs.
+
+        Compound entities use direct DrugBank IDs (same as Hetionet).
+        Gene targets mapped via gene symbol or UniProt ID.
+        Action types mapped to bio predicates (inhibits, activates, binds, etc.).
+        """
+        t0 = time.time()
+        timestamp = int(time.time() * 1_000_000_000)
+
+        entities: dict[str, tuple[str, str, str]] = {}
+        claim_rows: list[tuple] = []
+        seen_claim_ids: set[str] = set()
+        mapped = 0
+        unmapped = 0
+
+        with open(path, "r") as f:
+            reader = csv.DictReader(f)
+
+            for row in reader:
+                # Extract target info
+                gene_name = (row.get("Gene Name") or row.get("gene_name") or "").strip()
+                uniprot_id = (row.get("UniProt ID") or row.get("uniprot_id") or "").strip()
+                species = (row.get("Species") or row.get("organism") or "").strip()
+                actions_raw = (row.get("Actions") or row.get("action") or "").strip()
+                known_action = (row.get("Known Action") or row.get("known_action") or "").strip()
+
+                # Only human targets
+                if species and "human" not in species.lower():
+                    continue
+
+                # Map target to gene entity
+                gene_id = None
+                if gene_name:
+                    gene_id = mapper.symbol_to_gene_entity_id(gene_name)
+                if gene_id is None and uniprot_id:
+                    gene_id = mapper.uniprot_to_gene_entity_id(uniprot_id)
+                if gene_id is None:
+                    unmapped += 1
+                    continue
+
+                # Get drug IDs
+                drug_ids_raw = (row.get("Drug IDs") or row.get("drug_ids") or "").strip()
+                if not drug_ids_raw:
+                    continue
+
+                drug_ids = [d.strip() for d in drug_ids_raw.split(";") if d.strip()]
+                if not drug_ids:
+                    continue
+
+                # Determine predicate from action
+                actions = [a.strip().lower() for a in actions_raw.split(";") if a.strip()]
+                pred_id = "binds"  # Default
+                for action in actions:
+                    if action in DRUGBANK_ACTION_MAP:
+                        pred_id = DRUGBANK_ACTION_MAP[action]
+                        break
+
+                gene_canonical = normalize_entity_id(gene_id)
+                if gene_canonical not in entities:
+                    gene_ext = _extract_external_ids(gene_id, "gene")
+                    if gene_name:
+                        gene_ext["symbol"] = gene_name
+                    if uniprot_id:
+                        gene_ext["uniprot"] = uniprot_id
+                    entities[gene_canonical] = ("gene", gene_name or gene_id,
+                                                json.dumps(gene_ext))
+
+                for db_id in drug_ids:
+                    if not db_id.startswith("DB"):
+                        continue
+
+                    compound_entity = f"Compound_{db_id}"
+                    compound_canonical = normalize_entity_id(compound_entity)
+
+                    if compound_canonical not in entities:
+                        comp_ext = {"drugbank": db_id}
+                        entities[compound_canonical] = ("compound", compound_entity,
+                                                        json.dumps(comp_ext))
+
+                    source_id = "drugbank"
+                    source_type = "database_import"
+
+                    claim_id = compute_claim_id(
+                        compound_canonical, pred_id, gene_canonical,
+                        source_id, source_type, timestamp,
+                    )
+                    if claim_id in seen_claim_ids:
+                        timestamp += 1
+                        claim_id = compute_claim_id(
+                            compound_canonical, pred_id, gene_canonical,
+                            source_id, source_type, timestamp,
+                        )
+                    seen_claim_ids.add(claim_id)
+
+                    content_id = compute_content_id(compound_canonical, pred_id, gene_canonical)
+
+                    claim_rows.append((
+                        compound_canonical, gene_canonical,
+                        claim_id, content_id, pred_id, "relates_to",
+                        tier1_confidence(source_type),
+                        source_type, source_id,
+                        "", "[]", "", "", "", timestamp, "active",
+                    ))
+                    mapped += 1
+
+        logger.info("DrugBank: %d drug-target pairs mapped, %d targets unmapped", mapped, unmapped)
+
+        if not claim_rows:
+            return BatchResult(ingested=0)
+
+        result = self._ingest_append_direct(entities, claim_rows, timestamp)
+        elapsed = time.time() - t0
+        logger.info(
+            "DrugBank loaded: %d entities, %d claims in %.1fs",
+            len(entities), len(claim_rows), elapsed,
+        )
+        return result
+
+    def load_chembl(self, path: str, mapper: GeneIDMapper, min_pchembl: float = 5.0) -> BatchResult:
+        """Load ChEMBL compound-target bioactivities via bulk import.
+
+        Queries the ChEMBL SQLite database for compound-target pairs with
+        activity data (IC50, Ki, Kd, EC50). Filters by pchembl_value >= min_pchembl.
+
+        Compound entities: Compound_CHEMBL{id} (separate namespace from DrugBank).
+        Gene targets: mapped via gene symbol from component_sequences.
+        """
+        import sqlite3
+
+        t0 = time.time()
+        timestamp = int(time.time() * 1_000_000_000)
+
+        entities: dict[str, tuple[str, str, str]] = {}
+        claim_rows: list[tuple] = []
+        seen_claim_ids: set[str] = set()
+        mapped = 0
+        unmapped = 0
+
+        conn = sqlite3.connect(path)
+        cursor = conn.cursor()
+
+        # Extract compound-target pairs with bioactivity
+        query = """
+            SELECT DISTINCT
+                md.chembl_id AS molecule_chembl_id,
+                md.pref_name AS molecule_name,
+                cseq.accession AS uniprot_id,
+                COALESCE(
+                    (SELECT cs2.component_synonym FROM component_synonyms cs2
+                     WHERE cs2.component_id = cseq.component_id
+                     AND cs2.syn_type = 'GENE_SYMBOL' LIMIT 1),
+                    td.pref_name
+                ) AS gene_name,
+                a.pchembl_value,
+                a.standard_type
+            FROM activities a
+            JOIN assays ass ON a.assay_id = ass.assay_id
+            JOIN target_dictionary td ON ass.tid = td.tid
+            JOIN target_components tc ON td.tid = tc.tid
+            JOIN component_sequences cseq ON tc.component_id = cseq.component_id
+            JOIN molecule_dictionary md ON a.molregno = md.molregno
+            WHERE a.pchembl_value >= ?
+              AND a.standard_type IN ('IC50', 'Ki', 'Kd', 'EC50')
+              AND td.target_type = 'SINGLE PROTEIN'
+              AND td.organism = 'Homo sapiens'
+        """
+
+        logger.info("Querying ChEMBL SQLite for bioactivities (pchembl >= %.1f)...", min_pchembl)
+        try:
+            cursor.execute(query, (min_pchembl,))
+        except sqlite3.OperationalError as e:
+            # Handle schema differences between ChEMBL versions
+            logger.warning("ChEMBL query failed (schema mismatch?): %s", e)
+            # Simplified fallback query without component_synonyms
+            query_simple = """
+                SELECT DISTINCT
+                    md.chembl_id,
+                    md.pref_name,
+                    cseq.accession,
+                    td.pref_name,
+                    a.pchembl_value,
+                    a.standard_type
+                FROM activities a
+                JOIN assays ass ON a.assay_id = ass.assay_id
+                JOIN target_dictionary td ON ass.tid = td.tid
+                JOIN target_components tc ON td.tid = tc.tid
+                JOIN component_sequences cseq ON tc.component_id = cseq.component_id
+                JOIN molecule_dictionary md ON a.molregno = md.molregno
+                WHERE a.pchembl_value >= ?
+                  AND a.standard_type IN ('IC50', 'Ki', 'Kd', 'EC50')
+                  AND td.target_type = 'SINGLE PROTEIN'
+                  AND td.organism = 'Homo sapiens'
+            """
+            cursor.execute(query_simple, (min_pchembl,))
+
+        for row in cursor:
+            chembl_id, mol_name, uniprot_id, gene_name, pchembl, std_type = row
+
+            if not chembl_id or not gene_name:
+                continue
+
+            # Map target to gene entity
+            gene_id = None
+            if gene_name:
+                gene_id = mapper.symbol_to_gene_entity_id(gene_name)
+            if gene_id is None and uniprot_id:
+                gene_id = mapper.uniprot_to_gene_entity_id(uniprot_id)
+            if gene_id is None:
+                unmapped += 1
+                continue
+            mapped += 1
+
+            # Compound entity in ChEMBL namespace
+            compound_entity = f"Compound_{chembl_id}"
+            compound_canonical = normalize_entity_id(compound_entity)
+            gene_canonical = normalize_entity_id(gene_id)
+
+            if compound_canonical not in entities:
+                comp_ext = {"chembl": chembl_id}
+                display = mol_name or compound_entity
+                entities[compound_canonical] = ("compound", display,
+                                                json.dumps(comp_ext))
+            if gene_canonical not in entities:
+                gene_ext = _extract_external_ids(gene_id, "gene")
+                if gene_name:
+                    gene_ext["symbol"] = gene_name
+                if uniprot_id:
+                    gene_ext["uniprot"] = uniprot_id
+                entities[gene_canonical] = ("gene", gene_name or gene_id,
+                                            json.dumps(gene_ext))
+
+            pred_id = "binds"
+            source_id = "chembl"
+            source_type = "experimental"
+
+            claim_id = compute_claim_id(
+                compound_canonical, pred_id, gene_canonical,
+                source_id, source_type, timestamp,
+            )
+            if claim_id in seen_claim_ids:
+                timestamp += 1
+                claim_id = compute_claim_id(
+                    compound_canonical, pred_id, gene_canonical,
+                    source_id, source_type, timestamp,
+                )
+            seen_claim_ids.add(claim_id)
+
+            content_id = compute_content_id(compound_canonical, pred_id, gene_canonical)
+
+            claim_rows.append((
+                compound_canonical, gene_canonical,
+                claim_id, content_id, pred_id, "relates_to",
+                tier1_confidence(source_type),
+                source_type, source_id,
+                "", "[]", "", "", "", timestamp, "active",
+            ))
+
+        conn.close()
+
+        logger.info("ChEMBL: %d compound-target pairs mapped, %d unmapped", mapped, unmapped)
+
+        if not claim_rows:
+            return BatchResult(ingested=0)
+
+        result = self._ingest_append_direct(entities, claim_rows, timestamp)
+        elapsed = time.time() - t0
+        logger.info(
+            "ChEMBL loaded: %d entities, %d claims in %.1fs",
+            len(entities), len(claim_rows), elapsed,
+        )
+        return result
+
+    # ── GO Annotations ────────────────────────────────────────────────
+
+    def download_goa(self, dest_dir: str) -> str:
+        """Download human GO annotations (GAF format). Returns path."""
+        import requests
+
+        dest = os.path.join(dest_dir, "goa_human.gaf.gz")
+        if os.path.exists(dest):
+            logger.info("GOA already cached at %s", dest)
+            return dest
+
+        logger.info("Downloading GO annotations for human...")
+        resp = requests.get(GOA_HUMAN_URL, timeout=120, stream=True)
+        resp.raise_for_status()
+        with open(dest, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                f.write(chunk)
+        size_mb = os.path.getsize(dest) / (1024 * 1024)
+        logger.info("GOA downloaded: %.1f MB", size_mb)
+        return dest
+
+    def load_goa(
+        self, path: str, mapper: GeneIDMapper, min_evidence: str = "all",
+    ) -> BatchResult:
+        """Load Gene Ontology annotations from GAF file.
+
+        Maps UniProt accessions to Entrez Gene IDs via the mapper.
+        Creates gene → participates_in → GO term claims.
+
+        Args:
+            path: Path to goa_human.gaf.gz
+            mapper: GeneIDMapper with UniProt mapping loaded
+            min_evidence: Filter level. 'experimental' = EXP/IDA/IPI/IMP/IGI/IEP only.
+                          'curated' = experimental + ISS/ISO/ISA/ISM/RCA/IC.
+                          'all' = include IEA (electronic). Default 'all'.
+        """
+        t0 = time.time()
+        timestamp = int(t0)
+
+        experimental_codes = {"EXP", "IDA", "IPI", "IMP", "IGI", "IEP"}
+        curated_codes = experimental_codes | {"ISS", "ISO", "ISA", "ISM", "RCA", "IC"}
+
+        entities: dict[str, tuple[str, str, str]] = {}
+        claim_rows: list[tuple] = []
+        mapped = 0
+        unmapped = 0
+        filtered = 0
+
+        with gzip.open(path, "rt") as f:
+            for line in f:
+                if line.startswith("!"):
+                    continue
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 15:
+                    continue
+
+                db = parts[0]  # e.g. "UniProtKB"
+                uniprot_id = parts[1]  # e.g. "P04637"
+                gene_symbol = parts[2]  # e.g. "TP53"
+                qualifier = parts[3]  # e.g. "NOT" or ""
+                go_id = parts[4]  # e.g. "GO:0006915"
+                evidence = parts[6]  # e.g. "IDA"
+                aspect = parts[8]  # P, F, or C
+                go_name = parts[9]  # full name
+                taxon = parts[12]  # e.g. "taxon:9606"
+
+                # Skip non-UniProtKB, non-human, negated annotations
+                if db != "UniProtKB":
+                    continue
+                if "9606" not in taxon:
+                    continue
+                if "NOT" in qualifier.upper():
+                    continue
+
+                # Evidence filter
+                if min_evidence == "experimental" and evidence not in experimental_codes:
+                    filtered += 1
+                    continue
+                if min_evidence == "curated" and evidence not in curated_codes:
+                    filtered += 1
+                    continue
+
+                # Map UniProt → Entrez Gene ID
+                gene_eid = mapper.uniprot_to_gene_entity_id(uniprot_id)
+                if gene_eid is None:
+                    # Fallback: try gene symbol
+                    gene_eid = mapper.symbol_to_gene_entity_id(gene_symbol)
+                if gene_eid is None:
+                    unmapped += 1
+                    continue
+
+                # Normalize IDs
+                gene_canonical = normalize_entity_id(gene_eid)
+                go_type = GO_ASPECT_MAP.get(aspect, "biological_process")
+                go_canonical = normalize_entity_id(go_id)
+
+                # Confidence from evidence code
+                confidence = GO_EVIDENCE_CONFIDENCE.get(evidence, 0.60)
+
+                # Register entities
+                if gene_canonical not in entities:
+                    entities[gene_canonical] = ("gene", gene_eid, "{}")
+                if go_canonical not in entities:
+                    entities[go_canonical] = (go_type, go_name or go_id, "{}")
+
+                # Build claim
+                predicate = "participates_in"
+                source_id = f"goa:{uniprot_id}:{go_id}:{evidence}"
+                content_id = compute_content_id(gene_canonical, predicate, go_canonical)
+                claim_id = compute_claim_id(
+                    gene_canonical, predicate, go_canonical,
+                    source_id, "database_import", timestamp,
+                )
+
+                claim_rows.append((
+                    gene_canonical, go_canonical, claim_id, content_id,
+                    predicate, "relation", confidence,
+                    "database_import", source_id,
+                    "", "[]", "", "", "", timestamp, "active",
+                ))
+                mapped += 1
+
+        logger.info(
+            "GOA: %d annotations mapped, %d unmapped, %d filtered by evidence",
+            mapped, unmapped, filtered,
+        )
+
+        if not claim_rows:
+            return BatchResult(ingested=0)
+
+        result = self._ingest_append_direct(entities, claim_rows, timestamp)
+        elapsed = time.time() - t0
+        logger.info(
+            "GOA loaded: %d entities, %d claims in %.1fs",
+            len(entities), len(claim_rows), elapsed,
+        )
+        return result
+
+    # ── CTD (Comparative Toxicogenomics Database) ─────────────────────
+
+    def download_ctd_chem_gene(self, dest_dir: str) -> str | None:
+        """Download CTD chemical-gene interactions. Returns path or None."""
+        import requests
+
+        dest = os.path.join(dest_dir, "CTD_chem_gene_ixns.tsv.gz")
+        if os.path.exists(dest):
+            logger.info("CTD chem-gene already cached at %s", dest)
+            return dest
+
+        logger.info("Downloading CTD chemical-gene interactions...")
+        try:
+            resp = requests.get(CTD_CHEM_GENE_URL, timeout=300, stream=True)
+            resp.raise_for_status()
+            with open(dest, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            size_mb = os.path.getsize(dest) / (1024 * 1024)
+            logger.info("CTD chem-gene downloaded: %.1f MB", size_mb)
+            return dest
+        except Exception as e:
+            logger.warning("CTD chem-gene download failed: %s", e)
+            return None
+
+    def download_ctd_gene_disease(self, dest_dir: str) -> str | None:
+        """Download CTD gene-disease associations. Returns path or None."""
+        import requests
+
+        dest = os.path.join(dest_dir, "CTD_genes_diseases.tsv.gz")
+        if os.path.exists(dest):
+            logger.info("CTD gene-disease already cached at %s", dest)
+            return dest
+
+        logger.info("Downloading CTD gene-disease associations...")
+        try:
+            resp = requests.get(CTD_GENE_DISEASE_URL, timeout=300, stream=True)
+            resp.raise_for_status()
+            with open(dest, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            size_mb = os.path.getsize(dest) / (1024 * 1024)
+            logger.info("CTD gene-disease downloaded: %.1f MB", size_mb)
+            return dest
+        except Exception as e:
+            logger.warning("CTD gene-disease download failed: %s", e)
+            return None
+
+    def load_ctd_chem_gene(self, path: str, human_only: bool = True) -> BatchResult:
+        """Load CTD chemical-gene interactions.
+
+        CTD uses NCBI Gene IDs and MeSH chemical IDs directly.
+        Only loads human interactions by default (organism_id=9606).
+
+        File format (tab-delimited, # comment headers):
+            ChemicalName, ChemicalID(MESH), CasRN, GeneSymbol, GeneID,
+            GeneForms, Organism, OrganismID, Interaction, InteractionActions,
+            PubMedIDs
+        """
+        t0 = time.time()
+        timestamp = int(t0)
+
+        entities: dict[str, tuple[str, str, str]] = {}
+        claim_rows: list[tuple] = []
+        skipped = 0
+
+        with gzip.open(path, "rt") as f:
+            for line in f:
+                if line.startswith("#"):
+                    continue
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 10:
+                    continue
+
+                chem_name = parts[0].strip()
+                chem_mesh = parts[1].strip()
+                gene_symbol = parts[3].strip()
+                gene_id_str = parts[4].strip()
+                organism_id = parts[7].strip()
+                actions_raw = parts[9].strip() if len(parts) > 9 else ""
+
+                # Filter human only
+                if human_only and organism_id != "9606":
+                    skipped += 1
+                    continue
+
+                if not gene_id_str or not gene_id_str.isdigit():
+                    skipped += 1
+                    continue
+
+                # Map to entity IDs
+                gene_eid = f"Gene_{gene_id_str}"
+                gene_canonical = normalize_entity_id(gene_eid)
+                chem_canonical = normalize_entity_id(f"Compound_{chem_mesh}")
+
+                # Determine predicate from interaction actions
+                predicate = "associated_with"  # default
+                if actions_raw:
+                    for action in actions_raw.split("|"):
+                        action = action.strip().lower()
+                        if action in CTD_ACTION_MAP:
+                            predicate = CTD_ACTION_MAP[action]
+                            break
+
+                # Register entities
+                if gene_canonical not in entities:
+                    entities[gene_canonical] = ("gene", gene_eid, "{}")
+                if chem_canonical not in entities:
+                    entities[chem_canonical] = (
+                        "compound", chem_name or f"Compound_{chem_mesh}",
+                        json.dumps({"mesh": chem_mesh}) if chem_mesh else "{}",
+                    )
+
+                source_id = f"ctd:cg:{chem_mesh}:{gene_id_str}"
+                content_id = compute_content_id(chem_canonical, predicate, gene_canonical)
+                claim_id = compute_claim_id(
+                    chem_canonical, predicate, gene_canonical,
+                    source_id, "database_import", timestamp,
+                )
+
+                claim_rows.append((
+                    chem_canonical, gene_canonical, claim_id, content_id,
+                    predicate, "relation", 0.85,
+                    "database_import", source_id,
+                    "", "[]", "", "", "", timestamp, "active",
+                ))
+
+        logger.info(
+            "CTD chem-gene: %d interactions parsed, %d skipped",
+            len(claim_rows), skipped,
+        )
+
+        if not claim_rows:
+            return BatchResult(ingested=0)
+
+        result = self._ingest_append_direct(entities, claim_rows, timestamp)
+        elapsed = time.time() - t0
+        logger.info(
+            "CTD chem-gene loaded: %d entities, %d claims in %.1fs",
+            len(entities), len(claim_rows), elapsed,
+        )
+        return result
+
+    def load_ctd_gene_disease(self, path: str, direct_only: bool = True) -> BatchResult:
+        """Load CTD gene-disease associations.
+
+        CTD uses NCBI Gene IDs and MeSH/OMIM disease IDs.
+        By default only loads direct evidence (not inferred).
+
+        File format (tab-delimited, # comment headers):
+            GeneSymbol, GeneID, DiseaseName, DiseaseID, DirectEvidence,
+            InferenceChemicalName, InferenceScore, OmimIDs, PubMedIDs
+        """
+        t0 = time.time()
+        timestamp = int(t0)
+
+        entities: dict[str, tuple[str, str, str]] = {}
+        claim_rows: list[tuple] = []
+        skipped = 0
+
+        with gzip.open(path, "rt") as f:
+            for line in f:
+                if line.startswith("#"):
+                    continue
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 5:
+                    continue
+
+                gene_symbol = parts[0].strip()
+                gene_id_str = parts[1].strip()
+                disease_name = parts[2].strip()
+                disease_id = parts[3].strip()  # e.g. "MESH:D000544" or "OMIM:104300"
+                direct_evidence = parts[4].strip() if len(parts) > 4 else ""
+
+                # Filter: only direct evidence if requested
+                if direct_only and not direct_evidence:
+                    skipped += 1
+                    continue
+
+                if not gene_id_str or not gene_id_str.isdigit():
+                    skipped += 1
+                    continue
+
+                # Map to entity IDs
+                gene_eid = f"Gene_{gene_id_str}"
+                gene_canonical = normalize_entity_id(gene_eid)
+
+                # Normalize disease ID: MESH:D000544 -> Disease_MESH:D000544
+                disease_eid = f"Disease_{disease_id}"
+                disease_canonical = normalize_entity_id(disease_eid)
+
+                # Determine predicate from DirectEvidence field
+                predicate = "associated_with"
+                if direct_evidence:
+                    ev_lower = direct_evidence.lower()
+                    if "marker" in ev_lower:
+                        predicate = "associated_with"
+                    elif "therapeutic" in ev_lower:
+                        predicate = "treats"
+
+                # Register entities
+                if gene_canonical not in entities:
+                    entities[gene_canonical] = ("gene", gene_eid, "{}")
+                if disease_canonical not in entities:
+                    ext_ids = {}
+                    if disease_id.startswith("MESH:"):
+                        ext_ids["mesh"] = disease_id.split(":", 1)[1]
+                    elif disease_id.startswith("OMIM:"):
+                        ext_ids["omim"] = disease_id.split(":", 1)[1]
+                    entities[disease_canonical] = (
+                        "disease", disease_name or disease_eid,
+                        json.dumps(ext_ids) if ext_ids else "{}",
+                    )
+
+                source_id = f"ctd:gd:{gene_id_str}:{disease_id}"
+                content_id = compute_content_id(gene_canonical, predicate, disease_canonical)
+                claim_id = compute_claim_id(
+                    gene_canonical, predicate, disease_canonical,
+                    source_id, "database_import", timestamp,
+                )
+
+                claim_rows.append((
+                    gene_canonical, disease_canonical, claim_id, content_id,
+                    predicate, "relation", 0.85,
+                    "database_import", source_id,
+                    "", "[]", "", "", "", timestamp, "active",
+                ))
+
+        logger.info(
+            "CTD gene-disease: %d associations parsed, %d skipped",
+            len(claim_rows), skipped,
+        )
+
+        if not claim_rows:
+            return BatchResult(ingested=0)
+
+        result = self._ingest_append_direct(entities, claim_rows, timestamp)
+        elapsed = time.time() - t0
+        logger.info(
+            "CTD gene-disease loaded: %d entities, %d claims in %.1fs",
+            len(entities), len(claim_rows), elapsed,
+        )
+        return result
+
+    # ── BioGRID (Protein-Protein Interactions) ────────────────────────
+
+    def download_biogrid(self, dest_dir: str) -> str | None:
+        """Download BioGRID organism archive, extract human file. Returns path."""
+        import requests
+        import zipfile
+
+        human_path = os.path.join(dest_dir, "biogrid_human.tab3.txt")
+        if os.path.exists(human_path):
+            logger.info("BioGRID human already cached at %s", human_path)
+            return human_path
+
+        zip_path = os.path.join(dest_dir, "biogrid_organism.tab3.zip")
+        if not os.path.exists(zip_path):
+            logger.info("Downloading BioGRID organism archive...")
+            try:
+                resp = requests.get(BIOGRID_ORGANISM_URL, timeout=300, stream=True)
+                resp.raise_for_status()
+                with open(zip_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+                logger.info("BioGRID downloaded: %.1f MB", size_mb)
+            except Exception as e:
+                logger.warning("BioGRID download failed: %s", e)
+                return None
+
+        # Extract human file from zip
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                for name in zf.namelist():
+                    if "Homo_sapiens" in name and name.endswith(".tab3.txt"):
+                        with zf.open(name) as src, open(human_path, "wb") as dst:
+                            import shutil
+                            shutil.copyfileobj(src, dst)
+                        logger.info("Extracted %s", name)
+                        return human_path
+            logger.warning("No Homo sapiens file found in BioGRID archive")
+            return None
+        except Exception as e:
+            logger.warning("BioGRID extraction failed: %s", e)
+            return None
+
+    def load_biogrid(self, path: str, low_throughput_only: bool = False) -> BatchResult:
+        """Load BioGRID protein-protein interactions.
+
+        BioGRID TAB3 format uses Entrez Gene IDs directly.
+        Creates gene-gene interacts claims.
+
+        Args:
+            path: Path to human BioGRID TAB3 file.
+            low_throughput_only: If True, skip high-throughput experiments
+                (higher quality but fewer interactions).
+        """
+        t0 = time.time()
+        timestamp = int(t0)
+
+        entities: dict[str, tuple[str, str, str]] = {}
+        claim_rows: list[tuple] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        skipped = 0
+
+        with open(path, "r") as f:
+            for line in f:
+                if line.startswith("#"):
+                    continue
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 19:
+                    continue
+
+                gene_a_str = parts[1].strip()  # Entrez Gene Interactor A
+                gene_b_str = parts[2].strip()  # Entrez Gene Interactor B
+                exp_system_type = parts[12].strip().lower() if len(parts) > 12 else ""
+                throughput = parts[17].strip().lower() if len(parts) > 17 else ""
+                organism_a = parts[15].strip() if len(parts) > 15 else ""
+                organism_b = parts[16].strip() if len(parts) > 16 else ""
+
+                # Human only
+                if organism_a != "9606" or organism_b != "9606":
+                    skipped += 1
+                    continue
+
+                # Skip self-interactions
+                if gene_a_str == gene_b_str:
+                    skipped += 1
+                    continue
+
+                if not gene_a_str.isdigit() or not gene_b_str.isdigit():
+                    skipped += 1
+                    continue
+
+                if low_throughput_only and "high" in throughput:
+                    skipped += 1
+                    continue
+
+                # Deduplicate (A,B) and (B,A)
+                pair = (min(gene_a_str, gene_b_str), max(gene_a_str, gene_b_str))
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+
+                gene_a_eid = f"Gene_{gene_a_str}"
+                gene_b_eid = f"Gene_{gene_b_str}"
+                gene_a_canonical = normalize_entity_id(gene_a_eid)
+                gene_b_canonical = normalize_entity_id(gene_b_eid)
+
+                confidence = BIOGRID_CONFIDENCE.get(exp_system_type, 0.80)
+
+                if gene_a_canonical not in entities:
+                    entities[gene_a_canonical] = ("gene", gene_a_eid, "{}")
+                if gene_b_canonical not in entities:
+                    entities[gene_b_canonical] = ("gene", gene_b_eid, "{}")
+
+                predicate = "interacts"
+                source_id = f"biogrid:{gene_a_str}:{gene_b_str}"
+                content_id = compute_content_id(gene_a_canonical, predicate, gene_b_canonical)
+                claim_id = compute_claim_id(
+                    gene_a_canonical, predicate, gene_b_canonical,
+                    source_id, "experimental", timestamp,
+                )
+
+                claim_rows.append((
+                    gene_a_canonical, gene_b_canonical, claim_id, content_id,
+                    predicate, "relation", confidence,
+                    "experimental", source_id,
+                    "", "[]", "", "", "", timestamp, "active",
+                ))
+
+        logger.info(
+            "BioGRID: %d unique interactions parsed, %d skipped",
+            len(claim_rows), skipped,
+        )
+
+        if not claim_rows:
+            return BatchResult(ingested=0)
+
+        result = self._ingest_append_direct(entities, claim_rows, timestamp)
+        elapsed = time.time() - t0
+        logger.info(
+            "BioGRID loaded: %d entities, %d claims in %.1fs",
+            len(entities), len(claim_rows), elapsed,
+        )
+        return result
+
+    # ── ClinVar (Gene-Disease Associations) ───────────────────────────
+
+    def download_clinvar(self, dest_dir: str) -> str:
+        """Download ClinVar gene_condition_source_id file. Returns path."""
+        import requests
+
+        dest = os.path.join(dest_dir, "clinvar_gene_condition.tsv")
+        if os.path.exists(dest):
+            logger.info("ClinVar already cached at %s", dest)
+            return dest
+
+        logger.info("Downloading ClinVar gene-condition mapping...")
+        resp = requests.get(CLINVAR_GENE_CONDITION_URL, timeout=120)
+        resp.raise_for_status()
+        with open(dest, "wb") as f:
+            f.write(resp.content)
+        size_kb = os.path.getsize(dest) / 1024
+        logger.info("ClinVar downloaded: %.0f KB", size_kb)
+        return dest
+
+    def load_clinvar(self, path: str) -> BatchResult:
+        """Load ClinVar gene-disease associations.
+
+        Uses gene_condition_source_id file which maps Entrez Gene IDs
+        to disease conditions via UMLS concept IDs and OMIM MIM numbers.
+
+        File format (tab-delimited, 7 columns):
+            GeneID, GeneSymbol, ConceptID, SourceName, SourceID, DiseaseMIM, LastUpdated
+        """
+        t0 = time.time()
+        timestamp = int(t0)
+
+        entities: dict[str, tuple[str, str, str]] = {}
+        claim_rows: list[tuple] = []
+        skipped = 0
+
+        with open(path, "r") as f:
+            header = next(f, None)  # Skip header
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 6:
+                    continue
+
+                gene_id_str = parts[0].strip()
+                gene_symbol = parts[1].strip()
+                concept_id = parts[2].strip()  # UMLS CUI or CN
+                source_name = parts[3].strip()  # e.g. "OMIM", "GeneReviews"
+                source_id_val = parts[4].strip()
+                disease_mim = parts[5].strip()
+
+                if not gene_id_str or not gene_id_str.isdigit():
+                    skipped += 1
+                    continue
+                if not concept_id:
+                    skipped += 1
+                    continue
+
+                gene_eid = f"Gene_{gene_id_str}"
+                gene_canonical = normalize_entity_id(gene_eid)
+
+                # Build disease entity ID from concept ID
+                disease_eid = f"Disease_{concept_id}"
+                disease_canonical = normalize_entity_id(disease_eid)
+
+                # External IDs for the disease
+                ext_ids = {}
+                if concept_id.startswith("C"):
+                    ext_ids["umls"] = concept_id
+                if disease_mim and disease_mim.isdigit():
+                    ext_ids["omim"] = disease_mim
+
+                if gene_canonical not in entities:
+                    entities[gene_canonical] = ("gene", gene_eid, "{}")
+                if disease_canonical not in entities:
+                    # Use source_id_val as display name if available
+                    display = source_id_val or concept_id
+                    entities[disease_canonical] = (
+                        "disease", display,
+                        json.dumps(ext_ids) if ext_ids else "{}",
+                    )
+
+                predicate = "associated_with"
+                src_id = f"clinvar:{gene_id_str}:{concept_id}:{source_name}"
+                content_id = compute_content_id(gene_canonical, predicate, disease_canonical)
+                claim_id = compute_claim_id(
+                    gene_canonical, predicate, disease_canonical,
+                    src_id, "database_import", timestamp,
+                )
+
+                claim_rows.append((
+                    gene_canonical, disease_canonical, claim_id, content_id,
+                    predicate, "relation", 0.88,
+                    "database_import", src_id,
+                    "", "[]", "", "", "", timestamp, "active",
+                ))
+
+        logger.info(
+            "ClinVar: %d gene-disease associations parsed, %d skipped",
+            len(claim_rows), skipped,
+        )
+
+        if not claim_rows:
+            return BatchResult(ingested=0)
+
+        result = self._ingest_append_direct(entities, claim_rows, timestamp)
+        elapsed = time.time() - t0
+        logger.info(
+            "ClinVar loaded: %d entities, %d claims in %.1fs",
+            len(entities), len(claim_rows), elapsed,
+        )
+        return result
+
+    # ── PrimeKG (Multi-relational Knowledge Graph) ────────────────────
+
+    def download_primekg(self, dest_dir: str) -> str:
+        """Download PrimeKG CSV from Harvard Dataverse. Returns path."""
+        import requests
+
+        dest = os.path.join(dest_dir, "primekg_edges.csv")
+        if os.path.exists(dest):
+            logger.info("PrimeKG already cached at %s", dest)
+            return dest
+
+        logger.info("Downloading PrimeKG (~200MB)...")
+        resp = requests.get(PRIMEKG_URL, timeout=600, stream=True)
+        resp.raise_for_status()
+        with open(dest, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                f.write(chunk)
+        logger.info("Downloaded PrimeKG to %s", dest)
+        return dest
+
+    def load_primekg(self, path: str) -> BatchResult:
+        """Load PrimeKG multi-relational edges.
+
+        CSV columns: relation, display_relation, x_id, x_type, x_name,
+                     x_source, y_id, y_type, y_name, y_source
+        """
+        t0 = time.time()
+        timestamp = int(t0)
+
+        entities: dict[str, tuple[str, str, str]] = {}
+        claim_rows: list[tuple] = []
+        skipped = 0
+
+        # Map PrimeKG node types to entity type + ID prefix
+        type_map = {
+            "gene/protein": ("gene", "Gene"),
+            "drug": ("compound", "Compound"),
+            "disease": ("disease", "Disease"),
+            "pathway": ("pathway", "Pathway"),
+            "biological_process": ("biological_process", "BP"),
+            "molecular_function": ("molecular_function", "MF"),
+            "cellular_component": ("cellular_component", "CC"),
+            "anatomy": ("entity", "Anatomy"),
+            "exposure": ("entity", "Exposure"),
+            "effect/phenotype": ("phenotype", "Phenotype"),
+        }
+
+        with open(path, "r") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                display_rel = row.get("display_relation", "").strip()
+                x_id = row.get("x_id", "").strip()
+                x_type = row.get("x_type", "").strip().lower()
+                x_name = row.get("x_name", "").strip()
+                y_id = row.get("y_id", "").strip()
+                y_type = row.get("y_type", "").strip().lower()
+                y_name = row.get("y_name", "").strip()
+
+                if not x_id or not y_id or not display_rel:
+                    skipped += 1
+                    continue
+
+                predicate = PRIMEKG_PREDICATE_MAP.get(display_rel, "associated_with")
+
+                # Build entity IDs
+                x_info = type_map.get(x_type, ("entity", "Entity"))
+                y_info = type_map.get(y_type, ("entity", "Entity"))
+
+                x_eid = f"{x_info[1]}_{x_id}"
+                y_eid = f"{y_info[1]}_{y_id}"
+                x_canonical = normalize_entity_id(x_eid)
+                y_canonical = normalize_entity_id(y_eid)
+
+                if x_canonical == y_canonical:
+                    skipped += 1
+                    continue
+
+                if x_canonical not in entities:
+                    entities[x_canonical] = (x_info[0], x_name or x_eid, "{}")
+                if y_canonical not in entities:
+                    entities[y_canonical] = (y_info[0], y_name or y_eid, "{}")
+
+                source_id = f"primekg:{x_id}:{display_rel}:{y_id}"
+                content_id = compute_content_id(x_canonical, predicate, y_canonical)
+                claim_id = compute_claim_id(
+                    x_canonical, predicate, y_canonical,
+                    source_id, "database_import", timestamp,
+                )
+
+                claim_rows.append((
+                    x_canonical, y_canonical, claim_id, content_id,
+                    predicate, "relation", 0.85,
+                    "database_import", source_id,
+                    "", "[]", "", "", "", timestamp, "active",
+                ))
+
+        logger.info("PrimeKG: %d edges parsed, %d skipped", len(claim_rows), skipped)
+
+        if not claim_rows:
+            return BatchResult(ingested=0)
+
+        result = self._ingest_append_direct(entities, claim_rows, timestamp)
+        elapsed = time.time() - t0
+        logger.info(
+            "PrimeKG loaded: %d entities, %d claims in %.1fs",
+            len(entities), len(claim_rows), elapsed,
+        )
+        return result
+
+    # ── DRKG (Drug Repurposing Knowledge Graph) ───────────────────────
+
+    def download_drkg(self, dest_dir: str) -> str:
+        """Download DRKG tar.gz from S3, extract TSV. Returns path."""
+        import requests
+        import tarfile as _tarfile
+
+        dest = os.path.join(dest_dir, "drkg.tsv")
+        if os.path.exists(dest):
+            logger.info("DRKG already cached at %s", dest)
+            return dest
+
+        tar_path = os.path.join(dest_dir, "drkg.tar.gz")
+        if not os.path.exists(tar_path):
+            logger.info("Downloading DRKG (~100MB)...")
+            resp = requests.get(DRKG_URL, timeout=600, stream=True)
+            resp.raise_for_status()
+            with open(tar_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+        # Extract the TSV file from the tar.gz
+        logger.info("Extracting DRKG...")
+        with _tarfile.open(tar_path, "r:gz") as tf:
+            for member in tf.getmembers():
+                # Skip macOS resource fork files (._prefix)
+                basename = os.path.basename(member.name)
+                if basename.startswith("._"):
+                    continue
+                if member.name == "drkg.tsv" or basename == "drkg.tsv":
+                    extracted = tf.extractfile(member)
+                    if extracted:
+                        with open(dest, "wb") as f:
+                            f.write(extracted.read())
+                        break
+            else:
+                # Try extracting any large file
+                for member in tf.getmembers():
+                    basename = os.path.basename(member.name)
+                    if basename.startswith("._"):
+                        continue
+                    if member.isfile() and member.size > 1_000_000:
+                        extracted = tf.extractfile(member)
+                        if extracted:
+                            with open(dest, "wb") as f:
+                                f.write(extracted.read())
+                            break
+
+        logger.info("DRKG extracted to %s", dest)
+        return dest
+
+    def load_drkg(self, path: str) -> BatchResult:
+        """Load DRKG triples (head, relation, tail).
+
+        Format: TSV, 3 columns: head\\trelation\\ttail
+        Entity format: Type::ID (e.g., Compound::DB00945, Gene::5742)
+        """
+        t0 = time.time()
+        timestamp = int(t0)
+
+        entities: dict[str, tuple[str, str, str]] = {}
+        claim_rows: list[tuple] = []
+        skipped = 0
+
+        # DRKG entity type -> (attest_type, id_prefix)
+        drkg_type_map = {
+            "Compound": ("compound", "Compound"),
+            "Gene": ("gene", "Gene"),
+            "Disease": ("disease", "Disease"),
+            "Anatomy": ("entity", "Anatomy"),
+            "Side Effect": ("phenotype", "SideEffect"),
+        }
+        # Types to skip entirely
+        skip_types = {"Atc", "Tax"}
+
+        def _parse_drkg_entity(raw: str) -> tuple[str, str, str] | None:
+            """Parse 'Type::ID' into (entity_id, entity_type, display)."""
+            parts = raw.split("::", 1)
+            if len(parts) != 2:
+                return None
+            etype, eid = parts[0].strip(), parts[1].strip()
+            if etype in skip_types:
+                return None
+            info = drkg_type_map.get(etype, ("entity", etype))
+            entity_id = f"{info[1]}_{eid}"
+            return entity_id, info[0], entity_id
+
+        with open(path, "r", errors="replace") as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 3:
+                    skipped += 1
+                    continue
+
+                head_raw, relation, tail_raw = parts[0], parts[1], parts[2]
+
+                head = _parse_drkg_entity(head_raw)
+                tail = _parse_drkg_entity(tail_raw)
+                if head is None or tail is None:
+                    skipped += 1
+                    continue
+
+                head_eid, head_type, head_display = head
+                tail_eid, tail_type, tail_display = tail
+
+                head_canonical = normalize_entity_id(head_eid)
+                tail_canonical = normalize_entity_id(tail_eid)
+
+                if head_canonical == tail_canonical:
+                    skipped += 1
+                    continue
+
+                # Map relation to predicate
+                predicate = DRKG_PREDICATE_MAP.get(relation, None)
+                if predicate is None:
+                    # Try prefix match (e.g., "STRING::REACTION" -> "interacts")
+                    prefix = relation.rsplit("::", 1)[0] + "::" if "::" in relation else ""
+                    predicate = DRKG_PREDICATE_MAP.get(prefix, "associated_with")
+
+                if head_canonical not in entities:
+                    entities[head_canonical] = (head_type, head_display, "{}")
+                if tail_canonical not in entities:
+                    entities[tail_canonical] = (tail_type, tail_display, "{}")
+
+                source_id = f"drkg:{head_raw}:{relation}:{tail_raw}"
+                content_id = compute_content_id(head_canonical, predicate, tail_canonical)
+                claim_id = compute_claim_id(
+                    head_canonical, predicate, tail_canonical,
+                    source_id, "database_import", timestamp,
+                )
+
+                claim_rows.append((
+                    head_canonical, tail_canonical, claim_id, content_id,
+                    predicate, "relation", 0.80,
+                    "database_import", source_id,
+                    "", "[]", "", "", "", timestamp, "active",
+                ))
+
+        logger.info("DRKG: %d triples parsed, %d skipped", len(claim_rows), skipped)
+
+        if not claim_rows:
+            return BatchResult(ingested=0)
+
+        result = self._ingest_append_direct(entities, claim_rows, timestamp)
+        elapsed = time.time() - t0
+        logger.info(
+            "DRKG loaded: %d entities, %d claims in %.1fs",
+            len(entities), len(claim_rows), elapsed,
+        )
+        return result
+
+    # ── SIDER (Drug Side Effects) ─────────────────────────────────────
+
+    def download_sider(self, dest_dir: str) -> str:
+        """Download SIDER meddra_all_se.tsv.gz. Returns path to decompressed TSV."""
+        import requests
+
+        dest = os.path.join(dest_dir, "sider_meddra_all_se.tsv")
+        if os.path.exists(dest):
+            logger.info("SIDER already cached at %s", dest)
+            return dest
+
+        logger.info("Downloading SIDER (~10MB)...")
+        resp = requests.get(SIDER_URL, timeout=120)
+        resp.raise_for_status()
+
+        data = gzip.decompress(resp.content).decode("utf-8")
+        with open(dest, "w") as f:
+            f.write(data)
+        logger.info("SIDER downloaded to %s (%d lines)", dest, data.count("\n"))
+        return dest
+
+    def load_sider(self, path: str) -> BatchResult:
+        """Load SIDER drug-side effect pairs.
+
+        Format (TSV, no header): STITCH_flat, STITCH_stereo, UMLS_label,
+               MedDRA_type, UMLS_MedDRA, side_effect_name
+        STITCH flat IDs: CIDxxxxxxxxx -> subtract 100000000 for PubChem CID.
+        """
+        t0 = time.time()
+        timestamp = int(t0)
+
+        entities: dict[str, tuple[str, str, str]] = {}
+        claim_rows: list[tuple] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        skipped = 0
+
+        with open(path, "r") as f:
+            reader = csv.reader(f, delimiter="\t")
+            for row in reader:
+                if len(row) < 6:
+                    skipped += 1
+                    continue
+
+                stitch_flat = row[0].strip()
+                umls_cui = row[4].strip()
+                se_name = row[5].strip()
+
+                if not stitch_flat or not umls_cui or not se_name:
+                    skipped += 1
+                    continue
+
+                # Convert STITCH flat ID to PubChem CID
+                # STITCH flat format: CIDxxxxxxxxx (9-digit, zero-padded)
+                # Subtract 100000000 to get PubChem CID
+                stitch_num = stitch_flat.replace("CID", "").lstrip("0")
+                if not stitch_num:
+                    skipped += 1
+                    continue
+                try:
+                    cid = int(stitch_num)
+                    if cid > 100000000:
+                        cid -= 100000000
+                except ValueError:
+                    skipped += 1
+                    continue
+
+                compound_eid = f"Compound_CID:{cid}"
+                se_eid = f"SideEffect_{umls_cui}"
+
+                compound_canonical = normalize_entity_id(compound_eid)
+                se_canonical = normalize_entity_id(se_eid)
+
+                # Deduplicate compound-side_effect pairs
+                pair = (compound_canonical, se_canonical)
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+
+                if compound_canonical not in entities:
+                    entities[compound_canonical] = (
+                        "compound", compound_eid,
+                        json.dumps({"pubchem_cid": str(cid)}),
+                    )
+                if se_canonical not in entities:
+                    entities[se_canonical] = ("phenotype", se_name, "{}")
+
+                source_id = f"sider:{stitch_flat}:{umls_cui}"
+                predicate = "causes_side_effect"
+                content_id = compute_content_id(compound_canonical, predicate, se_canonical)
+                claim_id = compute_claim_id(
+                    compound_canonical, predicate, se_canonical,
+                    source_id, "database_import", timestamp,
+                )
+
+                claim_rows.append((
+                    compound_canonical, se_canonical, claim_id, content_id,
+                    predicate, "relation", 0.82,
+                    "database_import", source_id,
+                    "", "[]", "", "", "", timestamp, "active",
+                ))
+
+        logger.info(
+            "SIDER: %d drug-SE pairs parsed, %d skipped",
+            len(claim_rows), skipped,
+        )
+
+        if not claim_rows:
+            return BatchResult(ingested=0)
+
+        result = self._ingest_append_direct(entities, claim_rows, timestamp)
+        elapsed = time.time() - t0
+        logger.info(
+            "SIDER loaded: %d entities, %d claims in %.1fs",
+            len(entities), len(claim_rows), elapsed,
+        )
+        return result
+
+    # ── HPO (Human Phenotype Ontology Gene-Phenotype) ─────────────────
+
+    def download_hpo(self, dest_dir: str) -> str:
+        """Download HPO genes_to_phenotype.txt. Returns path."""
+        import requests
+
+        dest = os.path.join(dest_dir, "hpo_genes_to_phenotype.txt")
+        if os.path.exists(dest):
+            logger.info("HPO already cached at %s", dest)
+            return dest
+
+        logger.info("Downloading HPO gene-phenotype annotations...")
+        resp = requests.get(HPO_GENES_URL, timeout=120)
+        resp.raise_for_status()
+        with open(dest, "wb") as f:
+            f.write(resp.content)
+        logger.info("HPO downloaded to %s", dest)
+        return dest
+
+    def load_hpo(self, path: str) -> BatchResult:
+        """Load HPO gene-phenotype associations.
+
+        Format (TSV, header): gene_id, gene_symbol, hpo_id, hpo_name,
+                              frequency, disease_id
+        Gene→Phenotype: associated_with predicate.
+        """
+        t0 = time.time()
+        timestamp = int(t0)
+
+        entities: dict[str, tuple[str, str, str]] = {}
+        claim_rows: list[tuple] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        skipped = 0
+
+        with open(path, "r") as f:
+            for line in f:
+                if line.startswith("#"):
+                    continue
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 4:
+                    skipped += 1
+                    continue
+
+                gene_id_str = parts[0].strip()
+                gene_symbol = parts[1].strip()
+                hpo_id = parts[2].strip()
+                hpo_name = parts[3].strip()
+
+                if not gene_id_str or not hpo_id:
+                    skipped += 1
+                    continue
+
+                # Some files have "ncbi_gene_id" header as first data row
+                if not gene_id_str.replace("-", "").isdigit():
+                    continue
+
+                gene_eid = f"Gene_{gene_id_str}"
+                # Normalize HPO ID: HP:0001250 -> Phenotype_HP:0001250
+                phenotype_eid = f"Phenotype_{hpo_id}"
+
+                gene_canonical = normalize_entity_id(gene_eid)
+                phenotype_canonical = normalize_entity_id(phenotype_eid)
+
+                pair = (gene_canonical, phenotype_canonical)
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+
+                if gene_canonical not in entities:
+                    ext = json.dumps({"symbol": gene_symbol}) if gene_symbol else "{}"
+                    entities[gene_canonical] = ("gene", gene_eid, ext)
+                if phenotype_canonical not in entities:
+                    entities[phenotype_canonical] = ("phenotype", hpo_name or phenotype_eid, "{}")
+
+                source_id = f"hpo:{gene_id_str}:{hpo_id}"
+                predicate = "associated_with"
+                content_id = compute_content_id(gene_canonical, predicate, phenotype_canonical)
+                claim_id = compute_claim_id(
+                    gene_canonical, predicate, phenotype_canonical,
+                    source_id, "database_import", timestamp,
+                )
+
+                claim_rows.append((
+                    gene_canonical, phenotype_canonical, claim_id, content_id,
+                    predicate, "relation", 0.85,
+                    "database_import", source_id,
+                    "", "[]", "", "", "", timestamp, "active",
+                ))
+
+        logger.info("HPO: %d gene-phenotype pairs, %d skipped", len(claim_rows), skipped)
+
+        if not claim_rows:
+            return BatchResult(ingested=0)
+
+        result = self._ingest_append_direct(entities, claim_rows, timestamp)
+        elapsed = time.time() - t0
+        logger.info(
+            "HPO loaded: %d entities, %d claims in %.1fs",
+            len(entities), len(claim_rows), elapsed,
+        )
+        return result
+
+    # ── IntAct (Molecular Interactions) ───────────────────────────────
+
+    def download_intact(self, dest_dir: str) -> str:
+        """Download IntAct MITAB from EBI FTP. Returns path to extracted TSV."""
+        import requests
+        import zipfile
+
+        dest = os.path.join(dest_dir, "intact.txt")
+        if os.path.exists(dest):
+            logger.info("IntAct already cached at %s", dest)
+            return dest
+
+        zip_path = os.path.join(dest_dir, "intact.zip")
+        if not os.path.exists(zip_path):
+            logger.info("Downloading IntAct (~150MB)...")
+            resp = requests.get(INTACT_URL, timeout=600, stream=True)
+            resp.raise_for_status()
+            with open(zip_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+        logger.info("Extracting IntAct...")
+        with zipfile.ZipFile(zip_path) as zf:
+            # Find the main MITAB file (usually intact.txt or similar)
+            for name in zf.namelist():
+                if name.endswith(".txt") and "negative" not in name.lower():
+                    with open(dest, "wb") as f:
+                        f.write(zf.read(name))
+                    break
+        logger.info("IntAct extracted to %s", dest)
+        return dest
+
+    def load_intact(self, path: str, mapper: GeneIDMapper | None = None) -> BatchResult:
+        """Load IntAct molecular interactions (MITAB 2.7 format).
+
+        Col 0: ID interactor A (e.g., uniprotkb:P12345)
+        Col 1: ID interactor B
+        Col 14: Confidence (e.g., intact-miscore:0.75)
+
+        Maps UniProt IDs to Entrez gene IDs via mapper. Falls back to
+        using UniProt accessions directly if mapper unavailable.
+        """
+        t0 = time.time()
+        timestamp = int(t0)
+
+        entities: dict[str, tuple[str, str, str]] = {}
+        claim_rows: list[tuple] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        skipped = 0
+
+        def _extract_uniprot(col: str) -> str | None:
+            """Extract UniProt accession from MITAB ID column."""
+            for entry in col.split("|"):
+                entry = entry.strip()
+                if entry.startswith("uniprotkb:"):
+                    acc = entry.split(":", 1)[1].split("-")[0]  # strip isoform
+                    if acc and len(acc) >= 6:
+                        return acc
+            return None
+
+        def _extract_confidence(col: str) -> float:
+            """Extract intact-miscore from confidence column."""
+            for entry in col.split("|"):
+                entry = entry.strip()
+                if entry.startswith("intact-miscore:"):
+                    try:
+                        return float(entry.split(":", 1)[1])
+                    except ValueError:
+                        pass
+            return 0.70  # default
+
+        with open(path, "r") as f:
+            for line in f:
+                if line.startswith("#"):
+                    continue
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 2:
+                    skipped += 1
+                    continue
+
+                uniprot_a = _extract_uniprot(parts[0])
+                uniprot_b = _extract_uniprot(parts[1])
+                if uniprot_a is None or uniprot_b is None:
+                    skipped += 1
+                    continue
+
+                # Skip self-interactions
+                if uniprot_a == uniprot_b:
+                    skipped += 1
+                    continue
+
+                # Map to gene entity IDs
+                if mapper is not None:
+                    gene_a = mapper.uniprot_to_gene_entity_id(uniprot_a)
+                    gene_b = mapper.uniprot_to_gene_entity_id(uniprot_b)
+                else:
+                    gene_a = f"Protein_{uniprot_a}"
+                    gene_b = f"Protein_{uniprot_b}"
+
+                if gene_a is None or gene_b is None:
+                    skipped += 1
+                    continue
+
+                gene_a_canonical = normalize_entity_id(gene_a)
+                gene_b_canonical = normalize_entity_id(gene_b)
+
+                if gene_a_canonical == gene_b_canonical:
+                    skipped += 1
+                    continue
+
+                # Deduplicate (A,B) and (B,A)
+                pair = (min(gene_a_canonical, gene_b_canonical),
+                        max(gene_a_canonical, gene_b_canonical))
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+
+                confidence = _extract_confidence(parts[14]) if len(parts) > 14 else 0.70
+
+                etype = "gene" if mapper is not None else "protein"
+                if gene_a_canonical not in entities:
+                    ext_a = json.dumps({"uniprot": uniprot_a})
+                    entities[gene_a_canonical] = (etype, gene_a, ext_a)
+                if gene_b_canonical not in entities:
+                    ext_b = json.dumps({"uniprot": uniprot_b})
+                    entities[gene_b_canonical] = (etype, gene_b, ext_b)
+
+                source_id = f"intact:{uniprot_a}:{uniprot_b}"
+                predicate = "interacts"
+                content_id = compute_content_id(gene_a_canonical, predicate, gene_b_canonical)
+                claim_id = compute_claim_id(
+                    gene_a_canonical, predicate, gene_b_canonical,
+                    source_id, "experimental", timestamp,
+                )
+
+                claim_rows.append((
+                    gene_a_canonical, gene_b_canonical, claim_id, content_id,
+                    predicate, "relation", confidence,
+                    "experimental", source_id,
+                    "", "[]", "", "", "", timestamp, "active",
+                ))
+
+        logger.info("IntAct: %d interactions parsed, %d skipped", len(claim_rows), skipped)
+
+        if not claim_rows:
+            return BatchResult(ingested=0)
+
+        result = self._ingest_append_direct(entities, claim_rows, timestamp)
+        elapsed = time.time() - t0
+        logger.info(
+            "IntAct loaded: %d entities, %d claims in %.1fs",
+            len(entities), len(claim_rows), elapsed,
+        )
+        return result
+
+    # ── PharmGKB (Pharmacogenomics Relationships) ─────────────────────
+
+    def download_pharmgkb(self, dest_dir: str) -> str:
+        """Download PharmGKB relationships zip. Returns path to extracted TSV."""
+        import requests
+        import zipfile
+
+        dest = os.path.join(dest_dir, "pharmgkb_relationships.tsv")
+        if os.path.exists(dest):
+            logger.info("PharmGKB already cached at %s", dest)
+            return dest
+
+        zip_path = os.path.join(dest_dir, "pharmgkb_relationships.zip")
+        if not os.path.exists(zip_path):
+            logger.info("Downloading PharmGKB relationships...")
+            resp = requests.get(PHARMGKB_URL, timeout=120)
+            resp.raise_for_status()
+            with open(zip_path, "wb") as f:
+                f.write(resp.content)
+
+        logger.info("Extracting PharmGKB...")
+        with zipfile.ZipFile(zip_path) as zf:
+            for name in zf.namelist():
+                if name.endswith(".tsv") or name.endswith("relationships.tsv"):
+                    with open(dest, "wb") as f:
+                        f.write(zf.read(name))
+                    break
+        logger.info("PharmGKB extracted to %s", dest)
+        return dest
+
+    def load_pharmgkb(self, path: str, mapper: GeneIDMapper | None = None) -> BatchResult:
+        """Load PharmGKB pharmacogenomics relationships.
+
+        TSV columns: Entity1_id, Entity1_name, Entity1_type,
+                     Entity2_id, Entity2_name, Entity2_type,
+                     Evidence, Association, PK, PD
+        """
+        t0 = time.time()
+        timestamp = int(t0)
+
+        entities: dict[str, tuple[str, str, str]] = {}
+        claim_rows: list[tuple] = []
+        skipped = 0
+
+        def _resolve_entity(eid: str, name: str, etype: str) -> tuple[str, str, str] | None:
+            """Resolve PharmGKB entity to Attest entity ID."""
+            etype_lower = etype.lower()
+            if etype_lower == "gene":
+                if mapper is not None and name:
+                    gene_eid = mapper.symbol_to_gene_entity_id(name)
+                    if gene_eid:
+                        return gene_eid, "gene", name
+                return f"Gene_PharmGKB:{eid}", "gene", name or eid
+            elif etype_lower in ("drug", "chemical"):
+                return f"Compound_PharmGKB:{eid}", "compound", name or eid
+            elif etype_lower == "disease":
+                return f"Disease_PharmGKB:{eid}", "disease", name or eid
+            elif etype_lower == "phenotype":
+                return f"Phenotype_PharmGKB:{eid}", "phenotype", name or eid
+            elif etype_lower == "variant" or etype_lower == "haplotype":
+                return f"Variant_PharmGKB:{eid}", "gene", name or eid
+            return None
+
+        with open(path, "r") as f:
+            reader = csv.reader(f, delimiter="\t")
+            header = next(reader, None)
+            if header is None:
+                return BatchResult(ingested=0)
+
+            for row in reader:
+                if len(row) < 7:
+                    skipped += 1
+                    continue
+
+                e1_id = row[0].strip()
+                e1_name = row[1].strip()
+                e1_type = row[2].strip()
+                e2_id = row[3].strip()
+                e2_name = row[4].strip()
+                e2_type = row[5].strip()
+                evidence = row[6].strip()
+                association = row[7].strip() if len(row) > 7 else ""
+
+                if not e1_id or not e2_id:
+                    skipped += 1
+                    continue
+
+                e1 = _resolve_entity(e1_id, e1_name, e1_type)
+                e2 = _resolve_entity(e2_id, e2_name, e2_type)
+                if e1 is None or e2 is None:
+                    skipped += 1
+                    continue
+
+                e1_eid, e1_atype, e1_display = e1
+                e2_eid, e2_atype, e2_display = e2
+
+                e1_canonical = normalize_entity_id(e1_eid)
+                e2_canonical = normalize_entity_id(e2_eid)
+
+                if e1_canonical == e2_canonical:
+                    skipped += 1
+                    continue
+
+                # Determine predicate based on entity types
+                e1_lower = e1_type.lower()
+                e2_lower = e2_type.lower()
+                if (e1_lower in ("drug", "chemical") and e2_lower == "disease") or \
+                   (e2_lower in ("drug", "chemical") and e1_lower == "disease"):
+                    predicate = "treats"
+                else:
+                    predicate = "associated_with"
+
+                # Map evidence to confidence
+                confidence = PHARMGKB_EVIDENCE_CONFIDENCE.get(evidence, 0.75)
+
+                if e1_canonical not in entities:
+                    entities[e1_canonical] = (e1_atype, e1_display, "{}")
+                if e2_canonical not in entities:
+                    entities[e2_canonical] = (e2_atype, e2_display, "{}")
+
+                source_id = f"pharmgkb:{e1_id}:{e2_id}"
+                content_id = compute_content_id(e1_canonical, predicate, e2_canonical)
+                claim_id = compute_claim_id(
+                    e1_canonical, predicate, e2_canonical,
+                    source_id, "database_import", timestamp,
+                )
+
+                claim_rows.append((
+                    e1_canonical, e2_canonical, claim_id, content_id,
+                    predicate, "relation", confidence,
+                    "database_import", source_id,
+                    "", "[]", "", "", "", timestamp, "active",
+                ))
+
+        logger.info("PharmGKB: %d relationships parsed, %d skipped", len(claim_rows), skipped)
+
+        if not claim_rows:
+            return BatchResult(ingested=0)
+
+        result = self._ingest_append_direct(entities, claim_rows, timestamp)
+        elapsed = time.time() - t0
+        logger.info(
+            "PharmGKB loaded: %d entities, %d claims in %.1fs",
+            len(entities), len(claim_rows), elapsed,
+        )
+        return result
+
+    # ── Mondo Disease Ontology (Cross-references) ─────────────────────
+
+    def download_mondo(self, dest_dir: str) -> str:
+        """Download Mondo SSSOM TSV. Returns path."""
+        import requests
+
+        dest = os.path.join(dest_dir, "mondo.sssom.tsv")
+        if os.path.exists(dest):
+            logger.info("Mondo already cached at %s", dest)
+            return dest
+
+        logger.info("Downloading Mondo disease ontology mappings...")
+        resp = requests.get(MONDO_SSSOM_URL, timeout=120)
+        resp.raise_for_status()
+        with open(dest, "wb") as f:
+            f.write(resp.content)
+        logger.info("Mondo downloaded to %s", dest)
+        return dest
+
+    def load_mondo(self, path: str) -> BatchResult:
+        """Load Mondo disease cross-reference mappings (SSSOM format).
+
+        Format (TSV): subject_id, subject_label, predicate_id,
+                      object_id, object_label, mapping_justification, ...
+        Maps disease IDs across ontologies (MONDO, DOID, MESH, OMIM, etc.).
+        """
+        t0 = time.time()
+        timestamp = int(t0)
+
+        entities: dict[str, tuple[str, str, str]] = {}
+        claim_rows: list[tuple] = []
+        skipped = 0
+
+        def _mondo_entity(raw_id: str, label: str) -> tuple[str, str] | None:
+            """Convert ontology ID to Attest disease entity ID."""
+            raw_id = raw_id.strip()
+            if not raw_id:
+                return None
+            # Normalize prefix format: MONDO:0005148, DOID:9352, MESH:D003920
+            # Some have full URI — extract just the CURIE
+            if "/" in raw_id:
+                raw_id = raw_id.rsplit("/", 1)[-1]
+            # Replace underscore with colon if needed (OBO format: MONDO_0005148)
+            raw_id = raw_id.replace("_", ":", 1)
+            prefix = raw_id.split(":")[0].upper() if ":" in raw_id else ""
+            if prefix in ("MONDO", "DOID", "MESH", "OMIM", "ORPHANET",
+                          "HP", "NCIT", "ICD10CM", "ICD9", "SCTID",
+                          "UMLS", "EFO", "COHD", "MEDDRA", "GARD"):
+                return f"Disease_{raw_id}", label or raw_id
+            return None
+
+        with open(path, "r") as f:
+            for line in f:
+                if line.startswith("#"):
+                    continue
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 4:
+                    # Check if this is the header
+                    if "subject_id" in line:
+                        continue
+                    skipped += 1
+                    continue
+
+                subject_id = parts[0].strip()
+                subject_label = parts[1].strip() if len(parts) > 1 else ""
+                predicate_id = parts[2].strip() if len(parts) > 2 else ""
+                object_id = parts[3].strip()
+                object_label = parts[4].strip() if len(parts) > 4 else ""
+
+                # Only process exact/close mappings
+                if predicate_id and "exact" not in predicate_id.lower() and \
+                   "close" not in predicate_id.lower() and \
+                   "equivalent" not in predicate_id.lower():
+                    skipped += 1
+                    continue
+
+                subj = _mondo_entity(subject_id, subject_label)
+                obj = _mondo_entity(object_id, object_label)
+                if subj is None or obj is None:
+                    skipped += 1
+                    continue
+
+                subj_eid, subj_display = subj
+                obj_eid, obj_display = obj
+
+                subj_canonical = normalize_entity_id(subj_eid)
+                obj_canonical = normalize_entity_id(obj_eid)
+
+                if subj_canonical == obj_canonical:
+                    skipped += 1
+                    continue
+
+                if subj_canonical not in entities:
+                    entities[subj_canonical] = ("disease", subj_display, "{}")
+                if obj_canonical not in entities:
+                    entities[obj_canonical] = ("disease", obj_display, "{}")
+
+                source_id = f"mondo:{subject_id}:{object_id}"
+                predicate = "equivalent_to"
+                content_id = compute_content_id(subj_canonical, predicate, obj_canonical)
+                claim_id = compute_claim_id(
+                    subj_canonical, predicate, obj_canonical,
+                    source_id, "database_import", timestamp,
+                )
+
+                claim_rows.append((
+                    subj_canonical, obj_canonical, claim_id, content_id,
+                    predicate, "relation", 0.95,
+                    "database_import", source_id,
+                    "", "[]", "", "", "", timestamp, "active",
+                ))
+
+        logger.info("Mondo: %d cross-references parsed, %d skipped", len(claim_rows), skipped)
+
+        if not claim_rows:
+            return BatchResult(ingested=0)
+
+        result = self._ingest_append_direct(entities, claim_rows, timestamp)
+        elapsed = time.time() - t0
+        logger.info(
+            "Mondo loaded: %d entities, %d claims in %.1fs",
+            len(entities), len(claim_rows), elapsed,
+        )
+        return result
+
+    # ── STITCH (Chemical-Protein Interactions) ────────────────────────
+
+    def download_stitch(self, dest_dir: str) -> str:
+        """Download STITCH human chemical-protein links. Returns path to decompressed TSV."""
+        import requests
+
+        dest = os.path.join(dest_dir, "stitch_chemical_protein.tsv")
+        if os.path.exists(dest):
+            logger.info("STITCH already cached at %s", dest)
+            return dest
+
+        logger.info("Downloading STITCH chemical-protein links (~500MB)...")
+        resp = requests.get(STITCH_URL, timeout=600, stream=True)
+        resp.raise_for_status()
+
+        gz_path = os.path.join(dest_dir, "stitch_chemical_protein.tsv.gz")
+        with open(gz_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                f.write(chunk)
+
+        # Decompress
+        with gzip.open(gz_path, "rt") as gz_f, open(dest, "w") as out_f:
+            for line in gz_f:
+                out_f.write(line)
+
+        logger.info("STITCH extracted to %s", dest)
+        return dest
+
+    def load_stitch(
+        self, path: str, min_score: int = 700,
+    ) -> BatchResult:
+        """Load STITCH chemical-protein interactions.
+
+        Format (space/tab-separated, header): chemical protein combined_score
+        Chemical IDs: CIDsXXXXXXXXX (stereo) or CIDmXXXXXXXXX (flat).
+        Protein IDs: 9606.ENSPXXX (same as STRING).
+        Maps chemicals to PubChem CID, proteins to Gene via ENSP.
+        """
+        t0 = time.time()
+        timestamp = int(t0)
+
+        entities: dict[str, tuple[str, str, str]] = {}
+        claim_rows: list[tuple] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        skipped = 0
+
+        with open(path, "r") as f:
+            f.readline()  # Skip header
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) < 3:
+                    continue
+                chem_raw, protein_raw = parts[0], parts[1]
+                try:
+                    score = int(parts[2])
+                except ValueError:
+                    continue
+
+                if score < min_score:
+                    skipped += 1
+                    continue
+
+                # Parse chemical: CIDsXXXXXXXXX or CIDmXXXXXXXXX
+                # Strip "CIDs" or "CIDm" prefix, convert to PubChem CID
+                cid_str = chem_raw
+                if cid_str.startswith("CIDs") or cid_str.startswith("CIDm"):
+                    cid_str = cid_str[4:]
+                elif cid_str.startswith("CID"):
+                    cid_str = cid_str[3:]
+                cid_str = cid_str.lstrip("0")
+                if not cid_str:
+                    skipped += 1
+                    continue
+
+                try:
+                    cid = int(cid_str)
+                    if cid > 100000000:
+                        cid -= 100000000
+                except ValueError:
+                    skipped += 1
+                    continue
+
+                compound_eid = f"Compound_CID:{cid}"
+                compound_canonical = normalize_entity_id(compound_eid)
+
+                # Parse protein: strip "9606." prefix for ENSP lookup
+                protein_id = protein_raw
+                if protein_id.startswith("9606."):
+                    protein_id = protein_id[5:]
+                # Use Gene entity directly (ENSP → Gene via existing naming)
+                gene_eid = f"Gene_{protein_id}"
+                gene_canonical = normalize_entity_id(gene_eid)
+
+                if compound_canonical == gene_canonical:
+                    skipped += 1
+                    continue
+
+                pair = (compound_canonical, gene_canonical)
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+
+                if compound_canonical not in entities:
+                    entities[compound_canonical] = (
+                        "compound", compound_eid,
+                        json.dumps({"pubchem_cid": str(cid)}),
+                    )
+                if gene_canonical not in entities:
+                    entities[gene_canonical] = ("gene", gene_eid, "{}")
+
+                predicate = "interacts"
+                source_id = f"stitch:{chem_raw}:{protein_raw}"
+                content_id = compute_content_id(compound_canonical, predicate, gene_canonical)
+                claim_id = compute_claim_id(
+                    compound_canonical, predicate, gene_canonical,
+                    source_id, "database_import", timestamp,
+                )
+
+                claim_rows.append((
+                    compound_canonical, gene_canonical, claim_id, content_id,
+                    predicate, "relation", 0.80,
+                    "database_import", source_id,
+                    "", "[]", "", "", "", timestamp, "active",
+                ))
+
+        logger.info("STITCH: %d interactions parsed, %d skipped", len(claim_rows), skipped)
+
+        if not claim_rows:
+            return BatchResult(ingested=0)
+
+        result = self._ingest_append_direct(entities, claim_rows, timestamp)
+        elapsed = time.time() - t0
+        logger.info(
+            "STITCH loaded: %d entities, %d claims in %.1fs",
+            len(entities), len(claim_rows), elapsed,
+        )
+        return result
+
+    # ── CTD Chemical-Disease Associations ─────────────────────────────
+
+    def download_ctd_chem_disease(self, dest_dir: str) -> str | None:
+        """Download CTD chemical-disease associations. Returns path or None."""
+        import requests
+
+        dest = os.path.join(dest_dir, "CTD_chemicals_diseases.tsv.gz")
+        if os.path.exists(dest):
+            logger.info("CTD chem-disease already cached at %s", dest)
+            return dest
+
+        logger.info("Downloading CTD chemical-disease associations...")
+        try:
+            resp = requests.get(CTD_CHEM_DISEASE_URL, timeout=300, stream=True)
+            resp.raise_for_status()
+            with open(dest, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            size_mb = os.path.getsize(dest) / (1024 * 1024)
+            logger.info("CTD chem-disease downloaded: %.1f MB", size_mb)
+            return dest
+        except Exception as e:
+            logger.warning("CTD chem-disease download failed: %s", e)
+            return None
+
+    def load_ctd_chem_disease(self, path: str, direct_only: bool = True) -> BatchResult:
+        """Load CTD chemical-disease associations.
+
+        File format (tab-delimited, # comment headers):
+            ChemicalName, ChemicalID(MESH), CasRN, DiseaseName, DiseaseID,
+            DirectEvidence, InferenceGeneSymbol, InferenceScore, OmimIDs, PubMedIDs
+
+        DirectEvidence values: 'therapeutic', 'marker/mechanism', or empty (inferred).
+        """
+        t0 = time.time()
+        timestamp = int(t0)
+
+        entities: dict[str, tuple[str, str, str]] = {}
+        claim_rows: list[tuple] = []
+        skipped = 0
+
+        with gzip.open(path, "rt") as f:
+            for line in f:
+                if line.startswith("#"):
+                    continue
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 6:
+                    continue
+
+                chem_name = parts[0].strip()
+                chem_mesh = parts[1].strip()
+                disease_name = parts[3].strip()
+                disease_id = parts[4].strip()  # e.g., "MESH:D003920" or "OMIM:222100"
+                direct_evidence = parts[5].strip() if len(parts) > 5 else ""
+
+                if direct_only and not direct_evidence:
+                    skipped += 1
+                    continue
+
+                if not chem_mesh or not disease_id:
+                    skipped += 1
+                    continue
+
+                chem_canonical = normalize_entity_id(f"Compound_{chem_mesh}")
+                disease_canonical = normalize_entity_id(f"Disease_{disease_id}")
+
+                # Determine predicate
+                predicate = "associated_with"
+                if direct_evidence:
+                    ev_lower = direct_evidence.lower()
+                    if "therapeutic" in ev_lower:
+                        predicate = "treats"
+                    elif "marker" in ev_lower:
+                        predicate = "associated_with"
+
+                if chem_canonical not in entities:
+                    entities[chem_canonical] = (
+                        "compound", chem_name or f"Compound_{chem_mesh}",
+                        json.dumps({"mesh": chem_mesh}) if chem_mesh else "{}",
+                    )
+                if disease_canonical not in entities:
+                    ext_ids = {}
+                    if disease_id.startswith("MESH:"):
+                        ext_ids["mesh"] = disease_id.split(":", 1)[1]
+                    elif disease_id.startswith("OMIM:"):
+                        ext_ids["omim"] = disease_id.split(":", 1)[1]
+                    entities[disease_canonical] = (
+                        "disease", disease_name or disease_id,
+                        json.dumps(ext_ids) if ext_ids else "{}",
+                    )
+
+                source_id = f"ctd:cd:{chem_mesh}:{disease_id}"
+                content_id = compute_content_id(chem_canonical, predicate, disease_canonical)
+                claim_id = compute_claim_id(
+                    chem_canonical, predicate, disease_canonical,
+                    source_id, "database_import", timestamp,
+                )
+
+                claim_rows.append((
+                    chem_canonical, disease_canonical, claim_id, content_id,
+                    predicate, "relation", 0.85,
+                    "database_import", source_id,
+                    "", "[]", "", "", "", timestamp, "active",
+                ))
+
+        logger.info("CTD chem-disease: %d associations parsed, %d skipped", len(claim_rows), skipped)
+
+        if not claim_rows:
+            return BatchResult(ingested=0)
+
+        result = self._ingest_append_direct(entities, claim_rows, timestamp)
+        elapsed = time.time() - t0
+        logger.info(
+            "CTD chem-disease loaded: %d entities, %d claims in %.1fs",
+            len(entities), len(claim_rows), elapsed,
+        )
+        return result
+
+    # ── TISSUES (Jensen Lab Gene-Tissue Associations) ─────────────────
+
+    def download_tissues(self, dest_dir: str) -> str:
+        """Download TISSUES knowledge TSV (Jensen Lab). Returns path."""
+        import requests
+
+        dest = os.path.join(dest_dir, "human_tissue_knowledge_full.tsv")
+        if os.path.exists(dest):
+            logger.info("TISSUES already cached at %s", dest)
+            return dest
+
+        logger.info("Downloading TISSUES from %s", TISSUES_URL)
+        resp = requests.get(TISSUES_URL, timeout=120)
+        resp.raise_for_status()
+        with open(dest, "w") as f:
+            f.write(resp.text)
+        logger.info("Downloaded TISSUES to %s (%d lines)", dest, resp.text.count("\n"))
+        return dest
+
+    def load_tissues(self, path: str, mapper: GeneIDMapper) -> BatchResult:
+        """Load TISSUES gene-tissue associations (Jensen Lab).
+
+        Same format as DISEASES: ENSP  symbol  BTO  tissue_name  source_db  curation  score
+        Maps ENSP -> Gene_{entrez} via mapper.
+        """
+        t0 = time.time()
+        timestamp = int(t0)
+
+        entities: dict[str, tuple[str, str, str]] = {}
+        claim_rows: list[tuple] = []
+        mapped = 0
+        unmapped = 0
+
+        with open(path, "r") as f:
+            reader = csv.reader(f, delimiter="\t")
+            for row in reader:
+                if len(row) < 7:
+                    continue
+                ensp = row[0].strip()
+                symbol = row[1].strip()
+                tissue_id = row[2].strip()   # BTO ID
+                tissue_name = row[3].strip()
+
+                if not tissue_id or not ensp:
+                    continue
+
+                # Map ENSP -> Gene entity ID
+                gene_id = mapper.ensp_to_gene_entity_id(ensp)
+                if gene_id is None and symbol:
+                    gene_id = mapper.symbol_to_gene_entity_id(symbol)
+                if gene_id is None:
+                    unmapped += 1
+                    continue
+                mapped += 1
+
+                tissue_entity = f"Tissue_{tissue_id}"
+                gene_canonical = normalize_entity_id(gene_id)
+                tissue_canonical = normalize_entity_id(tissue_entity)
+
+                if gene_canonical not in entities:
+                    gene_ext = _extract_external_ids(gene_id, "gene")
+                    if symbol:
+                        gene_ext["symbol"] = symbol
+                    entities[gene_canonical] = ("gene", gene_id, json.dumps(gene_ext) if gene_ext else "{}")
+                if tissue_canonical not in entities:
+                    entities[tissue_canonical] = ("entity", tissue_name or tissue_entity, "{}")
+
+                predicate = "expressed_in"
+                source_id = "tissues_knowledge"
+                source_type = "database_import"
+
+                content_id = compute_content_id(gene_canonical, predicate, tissue_canonical)
+                claim_id = compute_claim_id(
+                    gene_canonical, predicate, tissue_canonical,
+                    source_id, source_type, timestamp,
+                )
+
+                claim_rows.append((
+                    gene_canonical, tissue_canonical, claim_id, content_id,
+                    predicate, "relates_to", tier1_confidence(source_type),
+                    source_type, source_id,
+                    "", "[]", "", "", "", timestamp, "active",
+                ))
+
+        logger.info("TISSUES: %d mapped, %d unmapped genes", mapped, unmapped)
+
+        if not claim_rows:
+            return BatchResult(ingested=0)
+
+        result = self._ingest_append_direct(entities, claim_rows, timestamp)
+        elapsed = time.time() - t0
+        logger.info(
+            "TISSUES loaded: %d entities, %d claims in %.1fs",
+            len(entities), len(claim_rows), elapsed,
+        )
+        return result
+
+    # ── Open Targets (Target-Disease Associations) ────────────────────
+
+    def download_open_targets(self, dest_dir: str) -> str:
+        """Download Open Targets overall direct associations (Parquet). Returns path to dir."""
+        import requests
+
+        dest = os.path.join(dest_dir, "open_targets_associations")
+        if os.path.exists(dest) and os.listdir(dest):
+            logger.info("Open Targets already cached at %s", dest)
+            return dest
+
+        os.makedirs(dest, exist_ok=True)
+
+        # List the Parquet parts from the FTP directory
+        logger.info("Downloading Open Targets associations (Parquet)...")
+        try:
+            resp = requests.get(OPEN_TARGETS_ASSOC_URL, timeout=60)
+            resp.raise_for_status()
+            # Parse filenames from directory listing (HTML)
+            import re
+            parquet_files = re.findall(r'href="(part-[^"]+\.parquet)"', resp.text)
+            if not parquet_files:
+                # Try a simpler pattern
+                parquet_files = re.findall(r'(part-\S+\.parquet)', resp.text)
+            if not parquet_files:
+                logger.warning("No Parquet files found at %s", OPEN_TARGETS_ASSOC_URL)
+                return dest
+
+            for pf in parquet_files:
+                pf_path = os.path.join(dest, pf)
+                if os.path.exists(pf_path):
+                    continue
+                url = OPEN_TARGETS_ASSOC_URL + pf
+                pf_resp = requests.get(url, timeout=120)
+                pf_resp.raise_for_status()
+                with open(pf_path, "wb") as f:
+                    f.write(pf_resp.content)
+            logger.info("Downloaded %d Open Targets Parquet files to %s", len(parquet_files), dest)
+        except Exception as e:
+            logger.warning("Open Targets download failed: %s", e)
+
+        return dest
+
+    def load_open_targets(self, path: str, mapper: GeneIDMapper | None = None) -> BatchResult:
+        """Load Open Targets overall direct associations from Parquet files.
+
+        Each row: targetId (Ensembl ENSG), diseaseId (EFO/Mondo), score, evidenceCount.
+        Maps Ensembl gene IDs to our Gene_{entrez} entities when mapper available.
+        """
+        try:
+            import pyarrow.parquet as pq
+        except ImportError:
+            logger.warning("Open Targets requires pyarrow: pip install pyarrow")
+            return BatchResult(ingested=0)
+
+        t0 = time.time()
+        timestamp = int(t0)
+
+        entities: dict[str, tuple[str, str, str]] = {}
+        claim_rows: list[tuple] = []
+        skipped = 0
+
+        # Read all Parquet files in the directory
+        parquet_files = sorted(
+            os.path.join(path, f) for f in os.listdir(path)
+            if f.endswith(".parquet")
+        )
+        if not parquet_files:
+            logger.warning("No Parquet files found in %s", path)
+            return BatchResult(ingested=0)
+
+        for pf in parquet_files:
+            table = pq.read_table(pf, columns=["targetId", "diseaseId", "score"])
+            for i in range(len(table)):
+                target_id = str(table.column("targetId")[i])  # ENSG00000157764
+                disease_id = str(table.column("diseaseId")[i])  # EFO_0000565
+                score = float(table.column("score")[i])
+
+                if not target_id or not disease_id:
+                    skipped += 1
+                    continue
+
+                # Map Ensembl gene ID to our entity format
+                # Try mapper first (Ensembl → Entrez), fall back to raw ENSG ID
+                gene_eid = None
+                if mapper is not None:
+                    gene_eid = mapper.ensp_to_gene_entity_id(target_id)
+                if gene_eid is None:
+                    gene_eid = f"Gene_{target_id}"
+
+                # Normalize disease ID: EFO_0000565 → Disease_EFO:0000565
+                disease_eid = f"Disease_{disease_id.replace('_', ':', 1)}"
+
+                gene_canonical = normalize_entity_id(gene_eid)
+                disease_canonical = normalize_entity_id(disease_eid)
+
+                if gene_canonical == disease_canonical:
+                    skipped += 1
+                    continue
+
+                if gene_canonical not in entities:
+                    entities[gene_canonical] = ("gene", gene_eid, "{}")
+                if disease_canonical not in entities:
+                    entities[disease_canonical] = ("disease", disease_eid, "{}")
+
+                # Map OT score to confidence (OT scores are already 0-1)
+                confidence = max(0.50, min(0.95, score))
+
+                predicate = "associated_with"
+                source_id = f"opentargets:{target_id}:{disease_id}"
+                content_id = compute_content_id(gene_canonical, predicate, disease_canonical)
+                claim_id = compute_claim_id(
+                    gene_canonical, predicate, disease_canonical,
+                    source_id, "database_import", timestamp,
+                )
+
+                claim_rows.append((
+                    gene_canonical, disease_canonical, claim_id, content_id,
+                    predicate, "relation", confidence,
+                    "database_import", source_id,
+                    "", "[]", "", "", "", timestamp, "active",
+                ))
+
+        logger.info("Open Targets: %d associations parsed, %d skipped", len(claim_rows), skipped)
+
+        if not claim_rows:
+            return BatchResult(ingested=0)
+
+        result = self._ingest_append_direct(entities, claim_rows, timestamp)
+        elapsed = time.time() - t0
+        logger.info(
+            "Open Targets loaded: %d entities, %d claims in %.1fs",
+            len(entities), len(claim_rows), elapsed,
+        )
+        return result
+
+    # ── SemMedDB (Literature-Mined Predications) ──────────────────────
+
+    def download_semmeddb(self, dest_dir: str) -> str | None:
+        """Download SemMedDB PREDICATION CSV (requires UTS account or manual download).
+
+        Returns path to the gzipped CSV, or None if not available.
+        Users must download manually from:
+        https://lhncbc.nlm.nih.gov/temp/SemRep_SemMedDB_SKR/SemMedDB_download.html
+        and place the file in dest_dir as semmed_predications.csv.gz
+        """
+        dest = os.path.join(dest_dir, "semmed_predications.csv.gz")
+        if os.path.exists(dest):
+            logger.info("SemMedDB already cached at %s", dest)
+            return dest
+
+        # Try downloading directly (may require UTS authentication)
+        import requests
+        logger.info("Attempting SemMedDB download (~3GB)...")
+        try:
+            resp = requests.get(SEMMEDDB_PREDICATIONS_URL, timeout=600, stream=True)
+            resp.raise_for_status()
+            with open(dest, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            size_mb = os.path.getsize(dest) / (1024 * 1024)
+            logger.info("SemMedDB downloaded: %.1f MB", size_mb)
+            return dest
+        except Exception as e:
+            logger.warning(
+                "SemMedDB download failed: %s. "
+                "Download manually from https://lhncbc.nlm.nih.gov/temp/SemRep_SemMedDB_SKR/SemMedDB_download.html "
+                "and place as %s",
+                e, dest,
+            )
+            return None
+
+    def load_semmeddb(self, path: str) -> BatchResult:
+        """Load SemMedDB predications from CSV.
+
+        PREDICATION CSV columns (pipe-delimited or comma-delimited):
+            PREDICATION_ID, SENTENCE_ID, PMID, PREDICATE,
+            SUBJECT_CUI, SUBJECT_NAME, SUBJECT_SEMTYPE, SUBJECT_NOVELTY,
+            OBJECT_CUI, OBJECT_NAME, OBJECT_SEMTYPE, OBJECT_NOVELTY
+
+        130M+ predications, UMLS CUIs, 30 predicate types.
+        Filters: skip NEG_ prefixed predicates, skip non-biomedical semantic types.
+        """
+        t0 = time.time()
+        timestamp = int(t0)
+
+        entities: dict[str, tuple[str, str, str]] = {}
+        claim_rows: list[tuple] = []
+        skipped = 0
+        processed = 0
+
+        # Determine if gzipped
+        open_fn = gzip.open if path.endswith(".gz") else open
+
+        with open_fn(path, "rt", errors="replace") as f:
+            for line in f:
+                parts = line.rstrip("\n").split(",")
+                # SemMedDB CSV has 12+ columns
+                if len(parts) < 12:
+                    # Try pipe delimiter
+                    parts = line.rstrip("\n").split("|")
+                if len(parts) < 12:
+                    skipped += 1
+                    continue
+
+                predicate_raw = parts[3].strip()
+                subject_cui = parts[4].strip()
+                subject_name = parts[5].strip()
+                subject_semtype = parts[6].strip()
+                object_cui = parts[8].strip()
+                object_name = parts[9].strip()
+                object_semtype = parts[10].strip()
+                pmid = parts[2].strip()
+
+                # Skip negated predicates
+                if predicate_raw.startswith("NEG_"):
+                    skipped += 1
+                    continue
+
+                # Skip non-biomedical semantic types
+                subj_type = SEMMEDDB_SEMTYPE_MAP.get(subject_semtype)
+                obj_type = SEMMEDDB_SEMTYPE_MAP.get(object_semtype)
+                if subj_type is None or obj_type is None:
+                    skipped += 1
+                    continue
+
+                if not subject_cui or not object_cui:
+                    skipped += 1
+                    continue
+                if subject_cui == object_cui:
+                    skipped += 1
+                    continue
+
+                # Map predicate
+                predicate = SEMMEDDB_PREDICATE_MAP.get(predicate_raw, "associated_with")
+
+                # Build entity IDs from UMLS CUIs
+                # Prefix with type for better entity resolution
+                subj_prefix = {"gene": "Gene", "protein": "Protein",
+                               "compound": "Compound", "disease": "Disease",
+                               "phenotype": "Phenotype"}.get(subj_type, "Entity")
+                obj_prefix = {"gene": "Gene", "protein": "Protein",
+                              "compound": "Compound", "disease": "Disease",
+                              "phenotype": "Phenotype"}.get(obj_type, "Entity")
+
+                subj_eid = f"{subj_prefix}_{subject_cui}"
+                obj_eid = f"{obj_prefix}_{object_cui}"
+
+                subj_canonical = normalize_entity_id(subj_eid)
+                obj_canonical = normalize_entity_id(obj_eid)
+
+                if subj_canonical == obj_canonical:
+                    skipped += 1
+                    continue
+
+                if subj_canonical not in entities:
+                    entities[subj_canonical] = (subj_type, subject_name or subj_eid, "{}")
+                if obj_canonical not in entities:
+                    entities[obj_canonical] = (obj_type, object_name or obj_eid, "{}")
+
+                source_id = f"semmeddb:{pmid}" if pmid else "semmeddb"
+                content_id = compute_content_id(subj_canonical, predicate, obj_canonical)
+                claim_id = compute_claim_id(
+                    subj_canonical, predicate, obj_canonical,
+                    source_id, "literature_extraction", timestamp,
+                )
+
+                claim_rows.append((
+                    subj_canonical, obj_canonical, claim_id, content_id,
+                    predicate, "relation", 0.65,
+                    "literature_extraction", source_id,
+                    "", "[]", "", "", "", timestamp, "active",
+                ))
+
+                processed += 1
+                if processed % 5_000_000 == 0:
+                    logger.info("SemMedDB: %dM rows processed...", processed // 1_000_000)
+
+        logger.info(
+            "SemMedDB: %d predications parsed, %d skipped",
+            len(claim_rows), skipped,
+        )
+
+        if not claim_rows:
+            return BatchResult(ingested=0)
+
+        result = self._ingest_append_direct(entities, claim_rows, timestamp)
+        elapsed = time.time() - t0
+        logger.info(
+            "SemMedDB loaded: %d entities, %d claims in %.1fs",
+            len(entities), len(claim_rows), elapsed,
+        )
+        return result
+
+    # ---- RTX-KG2c (composite biomedical KG, 40-55M edges) ----
+
+    def download_kg2c(self, dest_dir: str) -> str:
+        """Download RTX-KG2c lite JSON. Returns path to gzipped JSON."""
+        import requests
+
+        dest = os.path.join(dest_dir, "kg2c_lite.json.gz")
+        if os.path.exists(dest):
+            size_mb = os.path.getsize(dest) / (1024 * 1024)
+            if size_mb > 100:  # Valid download > 100MB
+                logger.info("KG2c already cached at %s (%.0f MB)", dest, size_mb)
+                return dest
+
+        logger.info("Downloading RTX-KG2c lite (~538 MB, may take a while)...")
+        resp = requests.get(KG2C_LITE_URL, timeout=3600, stream=True)
+        resp.raise_for_status()
+        with open(dest, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=65536):
+                f.write(chunk)
+        size_mb = os.path.getsize(dest) / (1024 * 1024)
+        logger.info("KG2c downloaded: %.1f MB", size_mb)
+        return dest
+
+    def load_kg2c(self, path: str) -> BatchResult:
+        """Load RTX-KG2c lite from gzipped JSON.
+
+        JSON structure: {"nodes": [...], "edges": [...], "kg2_version": "...", ...}
+        Node fields: id, name, category, all_categories
+        Edge fields: id, subject, object, predicate, primary_knowledge_source,
+                     qualified_predicate, qualified_object_aspect,
+                     qualified_object_direction, domain_range_exclusion
+
+        Uses streaming JSON parsing (ijson) if available, falls back to
+        chunked manual parsing for the massive arrays.
+        """
+        t0 = time.time()
+        timestamp = int(t0)
+
+        entities: dict[str, tuple[str, str, str]] = {}
+        claim_rows: list[tuple] = []
+        skipped = 0
+
+        def _kg2c_entity_id(curie: str, category: str) -> tuple[str, str] | None:
+            """Convert KG2c CURIE to Attest entity ID + type."""
+            if not curie:
+                return None
+            etype = BIOLINK_CATEGORY_MAP.get(category, "entity")
+            # Map CURIE prefixes to our entity ID format
+            prefix = curie.split(":")[0] if ":" in curie else ""
+            if prefix == "NCBIGene":
+                gid = curie.split(":", 1)[1]
+                return f"Gene_{gid}", etype
+            elif prefix == "UniProtKB":
+                return f"Protein_{curie}", etype
+            elif prefix in ("CHEBI", "DRUGBANK", "PUBCHEM.COMPOUND"):
+                return f"Compound_{curie}", etype
+            elif prefix in ("MONDO", "DOID", "MESH", "OMIM", "HP", "ORPHANET",
+                            "EFO", "NCIT", "UMLS", "SNOMEDCT"):
+                if etype == "phenotype" or prefix == "HP":
+                    return f"Phenotype_{curie}", "phenotype"
+                return f"Disease_{curie}", "disease"
+            elif prefix in ("GO", "REACT", "KEGG.PATHWAY", "PANTHER.PATHWAY"):
+                return f"Pathway_{curie}", "pathway"
+            elif prefix == "HGNC":
+                return f"Gene_{curie}", "gene"
+            elif prefix in ("ENSEMBL", "ENSG"):
+                return f"Gene_{curie}", "gene"
+            elif prefix == "PR":
+                return f"Protein_{curie}", "protein"
+            else:
+                # Keep the CURIE as-is for less common prefixes
+                return f"Entity_{curie}", etype
+
+        # Stream-parse the gzipped JSON — nodes first, then edges
+        # For very large files, we parse line by line to avoid loading
+        # the entire JSON into memory at once.
+        logger.info("Loading KG2c nodes and edges (streaming)...")
+
+        # Build node name map from nodes array
+        node_names: dict[str, tuple[str, str]] = {}  # curie -> (name, category)
+
+        # Use ijson for streaming if available, else load in memory
+        try:
+            import ijson
+            _has_ijson = True
+        except ImportError:
+            _has_ijson = False
+
+        if _has_ijson:
+            # Stream parse nodes
+            logger.info("KG2c: streaming nodes with ijson...")
+            with gzip.open(path, "rb") as f:
+                for node in ijson.items(f, "nodes.item"):
+                    nid = node.get("id", "")
+                    name = node.get("name", "")
+                    cat = node.get("category", "biolink:NamedThing")
+                    if nid:
+                        node_names[nid] = (name, cat)
+                        result = _kg2c_entity_id(nid, cat)
+                        if result:
+                            eid, etype = result
+                            canonical = normalize_entity_id(eid)
+                            if canonical not in entities:
+                                entities[canonical] = (etype, name or eid, "{}")
+
+            logger.info("KG2c: %d nodes loaded, streaming edges...", len(node_names))
+
+            # Stream parse edges
+            with gzip.open(path, "rb") as f:
+                for edge in ijson.items(f, "edges.item"):
+                    subj_curie = edge.get("subject", "")
+                    obj_curie = edge.get("object", "")
+                    pred_raw = edge.get("predicate", "")
+                    source = edge.get("primary_knowledge_source", "")
+
+                    if not subj_curie or not obj_curie or not pred_raw:
+                        skipped += 1
+                        continue
+
+                    # Get categories from node map
+                    subj_info = node_names.get(subj_curie, ("", "biolink:NamedThing"))
+                    obj_info = node_names.get(obj_curie, ("", "biolink:NamedThing"))
+
+                    subj_result = _kg2c_entity_id(subj_curie, subj_info[1])
+                    obj_result = _kg2c_entity_id(obj_curie, obj_info[1])
+                    if not subj_result or not obj_result:
+                        skipped += 1
+                        continue
+
+                    subj_eid, subj_type = subj_result
+                    obj_eid, obj_type = obj_result
+                    subj_canonical = normalize_entity_id(subj_eid)
+                    obj_canonical = normalize_entity_id(obj_eid)
+
+                    if subj_canonical == obj_canonical:
+                        skipped += 1
+                        continue
+
+                    predicate = BIOLINK_PREDICATE_MAP.get(pred_raw, "associated_with")
+
+                    if subj_canonical not in entities:
+                        entities[subj_canonical] = (subj_type, subj_info[0] or subj_eid, "{}")
+                    if obj_canonical not in entities:
+                        entities[obj_canonical] = (obj_type, obj_info[0] or obj_eid, "{}")
+
+                    # Use primary_knowledge_source for provenance
+                    source_id = f"kg2c:{source}" if source else "kg2c"
+                    content_id = compute_content_id(subj_canonical, predicate, obj_canonical)
+                    claim_id = compute_claim_id(
+                        subj_canonical, predicate, obj_canonical,
+                        source_id, "database_import", timestamp,
+                    )
+
+                    claim_rows.append((
+                        subj_canonical, obj_canonical, claim_id, content_id,
+                        predicate, "relation", 0.80,
+                        "database_import", source_id,
+                        "", "[]", "", "", "", timestamp, "active",
+                    ))
+
+                    if len(claim_rows) % 5_000_000 == 0:
+                        logger.info("KG2c: %dM edges processed...", len(claim_rows) // 1_000_000)
+        else:
+            # Fallback: load entire JSON into memory (needs ~4-8GB RAM)
+            logger.info("KG2c: loading full JSON (no ijson, needs ~5GB RAM)...")
+            with gzip.open(path, "rt") as f:
+                data = json.load(f)
+
+            # Process nodes
+            for node in data.get("nodes", []):
+                nid = node.get("id", "")
+                name = node.get("name", "")
+                cat = node.get("category", "biolink:NamedThing")
+                if nid:
+                    node_names[nid] = (name, cat)
+                    result = _kg2c_entity_id(nid, cat)
+                    if result:
+                        eid, etype = result
+                        canonical = normalize_entity_id(eid)
+                        if canonical not in entities:
+                            entities[canonical] = (etype, name or eid, "{}")
+
+            logger.info("KG2c: %d nodes, processing edges...", len(node_names))
+
+            # Process edges
+            for edge in data.get("edges", []):
+                subj_curie = edge.get("subject", "")
+                obj_curie = edge.get("object", "")
+                pred_raw = edge.get("predicate", "")
+                source = edge.get("primary_knowledge_source", "")
+
+                if not subj_curie or not obj_curie or not pred_raw:
+                    skipped += 1
+                    continue
+
+                subj_info = node_names.get(subj_curie, ("", "biolink:NamedThing"))
+                obj_info = node_names.get(obj_curie, ("", "biolink:NamedThing"))
+
+                subj_result = _kg2c_entity_id(subj_curie, subj_info[1])
+                obj_result = _kg2c_entity_id(obj_curie, obj_info[1])
+                if not subj_result or not obj_result:
+                    skipped += 1
+                    continue
+
+                subj_eid, subj_type = subj_result
+                obj_eid, obj_type = obj_result
+                subj_canonical = normalize_entity_id(subj_eid)
+                obj_canonical = normalize_entity_id(obj_eid)
+
+                if subj_canonical == obj_canonical:
+                    skipped += 1
+                    continue
+
+                predicate = BIOLINK_PREDICATE_MAP.get(pred_raw, "associated_with")
+
+                if subj_canonical not in entities:
+                    entities[subj_canonical] = (subj_type, subj_info[0] or subj_eid, "{}")
+                if obj_canonical not in entities:
+                    entities[obj_canonical] = (obj_type, obj_info[0] or obj_eid, "{}")
+
+                source_id = f"kg2c:{source}" if source else "kg2c"
+                content_id = compute_content_id(subj_canonical, predicate, obj_canonical)
+                claim_id = compute_claim_id(
+                    subj_canonical, predicate, obj_canonical,
+                    source_id, "database_import", timestamp,
+                )
+
+                claim_rows.append((
+                    subj_canonical, obj_canonical, claim_id, content_id,
+                    predicate, "relation", 0.80,
+                    "database_import", source_id,
+                    "", "[]", "", "", "", timestamp, "active",
+                ))
+
+                if len(claim_rows) % 5_000_000 == 0:
+                    logger.info("KG2c: %dM edges processed...", len(claim_rows) // 1_000_000)
+
+            del data  # Free memory
+
+        logger.info(
+            "KG2c: %d edges parsed, %d skipped",
+            len(claim_rows), skipped,
+        )
+
+        if not claim_rows:
+            return BatchResult(ingested=0)
+
+        result = self._ingest_append_direct(entities, claim_rows, timestamp)
+        elapsed = time.time() - t0
+        logger.info(
+            "KG2c loaded: %d entities, %d claims in %.1fs",
+            len(entities), len(claim_rows), elapsed,
+        )
+        return result
+
+    # ---- Monarch KG (multi-source biomedical KG, 15.3M edges) ----
+
+    def download_monarch_kg(self, dest_dir: str) -> str:
+        """Download Monarch KG tar.gz and extract edges TSV. Returns path to edges file."""
+        import requests
+        import tarfile
+
+        edges_dest = os.path.join(dest_dir, "monarch-kg_edges.tsv")
+        if os.path.exists(edges_dest):
+            size_mb = os.path.getsize(edges_dest) / (1024 * 1024)
+            if size_mb > 10:  # Valid extraction > 10MB
+                logger.info("Monarch KG edges already cached at %s (%.0f MB)", edges_dest, size_mb)
+                return edges_dest
+
+        tar_path = os.path.join(dest_dir, "monarch-kg.tar.gz")
+        if not os.path.exists(tar_path):
+            logger.info("Downloading Monarch KG (~272 MB)...")
+            resp = requests.get(MONARCH_KG_URL, timeout=1800, stream=True)
+            resp.raise_for_status()
+            with open(tar_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=65536):
+                    f.write(chunk)
+            logger.info("Monarch KG downloaded: %.1f MB", os.path.getsize(tar_path) / (1024 * 1024))
+
+        # Extract edges TSV from tar
+        logger.info("Extracting Monarch KG edges...")
+        with tarfile.open(tar_path, "r:gz") as tf:
+            for member in tf.getmembers():
+                basename = os.path.basename(member.name)
+                if basename.startswith("._"):
+                    continue
+                if "edges" in basename and basename.endswith(".tsv"):
+                    member.name = "monarch-kg_edges.tsv"
+                    tf.extract(member, dest_dir)
+                    logger.info("Extracted edges: %s", edges_dest)
+                    break
+                if "nodes" in basename and basename.endswith(".tsv"):
+                    member.name = "monarch-kg_nodes.tsv"
+                    tf.extract(member, dest_dir)
+
+        if not os.path.exists(edges_dest):
+            raise FileNotFoundError(f"No edges TSV found in {tar_path}")
+        return edges_dest
+
+    def load_monarch_kg(self, path: str) -> BatchResult:
+        """Load Monarch KG edges from TSV.
+
+        Columns (15): subject, subject_label, subject_category, subject_taxon,
+            subject_taxon_label, negated, predicate, object, object_label,
+            object_category, qualifiers, publications, has_evidence,
+            primary_knowledge_source, aggregator_knowledge_source
+
+        Node IDs use CURIE format (HGNC:2593, MONDO:0008730, CHEBI:701, etc.).
+        Predicates use Biolink model (biolink:has_phenotype, biolink:causes, etc.).
+        """
+        t0 = time.time()
+        timestamp = int(t0)
+
+        entities: dict[str, tuple[str, str, str]] = {}
+        claim_rows: list[tuple] = []
+        skipped = 0
+
+        def _monarch_entity_id(curie: str, category: str, label: str) -> tuple[str, str, str] | None:
+            """Convert Monarch CURIE to (attest_id, entity_type, display_name)."""
+            if not curie:
+                return None
+            etype = BIOLINK_CATEGORY_MAP.get(category, "entity")
+            prefix = curie.split(":")[0] if ":" in curie else ""
+
+            # Map well-known CURIE prefixes
+            if prefix == "HGNC":
+                return f"Gene_{curie}", "gene", label or curie
+            elif prefix == "NCBIGene":
+                gid = curie.split(":", 1)[1]
+                return f"Gene_{gid}", "gene", label or curie
+            elif prefix in ("MGI", "ZFIN", "RGD", "WB", "FB", "SGD"):
+                # Model organism gene IDs
+                return f"Gene_{curie}", "gene", label or curie
+            elif prefix == "UniProtKB":
+                return f"Protein_{curie}", "protein", label or curie
+            elif prefix in ("CHEBI", "DrugCentral"):
+                return f"Compound_{curie}", "compound", label or curie
+            elif prefix in ("MONDO", "DOID", "OMIM", "Orphanet", "DECIPHER"):
+                return f"Disease_{curie}", "disease", label or curie
+            elif prefix in ("HP", "MP", "ZP", "WBPhenotype", "XPO"):
+                return f"Phenotype_{curie}", "phenotype", label or curie
+            elif prefix in ("GO",):
+                if etype == "biological_process":
+                    return f"BiologicalProcess_{curie}", "biological_process", label or curie
+                elif etype == "molecular_function":
+                    return f"MolecularFunction_{curie}", "molecular_function", label or curie
+                elif etype == "cellular_component":
+                    return f"CellularComponent_{curie}", "cellular_component", label or curie
+                return f"Pathway_{curie}", "pathway", label or curie
+            elif prefix in ("REACT", "KEGG"):
+                return f"Pathway_{curie}", "pathway", label or curie
+            elif prefix in ("UBERON", "CL", "CLO"):
+                if prefix == "CL" or prefix == "CLO":
+                    return f"CellType_{curie}", "cell_line", label or curie
+                return f"Anatomy_{curie}", "entity", label or curie
+            elif prefix == "NCBITaxon":
+                return f"Organism_{curie}", "organism", label or curie
+            else:
+                return f"Entity_{curie}", etype, label or curie
+
+        with open(path, "r", errors="replace") as f:
+            header = f.readline().rstrip("\n").split("\t")
+            # Find column indices
+            col_map = {name: i for i, name in enumerate(header)}
+            subj_idx = col_map.get("subject", 0)
+            subj_label_idx = col_map.get("subject_label", 1)
+            subj_cat_idx = col_map.get("subject_category", 2)
+            neg_idx = col_map.get("negated", 5)
+            pred_idx = col_map.get("predicate", 6)
+            obj_idx = col_map.get("object", 7)
+            obj_label_idx = col_map.get("object_label", 8)
+            obj_cat_idx = col_map.get("object_category", 9)
+            source_idx = col_map.get("primary_knowledge_source", 13)
+
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) <= max(subj_idx, obj_idx, pred_idx):
+                    skipped += 1
+                    continue
+
+                # Skip negated assertions
+                negated = parts[neg_idx] if neg_idx < len(parts) else ""
+                if negated.lower() in ("true", "1"):
+                    skipped += 1
+                    continue
+
+                subj_curie = parts[subj_idx].strip()
+                obj_curie = parts[obj_idx].strip()
+                pred_raw = parts[pred_idx].strip()
+                subj_label = parts[subj_label_idx].strip() if subj_label_idx < len(parts) else ""
+                obj_label = parts[obj_label_idx].strip() if obj_label_idx < len(parts) else ""
+                subj_cat = parts[subj_cat_idx].strip() if subj_cat_idx < len(parts) else "biolink:NamedThing"
+                obj_cat = parts[obj_cat_idx].strip() if obj_cat_idx < len(parts) else "biolink:NamedThing"
+                source = parts[source_idx].strip() if source_idx < len(parts) else ""
+
+                if not subj_curie or not obj_curie or not pred_raw:
+                    skipped += 1
+                    continue
+
+                subj_result = _monarch_entity_id(subj_curie, subj_cat, subj_label)
+                obj_result = _monarch_entity_id(obj_curie, obj_cat, obj_label)
+                if not subj_result or not obj_result:
+                    skipped += 1
+                    continue
+
+                subj_eid, subj_type, subj_name = subj_result
+                obj_eid, obj_type, obj_name = obj_result
+                subj_canonical = normalize_entity_id(subj_eid)
+                obj_canonical = normalize_entity_id(obj_eid)
+
+                if subj_canonical == obj_canonical:
+                    skipped += 1
+                    continue
+
+                predicate = BIOLINK_PREDICATE_MAP.get(pred_raw, "associated_with")
+
+                if subj_canonical not in entities:
+                    entities[subj_canonical] = (subj_type, subj_name, "{}")
+                if obj_canonical not in entities:
+                    entities[obj_canonical] = (obj_type, obj_name, "{}")
+
+                source_id = f"monarch:{source}" if source else "monarch"
+                content_id = compute_content_id(subj_canonical, predicate, obj_canonical)
+                claim_id = compute_claim_id(
+                    subj_canonical, predicate, obj_canonical,
+                    source_id, "database_import", timestamp,
+                )
+
+                claim_rows.append((
+                    subj_canonical, obj_canonical, claim_id, content_id,
+                    predicate, "relation", 0.82,
+                    "database_import", source_id,
+                    "", "[]", "", "", "", timestamp, "active",
+                ))
+
+                if len(claim_rows) % 2_000_000 == 0:
+                    logger.info("Monarch KG: %dM edges processed...", len(claim_rows) // 1_000_000)
+
+        logger.info(
+            "Monarch KG: %d edges parsed, %d skipped",
+            len(claim_rows), skipped,
+        )
+
+        if not claim_rows:
+            return BatchResult(ingested=0)
+
+        result = self._ingest_append_direct(entities, claim_rows, timestamp)
+        elapsed = time.time() - t0
+        logger.info(
+            "Monarch KG loaded: %d entities, %d claims in %.1fs",
+            len(entities), len(claim_rows), elapsed,
+        )
+        return result
+
+    # ---- PharMeBINet (composite KG, 15.9M edges, 48 sources) ----
+
+    def download_pharmebinet(self, dest_dir: str) -> tuple[str, str]:
+        """Download PharMeBINet TSV archive from Zenodo. Returns (nodes_path, edges_path)."""
+        import requests
+        import tarfile
+
+        nodes_dest = os.path.join(dest_dir, "pharmebinet_nodes.tsv")
+        edges_dest = os.path.join(dest_dir, "pharmebinet_edges.tsv")
+        if os.path.exists(nodes_dest) and os.path.exists(edges_dest):
+            n_size = os.path.getsize(nodes_dest) / (1024 * 1024)
+            e_size = os.path.getsize(edges_dest) / (1024 * 1024)
+            if n_size > 10 and e_size > 10:
+                logger.info("PharMeBINet cached: nodes %.0f MB, edges %.0f MB", n_size, e_size)
+                return nodes_dest, edges_dest
+
+        tar_path = os.path.join(dest_dir, "pharmebinet.tar.gz")
+        if not os.path.exists(tar_path):
+            logger.info("Downloading PharMeBINet (~863 MB)...")
+            resp = requests.get(PHARMEBINET_URL, timeout=3600, stream=True)
+            resp.raise_for_status()
+            with open(tar_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=65536):
+                    f.write(chunk)
+            logger.info("PharMeBINet downloaded: %.1f MB", os.path.getsize(tar_path) / (1024 * 1024))
+
+        logger.info("Extracting PharMeBINet TSVs...")
+        with tarfile.open(tar_path, "r:gz") as tf:
+            for member in tf.getmembers():
+                basename = os.path.basename(member.name)
+                if basename.startswith("._"):
+                    continue
+                if basename == "nodes.tsv":
+                    member.name = "pharmebinet_nodes.tsv"
+                    tf.extract(member, dest_dir)
+                elif basename == "edges.tsv":
+                    member.name = "pharmebinet_edges.tsv"
+                    tf.extract(member, dest_dir)
+
+        if not os.path.exists(nodes_dest) or not os.path.exists(edges_dest):
+            raise FileNotFoundError(f"Could not extract PharMeBINet TSVs from {tar_path}")
+        return nodes_dest, edges_dest
+
+    def load_pharmebinet(self, nodes_path: str, edges_path: str) -> BatchResult:
+        """Load PharMeBINet from nodes + edges TSV files.
+
+        Two-pass approach:
+        1. Load nodes.tsv to build node_id -> (identifier, label, name) lookup
+        2. Load edges.tsv, resolve start_id/end_id via lookup, build claims
+
+        nodes.tsv columns: node_id, labels, properties, name, identifier, resource, license, source, url
+        edges.tsv columns: relationship_id, type, start_id, end_id, properties, resource, license, source, url
+        """
+        t0 = time.time()
+        timestamp = int(t0)
+
+        # Pass 1: Build node lookup
+        logger.info("PharMeBINet: loading nodes...")
+        node_lookup: dict[str, tuple[str, str, str]] = {}  # int_id -> (identifier, label, name)
+
+        with open(nodes_path, "r", errors="replace") as f:
+            header = f.readline()  # Skip header
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 5:
+                    continue
+                node_id = parts[0].strip()
+                labels = parts[1].strip()  # e.g. "Gene", "Disease|Phenotype"
+                name = parts[3].strip()
+                identifier = parts[4].strip()
+
+                if not node_id or not identifier:
+                    continue
+
+                # Use first label for type mapping
+                primary_label = labels.split("|")[0] if "|" in labels else labels
+                node_lookup[node_id] = (identifier, primary_label, name)
+
+        logger.info("PharMeBINet: %d nodes loaded", len(node_lookup))
+
+        # Pass 2: Process edges
+        entities: dict[str, tuple[str, str, str]] = {}
+        claim_rows: list[tuple] = []
+        skipped = 0
+
+        def _pbn_entity_id(identifier: str, label: str, name: str) -> tuple[str, str, str] | None:
+            """Convert PharMeBINet node to (attest_id, entity_type, display_name)."""
+            etype = PHARMEBINET_LABEL_MAP.get(label, "entity")
+
+            # Map identifier based on entity type
+            if label == "Gene":
+                return f"Gene_{identifier}", "gene", name or identifier
+            elif label in ("Protein", "Target"):
+                return f"Protein_{identifier}", "protein", name or identifier
+            elif label in ("Chemical", "Compound", "Drug", "Salt", "Metabolite", "Treatment", "Product"):
+                return f"Compound_{identifier}", "compound", name or identifier
+            elif label in ("Disease",):
+                if ":" in identifier:
+                    return f"Disease_{identifier}", "disease", name or identifier
+                return f"Disease_{identifier}", "disease", name or identifier
+            elif label in ("Phenotype", "Symptom", "SideEffect"):
+                return f"Phenotype_{identifier}", "phenotype", name or identifier
+            elif label == "BiologicalProcess":
+                return f"BiologicalProcess_{identifier}", "biological_process", name or identifier
+            elif label == "MolecularFunction":
+                return f"MolecularFunction_{identifier}", "molecular_function", name or identifier
+            elif label == "CellularComponent":
+                return f"CellularComponent_{identifier}", "cellular_component", name or identifier
+            elif label == "Pathway":
+                return f"Pathway_{identifier}", "pathway", name or identifier
+            elif label in ("GeneVariant", "Variant", "Haplotype", "RNA"):
+                return f"Gene_{identifier}", "gene", name or identifier
+            else:
+                return f"Entity_{identifier}", etype, name or identifier
+
+        def _resolve_verb(edge_type: str) -> str:
+            """Extract verb from edge type like TREATS_CHtD -> TREATS."""
+            # Try exact match first, then prefix matching
+            for verb, predicate in PHARMEBINET_VERB_MAP.items():
+                if edge_type.startswith(verb):
+                    return predicate
+            return "associated_with"
+
+        with open(edges_path, "r", errors="replace") as f:
+            header = f.readline()  # Skip header
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 5:
+                    skipped += 1
+                    continue
+
+                edge_type = parts[1].strip()
+                start_id = parts[2].strip()
+                end_id = parts[3].strip()
+
+                # Skip negative GO annotations
+                if edge_type.startswith("NOT_"):
+                    skipped += 1
+                    continue
+
+                # Resolve to real identifiers
+                start_node = node_lookup.get(start_id)
+                end_node = node_lookup.get(end_id)
+                if not start_node or not end_node:
+                    skipped += 1
+                    continue
+
+                s_id, s_label, s_name = start_node
+                o_id, o_label, o_name = end_node
+
+                s_result = _pbn_entity_id(s_id, s_label, s_name)
+                o_result = _pbn_entity_id(o_id, o_label, o_name)
+                if not s_result or not o_result:
+                    skipped += 1
+                    continue
+
+                subj_eid, subj_type, subj_name = s_result
+                obj_eid, obj_type, obj_name = o_result
+                subj_canonical = normalize_entity_id(subj_eid)
+                obj_canonical = normalize_entity_id(obj_eid)
+
+                if subj_canonical == obj_canonical:
+                    skipped += 1
+                    continue
+
+                predicate = _resolve_verb(edge_type)
+
+                if subj_canonical not in entities:
+                    entities[subj_canonical] = (subj_type, subj_name, "{}")
+                if obj_canonical not in entities:
+                    entities[obj_canonical] = (obj_type, obj_name, "{}")
+
+                source_id = f"pharmebinet:{edge_type}"
+                content_id = compute_content_id(subj_canonical, predicate, obj_canonical)
+                claim_id = compute_claim_id(
+                    subj_canonical, predicate, obj_canonical,
+                    source_id, "database_import", timestamp,
+                )
+
+                claim_rows.append((
+                    subj_canonical, obj_canonical, claim_id, content_id,
+                    predicate, "relation", 0.82,
+                    "database_import", source_id,
+                    "", "[]", "", "", "", timestamp, "active",
+                ))
+
+                if len(claim_rows) % 2_000_000 == 0:
+                    logger.info("PharMeBINet: %dM edges processed...", len(claim_rows) // 1_000_000)
+
+        logger.info(
+            "PharMeBINet: %d edges parsed, %d skipped",
+            len(claim_rows), skipped,
+        )
+
+        if not claim_rows:
+            return BatchResult(ingested=0)
+
+        result = self._ingest_append_direct(entities, claim_rows, timestamp)
+        elapsed = time.time() - t0
+        logger.info(
+            "PharMeBINet loaded: %d entities, %d claims in %.1fs",
+            len(entities), len(claim_rows), elapsed,
+        )
+        return result
+
     def _ingest_append_direct(
         self,
         entities: dict[str, tuple[str, str, str]],
@@ -635,9 +4500,17 @@ class BulkLoader:
     ) -> BatchResult:
         """Direct entity/claim insertion via the Rust store.
 
-        Uses upsert_entity (handles dedup naturally) and insert_claim.
-        Builds Claim objects from pre-computed row tuples.
+        Prefers insert_bulk (batch Rust path, ~100x faster) when available.
+        Falls back to per-claim Python→Rust loop for older wheel versions.
         """
+        store = self._pipeline._store
+
+        # Fast path: batch insert entirely in Rust (release GIL for Phase 2)
+        if hasattr(store, "insert_bulk"):
+            ingested = store.insert_bulk(entities, claim_rows, timestamp)
+            return BatchResult(ingested=ingested)
+
+        # Slow path: per-claim Python→Rust insertion
         from attestdb.core.types import (
             Claim,
             ClaimStatus,
@@ -645,8 +4518,6 @@ class BulkLoader:
             PredicateRef,
             Provenance,
         )
-
-        store = self._pipeline._store
 
         # Upsert all entities (idempotent — handles dedup)
         for eid, (etype, display, ext_json) in entities.items():
@@ -702,19 +4573,29 @@ class BulkLoader:
         """Load all data sources in correct order.
 
         Order: Hetionet (canonical) -> Reactome (no mapping) ->
-               DISEASES (ENSP mapping) -> STRING (ENSP mapping, largest)
+               DISEASES (ENSP mapping) -> STRING (ENSP mapping, largest) ->
+               DisGeNET (Entrez direct) -> DrugBank (symbol mapping) ->
+               ChEMBL (symbol mapping, largest) ->
+               GOA (UniProt mapping) -> CTD (Entrez direct)
 
         Args:
             dest_dir: Directory to cache downloaded files.
             holdout_fraction: Fraction of Hetionet edges to withhold.
-            include: List of sources to include. None means all.
-                     Options: 'hetionet', 'reactome', 'diseases', 'string'
+            include: List of sources to include. None means all 4 core sources.
+                     Options: 'hetionet', 'reactome', 'diseases', 'string',
+                              'disgenet', 'drugbank', 'chembl', 'goa',
+                              'ctd_chem_gene', 'ctd_gene_disease', 'biogrid',
+                              'clinvar', 'primekg', 'drkg', 'sider', 'hpo',
+                              'intact', 'pharmgkb', 'mondo', 'stitch',
+                              'ctd_chem_disease', 'tissues', 'open_targets',
+                              'semmeddb', 'kg2c', 'monarch_kg', 'pharmebinet'
             min_string_score: Minimum STRING combined score (default 700).
 
         Returns:
             (combined BatchResult, list of withheld Hetionet ClaimInputs)
         """
         os.makedirs(dest_dir, exist_ok=True)
+        # Default: original 4 sources (new sources opt-in)
         sources = set(include) if include else {"hetionet", "reactome", "diseases", "string"}
         total_ingested = 0
         withheld: list[ClaimInput] = []
@@ -729,15 +4610,23 @@ class BulkLoader:
             total_ingested += result.ingested
             logger.info("Hetionet: %d edges ingested", result.ingested)
 
-        # 2. Build ID mapper (needed by DISEASES and STRING)
+        # 2. Build ID mapper (needed by DISEASES, STRING, DrugBank, ChEMBL, GOA)
         mapper = None
-        if "diseases" in sources or "string" in sources:
+        needs_mapper = {"diseases", "string", "drugbank", "chembl", "goa", "intact", "pharmgkb", "tissues", "open_targets"}
+        if sources & needs_mapper:
             logger.info("=== Building ID mapper ===")
             mapper = GeneIDMapper(dest_dir)
             nodes_path = None
             if "hetionet" in sources:
                 nodes_path = self.download_hetionet_nodes(dest_dir)
             mapper.load(hetionet_nodes_path=nodes_path)
+
+            # Load UniProt mapping if DrugBank, ChEMBL, GOA, or IntAct requested
+            if sources & {"drugbank", "chembl", "goa", "intact"}:
+                try:
+                    mapper.load_uniprot_mapping()
+                except Exception as e:
+                    logger.warning("UniProt mapping unavailable: %s", e)
 
         # 3. Reactome (no mapping needed)
         if "reactome" in sources:
@@ -755,13 +4644,221 @@ class BulkLoader:
             total_ingested += result.ingested
             logger.info("DISEASES: %d edges ingested", result.ingested)
 
-        # 5. STRING (ENSP mapping, largest)
+        # 5. STRING (ENSP mapping, largest of original 4)
         if "string" in sources and mapper is not None:
             logger.info("=== Loading STRING PPI ===")
             string_path = self.download_string_links(dest_dir)
             result = self.load_string_ppi(string_path, mapper, min_score=min_string_score)
             total_ingested += result.ingested
             logger.info("STRING: %d edges ingested", result.ingested)
+
+        # 6. DisGeNET (direct Entrez gene IDs, UMLS CUI diseases)
+        if "disgenet" in sources:
+            logger.info("=== Loading DisGeNET ===")
+            disgenet_path = self.download_disgenet(dest_dir)
+            if disgenet_path:
+                result = self.load_disgenet(disgenet_path)
+                total_ingested += result.ingested
+                logger.info("DisGeNET: %d edges ingested", result.ingested)
+            else:
+                logger.warning("DisGeNET skipped (no credentials)")
+
+        # 7. DrugBank (DrugBank IDs match Hetionet compounds)
+        if "drugbank" in sources and mapper is not None:
+            logger.info("=== Loading DrugBank ===")
+            drugbank_path = self.download_drugbank_targets(dest_dir)
+            if drugbank_path:
+                result = self.load_drugbank(drugbank_path, mapper)
+                total_ingested += result.ingested
+                logger.info("DrugBank: %d edges ingested", result.ingested)
+            else:
+                logger.warning("DrugBank skipped (no credentials)")
+
+        # 8. ChEMBL (fully open, but large download ~3-4GB)
+        if "chembl" in sources and mapper is not None:
+            logger.info("=== Loading ChEMBL ===")
+            chembl_path = self.download_chembl(dest_dir)
+            if chembl_path:
+                result = self.load_chembl(chembl_path, mapper)
+                total_ingested += result.ingested
+                logger.info("ChEMBL: %d edges ingested", result.ingested)
+            else:
+                logger.warning("ChEMBL skipped (download failed)")
+
+        # 9. GO Annotations (UniProt→Entrez mapping)
+        if "goa" in sources and mapper is not None:
+            logger.info("=== Loading GO Annotations ===")
+            goa_path = self.download_goa(dest_dir)
+            result = self.load_goa(goa_path, mapper)
+            total_ingested += result.ingested
+            logger.info("GOA: %d annotations ingested", result.ingested)
+
+        # 10. CTD chemical-gene interactions (Entrez direct, MeSH chemicals)
+        if "ctd_chem_gene" in sources:
+            logger.info("=== Loading CTD chemical-gene ===")
+            ctd_cg_path = self.download_ctd_chem_gene(dest_dir)
+            if ctd_cg_path:
+                result = self.load_ctd_chem_gene(ctd_cg_path)
+                total_ingested += result.ingested
+                logger.info("CTD chem-gene: %d interactions ingested", result.ingested)
+            else:
+                logger.warning("CTD chem-gene skipped (download failed)")
+
+        # 11. CTD gene-disease associations (Entrez direct, MeSH/OMIM diseases)
+        if "ctd_gene_disease" in sources:
+            logger.info("=== Loading CTD gene-disease ===")
+            ctd_gd_path = self.download_ctd_gene_disease(dest_dir)
+            if ctd_gd_path:
+                result = self.load_ctd_gene_disease(ctd_gd_path)
+                total_ingested += result.ingested
+                logger.info("CTD gene-disease: %d associations ingested", result.ingested)
+            else:
+                logger.warning("CTD gene-disease skipped (download failed)")
+
+        # 12. BioGRID (experimentally validated PPIs, Entrez direct)
+        if "biogrid" in sources:
+            logger.info("=== Loading BioGRID ===")
+            biogrid_path = self.download_biogrid(dest_dir)
+            if biogrid_path:
+                result = self.load_biogrid(biogrid_path)
+                total_ingested += result.ingested
+                logger.info("BioGRID: %d interactions ingested", result.ingested)
+            else:
+                logger.warning("BioGRID skipped (download failed)")
+
+        # 13. ClinVar (gene-disease associations, Entrez direct)
+        if "clinvar" in sources:
+            logger.info("=== Loading ClinVar ===")
+            clinvar_path = self.download_clinvar(dest_dir)
+            result = self.load_clinvar(clinvar_path)
+            total_ingested += result.ingested
+            logger.info("ClinVar: %d associations ingested", result.ingested)
+
+        # 14. PrimeKG (multi-relational, no mapping needed)
+        if "primekg" in sources:
+            logger.info("=== Loading PrimeKG ===")
+            primekg_path = self.download_primekg(dest_dir)
+            result = self.load_primekg(primekg_path)
+            total_ingested += result.ingested
+            logger.info("PrimeKG: %d edges ingested", result.ingested)
+
+        # 15. DRKG (drug repurposing KG, no mapping needed)
+        if "drkg" in sources:
+            logger.info("=== Loading DRKG ===")
+            drkg_path = self.download_drkg(dest_dir)
+            result = self.load_drkg(drkg_path)
+            total_ingested += result.ingested
+            logger.info("DRKG: %d triples ingested", result.ingested)
+
+        # 16. SIDER (drug side effects, no mapping needed)
+        if "sider" in sources:
+            logger.info("=== Loading SIDER ===")
+            sider_path = self.download_sider(dest_dir)
+            result = self.load_sider(sider_path)
+            total_ingested += result.ingested
+            logger.info("SIDER: %d drug-SE pairs ingested", result.ingested)
+
+        # 17. HPO (gene-phenotype, no mapping needed)
+        if "hpo" in sources:
+            logger.info("=== Loading HPO ===")
+            hpo_path = self.download_hpo(dest_dir)
+            result = self.load_hpo(hpo_path)
+            total_ingested += result.ingested
+            logger.info("HPO: %d gene-phenotype pairs ingested", result.ingested)
+
+        # 18. IntAct (molecular interactions, UniProt mapping)
+        if "intact" in sources:
+            logger.info("=== Loading IntAct ===")
+            intact_path = self.download_intact(dest_dir)
+            result = self.load_intact(intact_path, mapper)
+            total_ingested += result.ingested
+            logger.info("IntAct: %d interactions ingested", result.ingested)
+
+        # 19. PharmGKB (pharmacogenomics, symbol mapping)
+        if "pharmgkb" in sources:
+            logger.info("=== Loading PharmGKB ===")
+            pharmgkb_path = self.download_pharmgkb(dest_dir)
+            result = self.load_pharmgkb(pharmgkb_path, mapper)
+            total_ingested += result.ingested
+            logger.info("PharmGKB: %d relationships ingested", result.ingested)
+
+        # 20. Mondo (disease cross-references, no mapping needed)
+        if "mondo" in sources:
+            logger.info("=== Loading Mondo ===")
+            mondo_path = self.download_mondo(dest_dir)
+            result = self.load_mondo(mondo_path)
+            total_ingested += result.ingested
+            logger.info("Mondo: %d cross-references ingested", result.ingested)
+
+        # 21. STITCH (chemical-protein interactions, PubChem CIDs)
+        if "stitch" in sources:
+            logger.info("=== Loading STITCH ===")
+            stitch_path = self.download_stitch(dest_dir)
+            result = self.load_stitch(stitch_path)
+            total_ingested += result.ingested
+            logger.info("STITCH: %d interactions ingested", result.ingested)
+
+        # 22. CTD chemical-disease (direct evidence, MeSH IDs)
+        if "ctd_chem_disease" in sources:
+            logger.info("=== Loading CTD chemical-disease ===")
+            ctd_cd_path = self.download_ctd_chem_disease(dest_dir)
+            if ctd_cd_path:
+                result = self.load_ctd_chem_disease(ctd_cd_path)
+                total_ingested += result.ingested
+                logger.info("CTD chem-disease: %d associations ingested", result.ingested)
+            else:
+                logger.warning("CTD chem-disease skipped (download failed)")
+
+        # 23. TISSUES (Jensen Lab gene-tissue, ENSP mapping)
+        if "tissues" in sources and mapper is not None:
+            logger.info("=== Loading TISSUES ===")
+            tissues_path = self.download_tissues(dest_dir)
+            result = self.load_tissues(tissues_path, mapper)
+            total_ingested += result.ingested
+            logger.info("TISSUES: %d gene-tissue pairs ingested", result.ingested)
+
+        # 24. Open Targets (target-disease associations, Parquet)
+        if "open_targets" in sources:
+            logger.info("=== Loading Open Targets ===")
+            ot_path = self.download_open_targets(dest_dir)
+            result = self.load_open_targets(ot_path, mapper)
+            total_ingested += result.ingested
+            logger.info("Open Targets: %d associations ingested", result.ingested)
+
+        # 25. SemMedDB (literature-mined predications, 130M+)
+        if "semmeddb" in sources:
+            logger.info("=== Loading SemMedDB ===")
+            semmed_path = self.download_semmeddb(dest_dir)
+            if semmed_path:
+                result = self.load_semmeddb(semmed_path)
+                total_ingested += result.ingested
+                logger.info("SemMedDB: %d predications ingested", result.ingested)
+            else:
+                logger.warning("SemMedDB skipped (download failed or requires manual download)")
+
+        # 26. RTX-KG2c (composite biomedical KG, 40-55M edges)
+        if "kg2c" in sources:
+            logger.info("=== Loading RTX-KG2c ===")
+            kg2c_path = self.download_kg2c(dest_dir)
+            result = self.load_kg2c(kg2c_path)
+            total_ingested += result.ingested
+            logger.info("KG2c: %d edges ingested", result.ingested)
+
+        # 27. Monarch KG (multi-source biomedical KG, 15.3M edges)
+        if "monarch_kg" in sources:
+            logger.info("=== Loading Monarch KG ===")
+            monarch_path = self.download_monarch_kg(dest_dir)
+            result = self.load_monarch_kg(monarch_path)
+            total_ingested += result.ingested
+            logger.info("Monarch KG: %d edges ingested", result.ingested)
+
+        # 28. PharMeBINet (composite KG, 15.9M edges, 48 sources)
+        if "pharmebinet" in sources:
+            logger.info("=== Loading PharMeBINet ===")
+            nodes_path, edges_path = self.download_pharmebinet(dest_dir)
+            result = self.load_pharmebinet(nodes_path, edges_path)
+            total_ingested += result.ingested
+            logger.info("PharMeBINet: %d edges ingested", result.ingested)
 
         logger.info("=== All sources loaded: %d total edges ===", total_ingested)
         return BatchResult(ingested=total_ingested), withheld

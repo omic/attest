@@ -11,7 +11,10 @@ Metadata record comes first, then entities, then claims.
 from __future__ import annotations
 
 import json
+import logging
 import time
+
+logger = logging.getLogger(__name__)
 
 # Current export format version. Bump when the NDJSON schema changes.
 FORMAT_VERSION = 1
@@ -46,15 +49,18 @@ def export_store(store, output_path: str) -> dict:
         metadata = {"type": "metadata", "format_version": FORMAT_VERSION}
         try:
             metadata["vocabularies"] = store.get_registered_vocabularies()
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to export vocabularies, using empty: %s", exc)
             metadata["vocabularies"] = {}
         try:
             metadata["predicate_constraints"] = store.get_predicate_constraints()
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to export predicate constraints, using empty: %s", exc)
             metadata["predicate_constraints"] = {}
         try:
             metadata["payload_schemas"] = store.get_payload_schemas()
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to export payload schemas, using empty: %s", exc)
             metadata["payload_schemas"] = {}
         f.write(json.dumps(metadata, separators=(",", ":"), default=str) + "\n")
 
@@ -73,7 +79,7 @@ def export_store(store, output_path: str) -> dict:
 
         # Export all claims by iterating through entities
         for e in entities:
-            claims = [claim_from_dict(d) for d in store.claims_for(e.id)]
+            claims = [claim_from_dict(d) for d in store.claims_for(e.id, None, None, 0.0)]
             for claim in claims:
                 if claim.claim_id in seen_claims:
                     continue
@@ -116,6 +122,52 @@ def export_store(store, output_path: str) -> dict:
         "claim_count": claim_count,
         "elapsed_seconds": round(elapsed, 2),
     }
+
+
+def export_entity_claims(store, entity_id: str, output_path: str) -> int:
+    """Export all claims for a single entity to an NDJSON file.
+
+    Each line is a JSON object with the same claim schema as export_store.
+    Returns the count of claims exported.
+    """
+    claim_count = 0
+
+    with open(output_path, "w") as f:
+        claims = [claim_from_dict(d) for d in store.claims_for(entity_id, None, None, 0.0)]
+        for claim in claims:
+            record = {
+                "type": "claim",
+                "claim_id": claim.claim_id,
+                "content_id": claim.content_id,
+                "subject_id": claim.subject.id,
+                "subject_type": claim.subject.entity_type,
+                "subject_display_name": claim.subject.display_name,
+                "subject_external_ids": claim.subject.external_ids,
+                "object_id": claim.object.id,
+                "object_type": claim.object.entity_type,
+                "object_display_name": claim.object.display_name,
+                "object_external_ids": claim.object.external_ids,
+                "predicate_id": claim.predicate.id,
+                "predicate_type": claim.predicate.predicate_type,
+                "confidence": claim.confidence,
+                "source_type": claim.provenance.source_type,
+                "source_id": claim.provenance.source_id,
+                "method": claim.provenance.method,
+                "chain": claim.provenance.chain,
+                "model_version": claim.provenance.model_version,
+                "organization": claim.provenance.organization,
+                "timestamp": claim.timestamp,
+                "status": claim.status.value,
+            }
+            if claim.payload:
+                record["payload_schema"] = claim.payload.schema_ref
+                record["payload_data"] = claim.payload.data
+
+            f.write(json.dumps(record, separators=(",", ":")) + "\n")
+            claim_count += 1
+
+    logger.info("Exported %d claims for entity %s to %s", claim_count, entity_id, output_path)
+    return claim_count
 
 
 def import_store(store, input_path: str, verify: bool = True) -> dict:

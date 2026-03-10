@@ -7,6 +7,8 @@ import json
 import logging
 import os
 import shutil
+import tempfile
+from collections import deque
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -85,8 +87,10 @@ logger = logging.getLogger(__name__)
 def _make_store(db_path: str):
     """Create the raw Rust store backend."""
     from attest_rust import RustStore
+    if db_path == ":memory:":
+        return RustStore.in_memory()
     rust_path = db_path if db_path.endswith((".substrate", ".attest")) else db_path + ".attest"
-    return RustStore(rust_path) if rust_path != ":memory:" else RustStore.in_memory()
+    return RustStore(rust_path)
 
 
 class AttestDB:
@@ -159,9 +163,20 @@ class AttestDB:
                 self._status_overrides = json.load(f)
 
     def _save_status_overrides(self) -> None:
+        if self._is_memory_db:
+            return
         path = self._sidecar_path()
-        with builtins.open(path, "w") as f:
-            json.dump(self._status_overrides, f)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(self._status_overrides, f)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     def _apply_status_overrides(self, claim: Claim) -> Claim:
         """Apply status overrides from retraction sidecar."""
@@ -202,11 +217,20 @@ class AttestDB:
         if self._is_memory_db:
             return
         path = self._chain_log_path()
-        with builtins.open(path, "w") as f:
-            json.dump(
-                [{"claim_id": cid, "chain_hash": ch} for cid, ch in self._chain_log],
-                f,
-            )
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(
+                    [{"claim_id": cid, "chain_hash": ch} for cid, ch in self._chain_log],
+                    f,
+                )
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     def _append_chain(self, claim_id: str) -> str:
         """Append a claim to the Merkle chain. Returns the new chain hash."""
@@ -242,15 +266,11 @@ class AttestDB:
         return {"valid": True, "length": len(self._chain_log), "error": None}
 
     def _all_claims(self) -> list[Claim]:
-        """Collect all unique claims across all entities."""
-        seen: set[str] = set()
-        claims: list[Claim] = []
-        for entity in self.list_entities():
-            for claim in self.claims_for(entity.id):
-                if claim.claim_id not in seen:
-                    seen.add(claim.claim_id)
-                    claims.append(claim)
-        return claims
+        """Return all claims via Rust store."""
+        return [
+            self._apply_status_overrides(claim_from_dict(d))
+            for d in self._store.all_claims()
+        ]
 
     # --- Database lifecycle ---
 
@@ -314,18 +334,20 @@ class AttestDB:
         # Flush Rust store to disk (close + reopen) so we can copy the file
         store_path = self._store._path if hasattr(self._store, '_path') else None
         self._store.close()
-        if store_path:
-            src = store_path
-        elif self._db_path.endswith((".substrate", ".attest")):
-            src = self._db_path
-        else:
-            src = self._db_path + ".attest"
-        if os.path.exists(src):
-            shutil.copy2(src, os.path.join(dest_path, os.path.basename(src)))
-        # Reopen the store so DB remains usable
-        self._store = _make_store(self._db_path)
-        self._pipeline._store = self._store
-        self._query_engine._store = self._store
+        try:
+            if store_path:
+                src = store_path
+            elif self._db_path.endswith((".substrate", ".attest")):
+                src = self._db_path
+            else:
+                src = self._db_path + ".attest"
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(dest_path, os.path.basename(src)))
+        finally:
+            # Always reopen the store so DB remains usable
+            self._store = _make_store(self._db_path)
+            self._pipeline._store = self._store
+            self._query_engine._store = self._store
 
         # Copy retraction sidecar
         sidecar = self._sidecar_path()
@@ -374,7 +396,10 @@ class AttestDB:
                 dst = dest_path + ".chain.json"
                 shutil.copy2(src_file, dst)
             elif entry.endswith(".usearch") or entry.endswith(".usearch.json"):
-                dst = dest_path + entry[entry.index("."):]
+                dot_idx = entry.find(".")
+                if dot_idx == -1:
+                    continue  # skip files without an extension
+                dst = dest_path + entry[dot_idx:]
                 shutil.copy2(src_file, dst)
 
         return AttestDB(dest_path, embedding_dim=embedding_dim)
@@ -421,6 +446,7 @@ class AttestDB:
         )
         claim_id = self._pipeline.ingest(ci)
         self._append_chain(claim_id)
+        self._flush_chain_log()
         self._fire("claim_ingested", claim_id=claim_id, claim_input=ci)
         # Check corroboration
         content_id = compute_content_id(
@@ -440,7 +466,9 @@ class AttestDB:
         return claim_id
 
     def ingest_batch(self, claims: list[ClaimInput]) -> BatchResult:
-        return self._pipeline.ingest_batch(claims, on_ingested=self._append_chain)
+        result = self._pipeline.ingest_batch(claims, on_ingested=self._append_chain)
+        self._flush_chain_log()
+        return result
 
     # --- Querying ---
 
@@ -719,10 +747,10 @@ class AttestDB:
             if eid in visited:
                 continue
             component: list[str] = []
-            queue = [eid]
+            queue = deque([eid])
             visited.add(eid)
             while queue:
-                node = queue.pop(0)
+                node = queue.popleft()
                 component.append(node)
                 for nb in cand_adj[node]:
                     if nb not in visited:
@@ -947,6 +975,9 @@ class AttestDB:
             "- Distinguish well-supported facts (high confidence, multiple sources) "
             "from weaker inferences.\n"
             "- Note contradictions when present — don't hide conflicting evidence.\n"
+            "- Items tagged with ⚠ WARNING, BUG, VULNERABILITY, or PATTERN are "
+            "knowledge annotations — surface these prominently as they represent "
+            "critical operational learnings.\n"
             "- Quote evidence text when available and relevant.\n"
             "- Answer in 3-8 sentences using specific names, facts, and "
             "relationships from the evidence. Synthesize directly from the "
@@ -1121,9 +1152,14 @@ class AttestDB:
                 src_info = f", from: {', '.join(rel.source_types)}" if rel.source_types else ""
                 n_src = rel.n_independent_sources
                 s_sfx = "s" if n_src != 1 else ""
+                # Tag knowledge claims so the LLM treats them appropriately
+                from attestdb.core.vocabulary import KNOWLEDGE_PRIORITY, knowledge_label
+                tag = ""
+                if rel.predicate in KNOWLEDGE_PRIORITY:
+                    tag = f" ⚠ {knowledge_label(rel.predicate).upper()}"
                 ann = (
                     f"[conf={rel.confidence:.2f}, "
-                    f"{n_src} source{s_sfx}{src_info}]"
+                    f"{n_src} source{s_sfx}{src_info}]{tag}"
                 )
                 lines.append(f"- {triple} {ann}")
 
@@ -1183,26 +1219,18 @@ class AttestDB:
         ]
 
     def claims_by_source_id(self, source_id: str) -> list[Claim]:
-        """Return all claims with the given source_id (O(N) scan)."""
-        all_claims = []
-        seen: set[str] = set()
-        for entity in self.list_entities():
-            for claim in self.claims_for(entity.id):
-                if claim.claim_id not in seen and claim.provenance.source_id == source_id:
-                    seen.add(claim.claim_id)
-                    all_claims.append(claim)
-        return all_claims
+        """Return all claims with the given source_id via Rust index (O(k))."""
+        return [
+            self._apply_status_overrides(claim_from_dict(d))
+            for d in self._store.claims_by_source_id(source_id)
+        ]
 
     def claims_for_predicate(self, predicate_id: str) -> list[Claim]:
-        """Return all claims with the given predicate id (O(N) scan)."""
-        all_claims = []
-        seen: set[str] = set()
-        for entity in self.list_entities():
-            for claim in self.claims_for(entity.id):
-                if claim.claim_id not in seen and claim.predicate.id == predicate_id:
-                    seen.add(claim.claim_id)
-                    all_claims.append(claim)
-        return all_claims
+        """Return all claims with the given predicate id via Rust index (O(k))."""
+        return [
+            self._apply_status_overrides(claim_from_dict(d))
+            for d in self._store.claims_by_predicate_id(predicate_id)
+        ]
 
     # --- Retraction ---
 
@@ -1249,10 +1277,10 @@ class AttestDB:
 
         # BFS downstream from retracted claim_ids
         degraded: list[str] = []
-        queue = list(retract_result.claim_ids)
+        queue = deque(retract_result.claim_ids)
         visited = set(retract_result.claim_ids)
         while queue:
-            current = queue.pop(0)
+            current = queue.popleft()
             for dependent_id in reverse_index.get(current, []):
                 if dependent_id not in visited:
                     visited.add(dependent_id)
@@ -2216,17 +2244,32 @@ class AttestDB:
     def blindspots(self, min_claims: int = 5) -> "BlindspotMap":
         """Find knowledge blindspots: single-source entities and gaps."""
         from attestdb.core.types import BlindspotMap
+        from attestdb.core.vocabulary import knowledge_sort_key
 
-        single_source = []
         entities = self.list_entities()
+
+        # Single pass: collect claims per entity and build subject→predicate map
+        single_source = []
+        subject_predicates: dict[str, set[str]] = {}
+        subject_claims: dict[str, list] = {}
 
         for entity in entities:
             claims = self.claims_for(entity.id)
-            # Exclude meta-claims (inquiries) — they aren't real evidence
+
+            # Single-source detection
             evidence_claims = [c for c in claims if c.predicate.id != "inquiry"]
             sources = {c.provenance.source_id for c in evidence_claims}
             if len(sources) == 1 and len(evidence_claims) >= min_claims:
                 single_source.append(entity.id)
+
+            # Build subject→predicate map for unresolved detection
+            for c in claims:
+                subj = c.subject.id
+                if subj not in subject_predicates:
+                    subject_predicates[subj] = set()
+                    subject_claims[subj] = []
+                subject_predicates[subj].add(c.predicate.id)
+                subject_claims[subj].append(c)
 
         # Compute knowledge gaps from predicate constraints
         knowledge_gaps: list[dict] = []
@@ -2251,16 +2294,48 @@ class AttestDB:
             alerts = self.find_confidence_alerts(min_claims=2)
             for alert in alerts:
                 low_conf.append({
-                    "entity": alert.entity_a if hasattr(alert, "entity_a") else str(alert),
-                    "type": "low_confidence",
+                    "entity": alert.entity_id,
+                    "entity_type": alert.entity_type,
+                    "alert_type": alert.alert_type.value,
+                    "explanation": alert.explanation,
+                    "source_id": alert.source_id,
                 })
         except Exception:
             logger.debug("Could not compute confidence alerts", exc_info=True)
+
+        # Find entities with bugs/issues but no corresponding fix.
+        # Uses subject→predicate map built in the single pass above.
+        unresolved: list[dict] = []
+        problem_predicates = {"had_bug", "has_issue", "has_vulnerability"}
+        resolution_predicates = {"has_fix", "resolved", "has_status"}
+        try:
+            for subj, preds in subject_predicates.items():
+                problems = preds & problem_predicates
+                resolutions = preds & resolution_predicates
+                if problems and not resolutions:
+                    problem_list = [
+                        c for c in subject_claims[subj]
+                        if c.predicate.id in problems
+                    ]
+                    problem_list.sort(
+                        key=lambda c: knowledge_sort_key(c.predicate.id, c.confidence),
+                    )
+                    top = problem_list[0]
+                    unresolved.append({
+                        "entity": subj,
+                        "entity_type": top.subject.entity_type,
+                        "predicate": top.predicate.id,
+                        "description": top.object.id,
+                        "confidence": top.confidence,
+                    })
+        except Exception:
+            logger.debug("Could not compute unresolved warnings", exc_info=True)
 
         return BlindspotMap(
             single_source_entities=single_source,
             knowledge_gaps=knowledge_gaps,
             low_confidence_areas=low_conf,
+            unresolved_warnings=unresolved,
         )
 
     def consensus(self, topic: str) -> "ConsensusReport":
@@ -4018,9 +4093,9 @@ class AttestDB:
         # Downstream cascade (read-only BFS)
         reverse_index = self._build_reverse_provenance_index()
         degraded_ids: set[str] = set()
-        queue = list(direct_ids)
+        queue = deque(direct_ids)
         while queue:
-            cid = queue.pop(0)
+            cid = queue.popleft()
             for dep_id in reverse_index.get(cid, []):
                 if dep_id not in direct_ids and dep_id not in degraded_ids:
                     degraded_ids.add(dep_id)
@@ -4240,9 +4315,9 @@ class AttestDB:
         # Downstream cascade
         reverse_index = self._build_reverse_provenance_index()
         degraded_ids: set[str] = set()
-        queue = list(removed_ids)
+        queue = deque(removed_ids)
         while queue:
-            cid = queue.pop(0)
+            cid = queue.popleft()
             for dep_id in reverse_index.get(cid, []):
                 if dep_id not in removed_ids and dep_id not in degraded_ids:
                     degraded_ids.add(dep_id)

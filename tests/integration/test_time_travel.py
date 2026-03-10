@@ -61,6 +61,21 @@ def test_snapshot_includes_all_at_time(temporal_db):
 
 
 def test_snapshot_stats(temporal_db):
+    # At t=1500, only the t=1000 claim is visible (entity_a activates entity_b)
     snapshot = temporal_db.at(1500)
     stats = snapshot.stats()
     assert stats["timestamp"] == 1500
+    assert stats["total_claims"] == 1
+    assert stats["entity_count"] == 2  # entity_a, entity_b
+
+    # At t=2500, two claims visible → 3 entities (a, b, c)
+    snapshot2 = temporal_db.at(2500)
+    stats2 = snapshot2.stats()
+    assert stats2["total_claims"] == 2
+    assert stats2["entity_count"] == 3
+
+    # At t=9999, all claims visible → 4 entities (a, b, c, d)
+    snapshot3 = temporal_db.at(9999)
+    stats3 = snapshot3.stats()
+    assert stats3["total_claims"] == 3
+    assert stats3["entity_count"] == 4
