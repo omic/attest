@@ -564,7 +564,7 @@ impl PyRustStore {
         entities: &Bound<'_, PyDict>,
         claim_rows: &Bound<'_, PyList>,
         timestamp: i64,
-        py: Python<'_>,
+        _py: Python<'_>,
     ) -> PyResult<usize> {
         // Phase 1: Extract all data from Python into Rust-native types (with GIL)
 

@@ -76,9 +76,26 @@ TOOLS = {
 }
 
 
+def _find_attest_mcp() -> str:
+    """Find the attest-mcp entry point co-located with the running Python.
+
+    Prefers the entry point in the same bin/Scripts dir as sys.executable
+    (the Python that installed attestdb) so hooks always use the matching
+    version, even when a stale attest-mcp exists elsewhere on PATH.
+    """
+    exe_dir = Path(sys.executable).parent
+    for name in ("attest-mcp", "attest-mcp.exe"):
+        candidate = exe_dir / name
+        if candidate.exists():
+            return str(candidate)
+    # Fall back to PATH (but may find stale version)
+    found = shutil.which("attest-mcp")
+    return found or ""
+
+
 def _mcp_server_entry() -> dict:
     """Build the MCP server config entry."""
-    attest_mcp = shutil.which("attest-mcp")
+    attest_mcp = _find_attest_mcp()
     if not attest_mcp:
         # Fall back to module invocation
         attest_mcp = sys.executable
@@ -177,8 +194,8 @@ def _install_claude_hooks(scope: str) -> None:
     existing = _read_json(hook_path)
     hooks = existing.setdefault("hooks", {})
 
-    # Find attest-mcp binary for hook commands
-    attest_mcp = shutil.which("attest-mcp")
+    # Find attest-mcp binary co-located with the running Python
+    attest_mcp = _find_attest_mcp()
     if attest_mcp:
         recall_cmd = f"{attest_mcp} recall"
         pre_edit_cmd = f"{attest_mcp} pre-edit-check"
@@ -298,6 +315,89 @@ When the user's task is done, call `attest_session_end`:
 # Recall — SessionStart hook that outputs prior approaches
 # ---------------------------------------------------------------------------
 
+def _merge_auto_learnings(db_path: Path) -> int:
+    """Merge auto-extracted learnings from the sidecar into the real DB.
+
+    Called at SessionStart (recall), before the MCP server acquires the lock.
+    The sidecar is written by the Stop hook and contains JSONL entries with
+    {timestamp, file, description, type}.
+
+    Returns number of learnings merged.
+    """
+    auto_path = DEFAULT_MEMORY_DIR / "auto_learnings.jsonl"
+    if not auto_path.exists():
+        return 0
+
+    try:
+        from attestdb.infrastructure.attest_db import AttestDB
+    except ImportError:
+        return 0
+
+    entries: list[dict] = []
+    try:
+        with open(auto_path) as f:
+            for line in f:
+                try:
+                    entries.append(json.loads(line))
+                except (json.JSONDecodeError, ValueError):
+                    continue
+    except Exception:
+        return 0
+
+    if not entries:
+        # Empty file — clean up
+        auto_path.unlink(missing_ok=True)
+        return 0
+
+    # Open the real DB — MCP server shouldn't be holding the lock yet
+    try:
+        db = AttestDB(str(db_path), embedding_dim=None)
+    except Exception:
+        return 0
+
+    count = 0
+    try:
+        for entry in entries:
+            file_name = entry.get("file", "")
+            description = entry.get("description", "")
+            kind = entry.get("type", "pattern")
+
+            if not file_name or not description:
+                continue
+
+            # Map type to predicate
+            pred_map = {
+                "bug": "had_bug",
+                "fix": "has_fix",
+                "pattern": "has_pattern",
+                "decision": "has_decision",
+                "warning": "has_warning",
+                "tip": "has_tip",
+            }
+            predicate = pred_map.get(kind, "has_pattern")
+
+            try:
+                db.ingest(
+                    subject=file_name,
+                    predicate=predicate,
+                    object=description,
+                    source_id="auto_extraction",
+                    source_type="hook",
+                    confidence=0.6,  # Lower confidence for auto-extracted
+                )
+                count += 1
+            except Exception:
+                continue
+    finally:
+        db.close()
+
+    # Clear the sidecar after successful merge
+    if count > 0:
+        auto_path.unlink(missing_ok=True)
+
+    return count
+
+
 def recall(task: str | None = None, db_path: str | None = None) -> None:
     """Query the memory DB and print context-aware knowledge to stdout.
 
@@ -312,6 +412,9 @@ def recall(task: str | None = None, db_path: str | None = None) -> None:
         from attestdb.infrastructure.attest_db import AttestDB
     except ImportError:
         return
+
+    # Merge any auto-extracted learnings from the previous session's Stop hook
+    _merge_auto_learnings(memory_db)
 
     # Copy the DB file (and WAL if present) to a temp location to avoid
     # fs2 lock conflicts. The MCP server may hold the advisory lock on the
@@ -829,15 +932,186 @@ def post_test_check() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Stop hook — lightweight session summary signal
+# Stop hook — session signal + auto-extraction of learnings
 # ---------------------------------------------------------------------------
 
-def stop_session_summary() -> None:
-    """Stop hook: log a lightweight session signal when Claude finishes responding.
+def _parse_metric_timestamp(ts) -> float:
+    """Parse a metric timestamp (ISO string or epoch float) to epoch float."""
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    if isinstance(ts, str):
+        try:
+            from datetime import datetime, timezone
 
-    Reads JSON from stdin (Claude Code hook format), extracts the project
-    from cwd, gets recently modified files via git, and logs a metric.
-    This is NOT a full session_end — just a fast signal that work happened.
+            dt = datetime.fromisoformat(ts)
+            return dt.timestamp()
+        except (ValueError, TypeError):
+            return 0.0
+    return 0.0
+
+
+def _extract_test_fix_cycles() -> list[dict]:
+    """Scan recent hook metrics for test-fail → test-pass patterns.
+
+    Returns a list of {file, description} dicts for auto-ingestion.
+    A cycle is: post_test_check fired (test failed) on file X, then later
+    post_test_check ran but didn't fire (test passed) on overlapping files.
+    """
+    if not HOOK_METRICS_LOG.exists():
+        return []
+
+    # Read last 200 metrics entries (enough for one session)
+    entries: list[dict] = []
+    try:
+        with open(HOOK_METRICS_LOG) as f:
+            lines = f.readlines()
+        for line in lines[-200:]:
+            try:
+                entries.append(json.loads(line))
+            except (json.JSONDecodeError, ValueError):
+                continue
+    except Exception:
+        return []
+
+    # Find test-fail → test-pass transitions in the current session
+    # (entries within the last 30 minutes)
+    now = time.time()
+    session_cutoff = now - 1800  # 30 minutes
+
+    failures: dict[str, float] = {}  # command → timestamp of failure
+    fixes: list[dict] = []
+
+    for entry in entries:
+        ts = _parse_metric_timestamp(entry.get("timestamp", 0))
+        if ts < session_cutoff:
+            continue
+
+        if entry.get("hook") != "post_test_check":
+            continue
+
+        cmd = entry.get("file", "")
+        if entry.get("fired"):
+            # Test failure detected
+            failures[cmd] = ts
+        elif not entry.get("fired") and failures:
+            # Tests passed — check if we had a prior failure with same/similar cmd
+            for fail_cmd, fail_ts in list(failures.items()):
+                if ts > fail_ts:
+                    # Extract test file names from the pytest command
+                    test_files = _extract_test_files(cmd)
+                    if test_files:
+                        fixes.append({
+                            "file": test_files[0],
+                            "description": (
+                                f"test-fail-fix cycle detected: tests in "
+                                f"{', '.join(test_files)} failed then passed"
+                            ),
+                        })
+                    del failures[fail_cmd]
+                    break
+
+    return fixes
+
+
+def _extract_test_files(command: str) -> list[str]:
+    """Extract test file paths from a pytest command string."""
+    parts = command.split()
+    files: list[str] = []
+    for part in parts:
+        if "test" in part.lower() and part.endswith(".py"):
+            files.append(os.path.basename(part))
+        elif part.startswith("tests/"):
+            files.append(os.path.basename(part))
+    return files
+
+
+def _extract_edit_patterns() -> list[dict]:
+    """Scan recent pre_edit_check metrics for repeatedly edited files.
+
+    If the same file was edited 3+ times in a session, it's worth noting
+    as a hot-spot.
+    """
+    if not HOOK_METRICS_LOG.exists():
+        return []
+
+    now = time.time()
+    session_cutoff = now - 1800
+
+    file_counts: dict[str, int] = {}
+    try:
+        with open(HOOK_METRICS_LOG) as f:
+            for line in f.readlines()[-200:]:
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                ts = _parse_metric_timestamp(entry.get("timestamp", 0))
+                if ts < session_cutoff:
+                    continue
+                if entry.get("hook") == "pre_edit_check":
+                    fname = entry.get("file", "")
+                    if fname:
+                        file_counts[fname] = file_counts.get(fname, 0) + 1
+    except Exception:
+        return []
+
+    patterns: list[dict] = []
+    for fname, count in file_counts.items():
+        if count >= 3:
+            patterns.append({
+                "file": os.path.basename(fname),
+                "description": (
+                    f"hot-spot: {os.path.basename(fname)} was edited "
+                    f"{count} times in this session"
+                ),
+            })
+    return patterns
+
+
+def _auto_ingest_learnings(learnings: list[dict]) -> int:
+    """Ingest auto-extracted learnings into the memory DB.
+
+    Returns count of successfully ingested claims.
+    """
+    if not learnings:
+        return 0
+
+    memory_db = DEFAULT_MEMORY_DB
+    if not memory_db.exists():
+        return 0
+
+    try:
+        from attestdb.infrastructure.attest_db import AttestDB
+    except ImportError:
+        return 0
+
+    # Unlike read-only hooks, the stop hook writes — so it needs the real DB.
+    # But the MCP server might hold the lock. Copy + write + merge back?
+    # Simpler: use a temp copy, write there, and on next recall it merges.
+    # Actually simplest: use a separate "auto-learnings" sidecar file that
+    # recall() checks and merges on next session start.
+    auto_path = DEFAULT_MEMORY_DIR / "auto_learnings.jsonl"
+    try:
+        with open(auto_path, "a") as f:
+            for learning in learnings:
+                entry = {
+                    "timestamp": time.time(),
+                    "file": learning.get("file", ""),
+                    "description": learning.get("description", ""),
+                    "type": learning.get("type", "pattern"),
+                }
+                f.write(json.dumps(entry) + "\n")
+        return len(learnings)
+    except Exception:
+        return 0
+
+
+def stop_session_summary() -> None:
+    """Stop hook: auto-extract learnings and log session signal.
+
+    Fires when Claude Code finishes responding. Reads hook metrics to
+    detect patterns (test-fail-fix cycles, hot-spot files), auto-ingests
+    them as learnings, and logs changed files via git.
     """
     try:
         import subprocess
@@ -851,7 +1125,14 @@ def stop_session_summary() -> None:
 
         _t0 = time.monotonic()
 
-        # Get recently changed files (quick git check)
+        # --- Auto-extract learnings from this session ---
+        learnings: list[dict] = []
+        learnings.extend(_extract_test_fix_cycles())
+        learnings.extend(_extract_edit_patterns())
+
+        n_auto = _auto_ingest_learnings(learnings)
+
+        # --- Get recently changed files (quick git check) ---
         changed_files: list[str] = []
         try:
             result = subprocess.run(
@@ -870,8 +1151,8 @@ def stop_session_summary() -> None:
         _log_hook_metric(
             hook="stop",
             file=json.dumps(changed_files[:20]) if changed_files else "[]",
-            fired=True,
-            n_items=len(changed_files),
+            fired=n_auto > 0,
+            n_items=n_auto,
             latency_ms=_latency_ms,
         )
     except Exception:
@@ -933,6 +1214,297 @@ def metrics() -> None:
         print(f"    Avg items/fire: {avg_items:.1f}")
         print(f"    Avg latency:    {avg_latency:.1f} ms")
         print()
+
+
+# ---------------------------------------------------------------------------
+# Benchmark — quantify the knowledge graph's impact
+# ---------------------------------------------------------------------------
+
+def benchmark(db_path: str | None = None) -> None:
+    """Measure the knowledge graph's impact on coding sessions.
+
+    Computes concrete metrics that answer: "how much does AttestDB help?"
+    """
+    memory_db = Path(db_path) if db_path else DEFAULT_MEMORY_DB
+    if not memory_db.exists():
+        print("No memory database found. Start using attest-mcp to build knowledge.")
+        return
+
+    try:
+        from attestdb.core.vocabulary import (
+            KNOWLEDGE_PREDICATES,
+            KNOWLEDGE_PRIORITY,
+            knowledge_label,
+        )
+        from attestdb.infrastructure.attest_db import AttestDB
+    except ImportError:
+        print("attestdb not installed.")
+        return
+
+    # Open DB (copy to avoid lock)
+    tmp_copy = None
+    tmp_wal = None
+    try:
+        tmp_fd, tmp_copy = tempfile.mkstemp(suffix=".attest")
+        os.close(tmp_fd)
+        shutil.copy2(str(memory_db), tmp_copy)
+        wal_path = str(memory_db) + ".wal"
+        if os.path.exists(wal_path):
+            tmp_wal = tmp_copy + ".wal"
+            shutil.copy2(wal_path, tmp_wal)
+        db = AttestDB(tmp_copy, embedding_dim=None)
+    except Exception as e:
+        print(f"Failed to open memory database: {e}")
+        if tmp_copy and os.path.exists(tmp_copy):
+            os.unlink(tmp_copy)
+        if tmp_wal and os.path.exists(tmp_wal):
+            os.unlink(tmp_wal)
+        return
+
+    try:
+        stats = db.stats()
+        total_claims = stats.get("total_claims", 0)
+        entity_count = stats.get("entity_count", 0)
+
+        # --- 1. Knowledge inventory ---
+        knowledge_claims: dict[str, list] = {}
+        for pred in KNOWLEDGE_PREDICATES:
+            try:
+                claims = db.claims_for_predicate(pred)
+                if claims:
+                    knowledge_claims[pred] = claims
+            except Exception:
+                pass
+
+        total_knowledge = sum(len(v) for v in knowledge_claims.values())
+
+        # Count by priority tier
+        tier_0 = sum(len(knowledge_claims.get(p, []))
+                     for p in ("has_warning", "has_vulnerability"))
+        tier_1 = sum(len(knowledge_claims.get(p, []))
+                     for p in ("has_pattern", "has_decision"))
+        tier_2 = len(knowledge_claims.get("has_tip", []))
+        tier_3 = sum(len(knowledge_claims.get(p, []))
+                     for p in ("had_bug", "has_issue", "failed_on"))
+        tier_4 = sum(len(knowledge_claims.get(p, []))
+                     for p in ("has_fix", "resolved"))
+
+        # --- 2. Coverage map ---
+        # Which files have knowledge vs total entities
+        file_entities: set[str] = set()
+        covered_files: set[str] = set()
+        for entity_dict in db._store.list_entities():
+            eid = entity_dict.get("id", "")
+            etype = entity_dict.get("entity_type", "")
+            if etype == "source_file":
+                file_entities.add(eid)
+                # Check if this file has actionable knowledge
+                for claim in db.claims_for(eid):
+                    if claim.predicate.id in KNOWLEDGE_PREDICATES:
+                        covered_files.add(eid)
+                        break
+
+        # --- 3. Bug/fix resolution rate ---
+        bug_subjects: set[str] = set()
+        fix_subjects: set[str] = set()
+        for c in knowledge_claims.get("had_bug", []):
+            bug_subjects.add(c.subject.id)
+        for c in knowledge_claims.get("has_issue", []):
+            bug_subjects.add(c.subject.id)
+        for c in knowledge_claims.get("has_fix", []):
+            fix_subjects.add(c.subject.id)
+        for c in knowledge_claims.get("resolved", []):
+            fix_subjects.add(c.subject.id)
+
+        resolved = bug_subjects & fix_subjects
+        unresolved = bug_subjects - fix_subjects
+
+        # --- 4. Session outcomes ---
+        try:
+            outcome_claims = db.claims_for_predicate("had_outcome")
+        except Exception:
+            outcome_claims = []
+
+        n_success = sum(1 for c in outcome_claims if "success" in c.object.id)
+        n_partial = sum(1 for c in outcome_claims if "partial" in c.object.id)
+        n_failure = sum(1 for c in outcome_claims if "failure" in c.object.id)
+        n_sessions = len(outcome_claims)
+
+        # --- 5. Hook metrics ---
+        hook_stats: dict[str, dict] = {}
+        if HOOK_METRICS_LOG.exists():
+            with open(HOOK_METRICS_LOG) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    hook = entry.get("hook", "unknown")
+                    h = hook_stats.setdefault(hook, {
+                        "total": 0, "fired": 0, "items": 0,
+                        "latency_sum": 0.0,
+                    })
+                    h["total"] += 1
+                    if entry.get("fired"):
+                        h["fired"] += 1
+                        h["items"] += entry.get("n_items", 0)
+                    h["latency_sum"] += entry.get("latency_ms", 0)
+
+        # --- 6. Recall token efficiency ---
+        # Compare knowledge graph output vs flat MEMORY.md
+        recall_lines = []
+        for pred, claims in sorted(
+            knowledge_claims.items(),
+            key=lambda x: KNOWLEDGE_PRIORITY.get(x[0], 9),
+        ):
+            for c in claims:
+                recall_lines.append(
+                    f"[{knowledge_label(pred)}] {c.subject.id}: {c.object.id}"
+                )
+        recall_text = "\n".join(recall_lines)
+        recall_tokens = len(recall_text.split())  # rough word count
+
+        # Check MEMORY.md size for comparison
+        memory_md_tokens = 0
+        memory_md_path = ""
+        # Search Claude Code's project memory directories
+        claude_projects = Path.home() / ".claude" / "projects"
+        if claude_projects.exists():
+            for candidate in claude_projects.glob("**/MEMORY.md"):
+                try:
+                    tokens = len(candidate.read_text().split())
+                    if tokens > memory_md_tokens:
+                        memory_md_tokens = tokens
+                        memory_md_path = str(candidate)
+                except Exception:
+                    pass
+        # Also check user-level
+        user_memory = Path.home() / ".claude" / "MEMORY.md"
+        if user_memory.exists():
+            try:
+                tokens = len(user_memory.read_text().split())
+                if tokens > memory_md_tokens:
+                    memory_md_tokens = tokens
+                    memory_md_path = str(user_memory)
+            except Exception:
+                pass
+
+        # --- Print report ---
+        print("=" * 60)
+        print("  ATTEST KNOWLEDGE GRAPH BENCHMARK")
+        print("=" * 60)
+        print()
+
+        print(f"  Database: {memory_db}")
+        print(f"  Claims: {total_claims}  |  Entities: {entity_count}")
+        print(f"  Sessions recorded: {n_sessions}")
+        print()
+
+        print("  KNOWLEDGE INVENTORY")
+        print(f"  {'─' * 50}")
+        print(f"  Warnings/vulnerabilities (P0):  {tier_0:>3}")
+        print(f"  Patterns/decisions (P1):        {tier_1:>3}")
+        print(f"  Tips (P2):                      {tier_2:>3}")
+        print(f"  Bugs/issues (P3):               {tier_3:>3}")
+        print(f"  Fixes/resolutions (P4):         {tier_4:>3}")
+        print(f"  {'─' * 50}")
+        print(f"  Total actionable knowledge:     {total_knowledge:>3}")
+        print()
+
+        print("  BUG RESOLUTION")
+        print(f"  {'─' * 50}")
+        if bug_subjects:
+            pct = len(resolved) / len(bug_subjects) * 100
+            print(f"  Files with bugs:     {len(bug_subjects)}")
+            print(f"  Files with fixes:    {len(resolved)}")
+            print(f"  Unresolved:          {len(unresolved)}")
+            print(f"  Resolution rate:     {pct:.0f}%")
+        else:
+            print("  No bugs recorded yet.")
+        print()
+
+        print("  FILE COVERAGE")
+        print(f"  {'─' * 50}")
+        print(f"  Files tracked:       {len(file_entities)}")
+        print(f"  Files with knowledge:{len(covered_files):>3}")
+        if file_entities:
+            pct = len(covered_files) / len(file_entities) * 100
+            print(f"  Coverage rate:       {pct:.0f}%")
+        print()
+
+        print("  SESSION SUCCESS RATE")
+        print(f"  {'─' * 50}")
+        if n_sessions:
+            success_rate = n_success / n_sessions * 100
+            print(f"  Success:  {n_success:>3}  ({success_rate:.0f}%)")
+            print(f"  Partial:  {n_partial:>3}")
+            print(f"  Failure:  {n_failure:>3}")
+        else:
+            print("  No sessions recorded yet.")
+        print()
+
+        print("  HOOK EFFECTIVENESS")
+        print(f"  {'─' * 50}")
+        if hook_stats:
+            for hook, h in sorted(hook_stats.items()):
+                fire_rate = h["fired"] / h["total"] * 100 if h["total"] else 0
+                avg_lat = h["latency_sum"] / h["total"] if h["total"] else 0
+                items_per = h["items"] / h["fired"] if h["fired"] else 0
+                print(f"  {hook}:")
+                print(f"    {h['total']} calls, {h['fired']} fired ({fire_rate:.0f}%), "
+                      f"{items_per:.1f} items/fire, {avg_lat:.1f}ms avg")
+        else:
+            print("  No hook metrics recorded yet.")
+        print()
+
+        print("  TOKEN EFFICIENCY (knowledge graph vs flat file)")
+        print(f"  {'─' * 50}")
+        print(f"  Knowledge graph:  {recall_tokens:>5} tokens "
+              f"({total_knowledge} facts)")
+        if memory_md_tokens:
+            print(f"  MEMORY.md:        {memory_md_tokens:>5} tokens")
+            if recall_tokens > 0:
+                ratio = memory_md_tokens / recall_tokens
+                print(f"  Compression:      {ratio:.1f}x "
+                      f"(graph is {ratio:.1f}x more dense)")
+        else:
+            print(f"  MEMORY.md:        not found")
+        print()
+
+        # --- Value score ---
+        # Composite score: knowledge density × coverage × resolution rate
+        knowledge_per_session = total_knowledge / max(n_sessions, 1)
+        # Normalize density: 10+ facts/session = 100%
+        density_score = min(knowledge_per_session / 10.0, 1.0)
+        coverage_rate = len(covered_files) / max(len(file_entities), 1)
+        resolution_rate = len(resolved) / max(len(bug_subjects), 1)
+        success_rate_f = n_success / max(n_sessions, 1)
+
+        value_score = (
+            density_score * 0.3
+            + coverage_rate * 0.2
+            + resolution_rate * 0.25
+            + success_rate_f * 0.25
+        ) * 100
+
+        print(f"  VALUE SCORE: {value_score:.0f}/100")
+        print(f"  {'─' * 50}")
+        print(f"  Knowledge density: {knowledge_per_session:.1f} facts/session (weight 30%)")
+        print(f"  File coverage:     {coverage_rate * 100:.0f}% (weight 20%)")
+        print(f"  Bug resolution:    {resolution_rate * 100:.0f}% (weight 25%)")
+        print(f"  Session success:   {success_rate_f * 100:.0f}% (weight 25%)")
+        print()
+        print("=" * 60)
+
+    finally:
+        db.close()
+        if tmp_copy and os.path.exists(tmp_copy):
+            os.unlink(tmp_copy)
+        if tmp_wal and os.path.exists(tmp_wal):
+            os.unlink(tmp_wal)
 
 
 # ---------------------------------------------------------------------------
@@ -1047,6 +1619,10 @@ def main():
     # metrics
     sub.add_parser("metrics", help="Show hook instrumentation metrics summary")
 
+    # benchmark
+    p_bench = sub.add_parser("benchmark", help="Quantify knowledge graph impact")
+    p_bench.add_argument("--db", default=str(DEFAULT_MEMORY_DB))
+
     # uninstall
     p_uninstall = sub.add_parser("uninstall", help="Remove Attest from coding tools")
     p_uninstall.add_argument(
@@ -1059,7 +1635,7 @@ def main():
     # This preserves backward compat for: attest-mcp, attest-mcp --transport stdio, etc.
     raw_args = sys.argv[1:]
     mcp_flags = {"--transport", "--host", "--port", "--db", "stdio", "sse", "streamable-http"}
-    subcommands = {"install", "recall", "uninstall", "pre-edit-check", "post-test-check", "stop", "metrics"}
+    subcommands = {"install", "recall", "uninstall", "pre-edit-check", "post-test-check", "stop", "metrics", "benchmark"}
     if not raw_args or (raw_args[0] not in subcommands and raw_args[0] != "-h" and raw_args[0] != "--help"):
         from attestdb.mcp_server import main as mcp_main
         mcp_main()
@@ -1093,6 +1669,9 @@ def main():
 
     elif args.command == "metrics":
         metrics()
+
+    elif args.command == "benchmark":
+        benchmark(db_path=args.db)
 
     elif args.command == "uninstall":
         removed = uninstall(tools=args.tools)
