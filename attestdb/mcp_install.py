@@ -315,6 +315,82 @@ When the user's task is done, call `attest_session_end`:
 # Recall — SessionStart hook that outputs prior approaches
 # ---------------------------------------------------------------------------
 
+def _merge_session_end(db_path: Path) -> bool:
+    """Merge session-end sidecar into the real DB.
+
+    Written by the Stop hook. Contains outcome, summary, files_changed.
+    Produces the same claims as attest_session_end() would.
+    Returns True if merged successfully.
+    """
+    session_end_path = DEFAULT_MEMORY_DIR / "session_end.json"
+    if not session_end_path.exists():
+        return False
+
+    try:
+        with open(session_end_path) as f:
+            data = json.load(f)
+    except Exception:
+        return False
+
+    outcome = data.get("outcome", "success")
+    summary = data.get("summary", "")
+    files_changed = data.get("files_changed", [])
+
+    if not summary:
+        session_end_path.unlink(missing_ok=True)
+        return False
+
+    try:
+        from attestdb.infrastructure.attest_db import AttestDB
+    except ImportError:
+        return False
+
+    try:
+        db = AttestDB(str(db_path), embedding_dim=None)
+    except Exception:
+        return False
+
+    try:
+        import uuid
+
+        sid = f"auto-stop:{uuid.uuid4().hex[:12]}"
+
+        db.ingest(
+            subject=(sid, "tool_session"),
+            predicate=("had_outcome", "had_outcome"),
+            object=(outcome, "outcome_value"),
+            provenance={"source_type": "session_end", "source_id": sid},
+            confidence=0.9,
+            payload={
+                "schema_ref": "session_outcome",
+                "data": {
+                    "outcome": outcome,
+                    "summary": summary,
+                    "files_changed": files_changed,
+                },
+            },
+        )
+
+        # Record files changed so recall can surface them
+        for fname in files_changed[:10]:
+            try:
+                db.ingest(
+                    subject=(sid, "tool_session"),
+                    predicate=("modified_file", "predicate"),
+                    object=(fname, "source_file"),
+                    provenance={"source_type": "session_end", "source_id": sid},
+                    confidence=0.7,
+                )
+            except Exception:
+                continue
+
+    finally:
+        db.close()
+
+    session_end_path.unlink(missing_ok=True)
+    return True
+
+
 def _merge_auto_learnings(db_path: Path) -> int:
     """Merge auto-extracted learnings from the sidecar into the real DB.
 
@@ -413,7 +489,8 @@ def recall(task: str | None = None, db_path: str | None = None) -> None:
     except ImportError:
         return
 
-    # Merge any auto-extracted learnings from the previous session's Stop hook
+    # Merge session-end data and auto-extracted learnings from the Stop hook
+    _merge_session_end(memory_db)
     _merge_auto_learnings(memory_db)
 
     # Copy the DB file (and WAL if present) to a temp location to avoid
@@ -1106,12 +1183,69 @@ def _auto_ingest_learnings(learnings: list[dict]) -> int:
         return 0
 
 
+def _infer_session_outcome() -> str:
+    """Infer session outcome from hook metrics.
+
+    Heuristic: if any post-test-check fired (test failure detected) with no
+    subsequent success, outcome is "partial". If no test failures at all,
+    outcome is "success". If only failures, "failure".
+    """
+    if not HOOK_METRICS_LOG.exists():
+        return "success"  # No data = assume success (lightweight sessions)
+
+    test_failures = 0
+    test_checks = 0
+    try:
+        with open(HOOK_METRICS_LOG) as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if entry.get("hook") == "post-test-check":
+                    test_checks += 1
+                    if entry.get("fired"):
+                        test_failures += 1
+    except Exception:
+        return "success"
+
+    if test_failures == 0:
+        return "success"
+    if test_failures < test_checks:
+        return "success"  # Failures followed by passes = fixed
+    return "partial"
+
+
+def _build_session_summary(
+    learnings: list[dict], changed_files: list[str], outcome: str,
+) -> str:
+    """Build a brief session summary from auto-extracted data."""
+    parts: list[str] = []
+
+    if changed_files:
+        parts.append(f"Modified {len(changed_files)} file(s)")
+
+    bug_count = sum(1 for l in learnings if l.get("type") == "bug")
+    fix_count = sum(1 for l in learnings if l.get("type") == "fix")
+    pattern_count = sum(1 for l in learnings if l.get("type") in ("pattern", "tip"))
+
+    if bug_count or fix_count:
+        parts.append(f"{fix_count} fix(es), {bug_count} bug(s) detected")
+    if pattern_count:
+        parts.append(f"{pattern_count} pattern(s) extracted")
+
+    if not parts:
+        return f"Session ended ({outcome})"
+    return f"{outcome.capitalize()}: {'. '.join(parts)}."
+
+
 def stop_session_summary() -> None:
-    """Stop hook: auto-extract learnings and log session signal.
+    """Stop hook: auto-extract learnings, write session-end sidecar, log signal.
 
     Fires when Claude Code finishes responding. Reads hook metrics to
     detect patterns (test-fail-fix cycles, hot-spot files), auto-ingests
-    them as learnings, and logs changed files via git.
+    them as learnings, writes a session-end sidecar for recall to merge,
+    and logs changed files via git.
     """
     try:
         import subprocess
@@ -1143,6 +1277,25 @@ def stop_session_summary() -> None:
                 changed_files = [
                     f for f in result.stdout.strip().split("\n") if f.strip()
                 ]
+        except Exception:
+            pass
+
+        # --- Write session-end sidecar for recall to merge ---
+        outcome = _infer_session_outcome()
+        summary = _build_session_summary(learnings, changed_files, outcome)
+
+        session_end_path = DEFAULT_MEMORY_DIR / "session_end.json"
+        try:
+            session_data = {
+                "timestamp": time.time(),
+                "outcome": outcome,
+                "summary": summary,
+                "files_changed": changed_files[:20],
+                "learnings_count": n_auto,
+                "cwd": cwd,
+            }
+            with open(session_end_path, "w") as f:
+                json.dump(session_data, f)
         except Exception:
             pass
 

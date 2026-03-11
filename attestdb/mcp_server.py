@@ -2542,7 +2542,19 @@ def main():
         "ATTEST_DB_PATH",
         os.environ.get("SUBSTRATE_DB_PATH", "attest.db"),
     )
-    _db = AttestDB(db_path, embedding_dim=None)
+    # Auto-detect embedding provider: if OPENAI_API_KEY is set, enable embeddings
+    embed_dim = None
+    if os.environ.get("OPENAI_API_KEY"):
+        embed_dim = 768  # text-embedding-3-small default
+
+    _db = AttestDB(db_path, embedding_dim=embed_dim)
+
+    if embed_dim and os.environ.get("OPENAI_API_KEY"):
+        try:
+            _db.configure_embeddings("openai", dimensions=embed_dim)
+            logger.info("Auto-embedding enabled (OpenAI text-embedding-3-small, %d dims)", embed_dim)
+        except Exception as e:
+            logger.warning("Could not configure embeddings: %s", e)
 
     try:
         from attestdb.intelligence.ai_tools_vocabulary import register_ai_tools_vocabulary

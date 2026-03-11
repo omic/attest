@@ -55,6 +55,8 @@ class IngestionPipeline:
         self._strict = strict
         # Optional EntityResolver, set via AttestDB.enable_entity_resolution()
         self._resolver = None
+        # Optional auto-embedding callback: (text) -> list[float]
+        self._embed_fn: callable | None = None
         # Vocabulary caches (invalidated via invalidate_vocab_caches)
         self._valid_entity_types: set[str] | None = None
         self._valid_pred_types: set[str] | None = None
@@ -221,6 +223,14 @@ class IngestionPipeline:
 
         # Rule 13: Embedding dimensionality
         embedding = claim_input.embedding
+        if not embedding and self._embed_fn and self._embedding_dim:
+            # Auto-embed: build text from subject + predicate + object
+            text = f"{claim_input.subject[0]} {claim_input.predicate[0]} {claim_input.object[0]}"
+            try:
+                embedding = self._embed_fn(text)
+            except Exception as e:
+                logger.warning("Auto-embedding failed: %s", e)
+                embedding = None
         if embedding and self._embedding_dim:
             if len(embedding) != self._embedding_dim:
                 raise DimensionalityError(

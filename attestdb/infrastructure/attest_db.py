@@ -193,6 +193,52 @@ class AttestDB:
             self._status_overrides[cid] = new_status
         self._save_status_overrides()
 
+    # --- Embedding provider ---
+
+    def configure_embeddings(self, provider: str = "openai", **kwargs) -> None:
+        """Configure automatic embedding generation on ingest.
+
+        Args:
+            provider: "openai" (uses OPENAI_API_KEY env var) or a callable (text -> list[float])
+            **kwargs: api_key, model, dimensions (for openai provider)
+
+        Example:
+            db.configure_embeddings("openai")  # Uses OPENAI_API_KEY, text-embedding-3-small
+            db.configure_embeddings("openai", model="text-embedding-3-large", dimensions=1536)
+            db.configure_embeddings(provider=my_embed_fn)  # Custom callable
+        """
+        if callable(provider):
+            self._pipeline._embed_fn = provider
+            return
+
+        if provider == "openai":
+            api_key = kwargs.get("api_key") or os.environ.get("OPENAI_API_KEY")
+            if not api_key:
+                raise ValueError(
+                    "OPENAI_API_KEY not set. Pass api_key= or set the environment variable."
+                )
+            model = kwargs.get("model", "text-embedding-3-small")
+            dimensions = kwargs.get("dimensions", self._embedding_dim or 768)
+
+            # Update embedding_dim to match if not set
+            if self._embedding_dim is None:
+                self._embedding_dim = dimensions
+                self._embedding_index = EmbeddingIndex(ndim=dimensions)
+                self._pipeline._embedding_index = self._embedding_index
+                self._pipeline._embedding_dim = dimensions
+
+            def _openai_embed(text: str) -> list[float]:
+                import openai
+                client = openai.OpenAI(api_key=api_key)
+                resp = client.embeddings.create(
+                    input=text, model=model, dimensions=dimensions,
+                )
+                return resp.data[0].embedding
+
+            self._pipeline._embed_fn = _openai_embed
+        else:
+            raise ValueError(f"Unknown embedding provider: {provider!r}. Use 'openai' or a callable.")
+
     # --- Tamper-evident chain ---
 
     @property
