@@ -220,16 +220,17 @@ class AttestDB:
             model = kwargs.get("model", "text-embedding-3-small")
             dimensions = kwargs.get("dimensions", self._embedding_dim or 768)
 
-            # Update embedding_dim to match if not set
-            if self._embedding_dim is None:
+            # Update embedding_dim to match if not set or different
+            if self._embedding_dim is None or self._embedding_dim != dimensions:
                 self._embedding_dim = dimensions
                 self._embedding_index = EmbeddingIndex(ndim=dimensions)
                 self._pipeline._embedding_index = self._embedding_index
                 self._pipeline._embedding_dim = dimensions
 
+            import openai
+            client = openai.OpenAI(api_key=api_key)
+
             def _openai_embed(text: str) -> list[float]:
-                import openai
-                client = openai.OpenAI(api_key=api_key)
                 resp = client.embeddings.create(
                     input=text, model=model, dimensions=dimensions,
                 )
@@ -1323,14 +1324,16 @@ class AttestDB:
 
         entities = self.list_entities()
         content_id_claims: dict[str, list] = {}
+        seen_claim_ids: set[str] = set()
 
         for entity in entities:
             for claim in self.claims_for(entity.id):
                 cid = claim.content_id
                 if cid not in content_id_claims:
                     content_id_claims[cid] = []
-                # Deduplicate by claim_id
-                if not any(c.claim_id == claim.claim_id for c in content_id_claims[cid]):
+                # Deduplicate by claim_id (O(1) set lookup)
+                if claim.claim_id not in seen_claim_ids:
+                    seen_claim_ids.add(claim.claim_id)
                     content_id_claims[cid].append(claim)
 
         corroborated = []
@@ -1727,7 +1730,7 @@ class AttestDB:
         # Session metadata predicates that don't represent real knowledge
         _session_predicates = {
             "awaiting_outcome", "had_outcome", "used_tool",
-            "session_metadata", "has_status",
+            "session_metadata", "produced_by", "confidence_updated",
         }
 
         for entity in entities:

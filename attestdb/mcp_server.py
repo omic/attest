@@ -12,9 +12,12 @@ Environment variables:
 
 import atexit
 import json
+import logging
 import os
 import time
 import uuid
+
+logger = logging.getLogger(__name__)
 from dataclasses import asdict
 from typing import Optional
 
@@ -408,15 +411,25 @@ def attest_ask(question: str, top_k: int = 10) -> str:
     words = [w.strip("?.,!\"'()[]{}:;") for w in question.lower().split()]
     query_terms = [w for w in words if w and len(w) >= 2 and w not in _ASK_STOP_WORDS]
 
-    candidates = _retrieve_candidates(db, " ".join(query_terms), "", "")
+    candidates, sim_scores = _retrieve_candidates(db, " ".join(query_terms), "", "")
 
-    # Sort by knowledge priority (warnings first) then confidence
-    candidates.sort(key=lambda c: knowledge_sort_key(c.predicate.id, c.confidence))
+    # Sort by: semantic similarity (if available) blended with knowledge priority
+    # Similarity boost: claims with high semantic match get promoted within their tier
+    def _sort_key(c):
+        pri_key = knowledge_sort_key(c.predicate.id, c.confidence)
+        sim = sim_scores.get(c.claim_id, 0.0)
+        # pri_key is (priority_tier, -confidence). Inject similarity as a tiebreaker:
+        # within the same priority tier, higher similarity sorts first
+        return (pri_key[0], -sim, pri_key[1])
+
+    candidates.sort(key=_sort_key)
 
     lines = []
     for c in candidates[:top_k]:
         label = knowledge_label(c.predicate.id)
-        lines.append(f"[{label}] {c.subject.id}: {c.object.id} (conf={c.confidence:.2f})")
+        sim = sim_scores.get(c.claim_id)
+        sim_tag = f" sim={sim:.2f}" if sim else ""
+        lines.append(f"[{label}] {c.subject.id}: {c.object.id} (conf={c.confidence:.2f}{sim_tag})")
 
     return json.dumps({
         "answer": "\n".join(lines) if lines else "No relevant claims found.",
@@ -643,13 +656,18 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
-def _retrieve_candidates(db, query: str, context: str, tenant_id: str) -> list:
-    """ISOLATION BOUNDARY for retrieval. Returns Claim objects.
+def _retrieve_candidates(
+    db, query: str, context: str, tenant_id: str,
+) -> tuple[list, dict[str, float]]:
+    """ISOLATION BOUNDARY for retrieval.
 
-    Searches entity names, claim content, AND embedding similarity (when available).
+    Returns (claims, similarity_scores) where similarity_scores maps
+    claim_id → cosine similarity (0-1, higher = more similar). Claims found
+    only via text search have no entry in similarity_scores.
     """
     claims: list = []
     seen: set[str] = set()
+    similarity_scores: dict[str, float] = {}
 
     def _add_claim(claim):
         if claim.claim_id not in seen:
@@ -667,7 +685,10 @@ def _retrieve_candidates(db, query: str, context: str, tenant_id: str) -> list:
         try:
             query_vec = embed_fn(query)
             hits = embed_idx.search(query_vec, top_k=30)
-            semantic_claim_ids = {claim_id for claim_id, _dist in hits}
+            # usearch returns cosine distance (0 = identical); convert to similarity
+            for claim_id, dist in hits:
+                semantic_claim_ids.add(claim_id)
+                similarity_scores[claim_id] = max(0.0, 1.0 - float(dist))
             # Resolve claim_ids to full Claim objects via entity scan
             if semantic_claim_ids:
                 for entity in db.list_entities():
@@ -676,8 +697,8 @@ def _retrieve_candidates(db, query: str, context: str, tenant_id: str) -> list:
                             _add_claim(claim)
                     if not semantic_claim_ids - seen:
                         break  # All hits resolved
-        except Exception:
-            pass  # Embedding search failed — fall through to text search
+        except Exception as e:
+            logger.warning("Embedding search failed: %s", e)
 
     # 2. Entity search: find entities matching query, get their claims
     entities = db.search_entities(query, top_k=20)
@@ -699,10 +720,10 @@ def _retrieve_candidates(db, query: str, context: str, tenant_id: str) -> list:
                     obj = claim.object.id.lower()
                     if any(tok in subj or tok in obj for tok in query_tokens):
                         _add_claim(claim)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Predicate scan failed for %s: %s", pred, e)
 
-    return claims
+    return claims, similarity_scores
 
 
 def _score_approach(confidence: float, outcome: str, age_days: float) -> float:
@@ -945,7 +966,7 @@ def attest_get_prior_approaches(
     db = _get_db()
     now_ns = time.time_ns()
 
-    candidates = _retrieve_candidates(db, problem_description, context, tenant_id)
+    candidates, _sim_scores = _retrieve_candidates(db, problem_description, context, tenant_id)
 
     # Separate into session-linked and direct knowledge claims
     session_approaches: dict[str, dict] = {}
@@ -1226,8 +1247,11 @@ def attest_learned(
     # Auto-link fixes to existing bugs on the same subject
     if insight_type == "fix":
         existing = db.claims_for(subject)
+        already_resolved = {
+            c.object.id for c in existing if c.predicate.id == "resolved"
+        }
         for c in existing:
-            if c.predicate.id == "had_bug":
+            if c.predicate.id == "had_bug" and c.object.id not in already_resolved:
                 db.ingest(
                     subject=(subject, entity_type),
                     predicate=("resolved", "resolved"),

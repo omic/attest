@@ -343,6 +343,8 @@ def _merge_session_end(db_path: Path) -> bool:
     try:
         from attestdb.infrastructure.attest_db import AttestDB
     except ImportError:
+        # Unrecoverable — no point retrying on next session
+        session_end_path.unlink(missing_ok=True)
         return False
 
     try:
@@ -1212,8 +1214,8 @@ def _infer_session_outcome() -> str:
     if test_failures == 0:
         return "success"
     if test_failures < test_checks:
-        return "success"  # Failures followed by passes = fixed
-    return "partial"
+        return "partial"  # Some failures followed by passes
+    return "failure"  # All test checks were failures
 
 
 def _build_session_summary(

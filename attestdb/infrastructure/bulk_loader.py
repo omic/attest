@@ -3874,6 +3874,7 @@ class BulkLoader:
         entities: dict[str, tuple[str, str, str]] = {}
         claim_rows: list[tuple] = []
         skipped = 0
+        total_ingested = 0
 
         def _kg2c_entity_id(curie: str, category: str) -> tuple[str, str] | None:
             """Convert KG2c CURIE to Attest entity ID + type."""
@@ -3993,8 +3994,11 @@ class BulkLoader:
                         "", "[]", "", "", "", timestamp, "active",
                     ))
 
-                    if len(claim_rows) % 5_000_000 == 0:
-                        logger.info("KG2c: %dM edges processed...", len(claim_rows) // 1_000_000)
+                    if len(claim_rows) >= 500_000:
+                        self._ingest_append_direct(entities, claim_rows, timestamp)
+                        total_ingested += len(claim_rows)
+                        logger.info("KG2c: %dK edges ingested so far...", total_ingested // 1_000)
+                        claim_rows.clear()
         else:
             # Fallback: load entire JSON into memory (needs ~4-8GB RAM)
             logger.info("KG2c: loading full JSON (no ijson, needs ~5GB RAM)...")
@@ -4067,26 +4071,29 @@ class BulkLoader:
                     "", "[]", "", "", "", timestamp, "active",
                 ))
 
-                if len(claim_rows) % 5_000_000 == 0:
-                    logger.info("KG2c: %dM edges processed...", len(claim_rows) // 1_000_000)
+                if len(claim_rows) >= 500_000:
+                    self._ingest_append_direct(entities, claim_rows, timestamp)
+                    total_ingested += len(claim_rows)
+                    logger.info("KG2c: %dK edges ingested so far...", total_ingested // 1_000)
+                    claim_rows.clear()
 
             del data  # Free memory
 
         logger.info(
-            "KG2c: %d edges parsed, %d skipped",
-            len(claim_rows), skipped,
+            "KG2c: parsing complete, %d skipped, %d ingested so far",
+            skipped, total_ingested,
         )
 
-        if not claim_rows:
-            return BatchResult(ingested=0)
+        if claim_rows:
+            self._ingest_append_direct(entities, claim_rows, timestamp)
+            total_ingested += len(claim_rows)
 
-        result = self._ingest_append_direct(entities, claim_rows, timestamp)
         elapsed = time.time() - t0
         logger.info(
             "KG2c loaded: %d entities, %d claims in %.1fs",
-            len(entities), len(claim_rows), elapsed,
+            len(entities), total_ingested, elapsed,
         )
-        return result
+        return BatchResult(ingested=total_ingested)
 
     # ---- Monarch KG (multi-source biomedical KG, 15.3M edges) ----
 
