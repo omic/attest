@@ -15,7 +15,7 @@ pub use self::redb::RedbBackend;
 /// Storage backend for RustStore.
 pub enum Backend {
     /// In-memory store with optional file persistence via checkpoint + WAL.
-    InMemory(MemoryBackend),
+    InMemory(Box<MemoryBackend>),
     /// File-backed store using redb B+ trees.
-    File(RedbBackend),
+    File(Box<RedbBackend>),
 }

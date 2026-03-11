@@ -708,9 +708,9 @@ impl RedbBackend {
             Err(_) => return Vec::new(),
         };
         seqs.iter().filter_map(|&seq| {
-            table.get(seq).ok()?.map(|data| {
+            table.get(seq).ok()?.and_then(|data| {
                 bincode::deserialize::<Claim>(data.value()).ok()
-            }).flatten()
+            })
         }).collect()
     }
 
@@ -761,11 +761,9 @@ impl RedbBackend {
         let capacity = table.len().unwrap_or(0) as usize;
         let mut claims = Vec::with_capacity(capacity);
         if let Ok(iter) = table.iter() {
-            for entry in iter {
-                if let Ok((_, v)) = entry {
-                    if let Ok(claim) = bincode::deserialize::<Claim>(v.value()) {
-                        claims.push(claim);
-                    }
+            for (_, v) in iter.flatten() {
+                if let Ok(claim) = bincode::deserialize::<Claim>(v.value()) {
+                    claims.push(claim);
                 }
             }
         }
@@ -958,16 +956,14 @@ impl RedbBackend {
 
         let mut result: HashMap<String, HashSet<String>> = HashMap::new();
         if let Ok(iter) = table.iter() {
-            for entry in iter {
-                if let Ok((k, values)) = entry {
-                    let neighbors: HashSet<String> = values
-                        .filter_map(|v| v.ok().map(|v| v.value().to_string()))
-                        .collect();
-                    if !neighbors.is_empty() {
-                        result.entry(k.value().to_string())
-                            .or_default()
-                            .extend(neighbors);
-                    }
+            for (k, values) in iter.flatten() {
+                let neighbors: HashSet<String> = values
+                    .filter_map(|v| v.ok().map(|v| v.value().to_string()))
+                    .collect();
+                if !neighbors.is_empty() {
+                    result.entry(k.value().to_string())
+                        .or_default()
+                        .extend(neighbors);
                 }
             }
         }
@@ -988,13 +984,9 @@ impl RedbBackend {
 
         let mut seqs = Vec::new();
         if let Ok(range) = table.range(min_ts..=max_ts) {
-            for entry in range {
-                if let Ok((_, values)) = entry {
-                    for v in values {
-                        if let Ok(v) = v {
-                            seqs.push(v.value());
-                        }
-                    }
+            for (_, values) in range.flatten() {
+                for v in values.flatten() {
+                    seqs.push(v.value());
                 }
             }
         }
@@ -1058,10 +1050,8 @@ impl RedbBackend {
         let mut scores: HashMap<String, usize> = HashMap::new();
         for token in &tokens {
             if let Ok(iter) = text_idx.get(token.as_str()) {
-                for v in iter {
-                    if let Ok(v) = v {
-                        *scores.entry(v.value().to_string()).or_insert(0) += 1;
-                    }
+                for v in iter.flatten() {
+                    *scores.entry(v.value().to_string()).or_insert(0) += 1;
                 }
             }
         }

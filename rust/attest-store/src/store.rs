@@ -47,7 +47,7 @@ impl RustStore {
             log::info!("Detected old format database, migrating to redb...");
             let backend = migration::migrate_to_redb(db_path)?;
             return Ok(Self {
-                backend: Backend::File(backend),
+                backend: Backend::File(Box::new(backend)),
                 checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
             });
         }
@@ -55,7 +55,7 @@ impl RustStore {
         // Otherwise → use RedbBackend (handles non-existent, valid redb, and corrupted files)
         let backend = RedbBackend::open(db_path)?;
         Ok(Self {
-            backend: Backend::File(backend),
+            backend: Backend::File(Box::new(backend)),
             checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
         })
     }
@@ -66,7 +66,7 @@ impl RustStore {
     pub fn new_memory_backend(db_path: &str) -> Result<Self, AttestError> {
         let backend = MemoryBackend::open(db_path)?;
         Ok(Self {
-            backend: Backend::InMemory(backend),
+            backend: Backend::InMemory(Box::new(backend)),
             checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
         })
     }
@@ -74,7 +74,7 @@ impl RustStore {
     /// Create a purely in-memory store (no file path, no persistence, no lock, no WAL).
     pub fn in_memory() -> Self {
         Self {
-            backend: Backend::InMemory(MemoryBackend::new_empty()),
+            backend: Backend::InMemory(Box::new(MemoryBackend::new_empty())),
             checkpoint_interval: 0,
         }
     }

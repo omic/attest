@@ -72,6 +72,7 @@ impl Wal {
 
         let mut file = fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&wal_path)?;
@@ -114,7 +115,7 @@ impl Wal {
     pub fn append_claim_no_sync(&mut self, claim: &Claim) -> Result<(), io::Error> {
         let entry = WalEntry::InsertClaim(claim.clone());
         let data = bincode::serialize(&entry)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
         let crc = crc32fast::hash(&data);
 
         // Write: [u32 len][data][u32 crc]
