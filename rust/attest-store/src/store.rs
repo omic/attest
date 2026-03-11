@@ -189,6 +189,22 @@ impl RustStore {
         }
     }
 
+    /// Batch-upsert entities in a single transaction (redb) or loop (in-memory).
+    pub fn upsert_entities_batch(
+        &mut self,
+        entities: &[(String, String, String, HashMap<String, String>)],
+        timestamp: i64,
+    ) {
+        match &mut self.backend {
+            Backend::InMemory(m) => {
+                for (id, etype, display, ext_ids) in entities {
+                    m.upsert_entity(id, etype, display, Some(ext_ids), timestamp);
+                }
+            }
+            Backend::File(r) => r.upsert_entities_batch(entities, timestamp),
+        }
+    }
+
     pub fn get_entity(&self, entity_id: &str) -> Option<EntitySummary> {
         match &self.backend {
             Backend::InMemory(m) => m.get_entity(entity_id),

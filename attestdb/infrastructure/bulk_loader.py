@@ -70,7 +70,7 @@ PHARMGKB_URL = "https://api.pharmgkb.org/v1/download/file/data/relationships.zip
 MONDO_SSSOM_URL = "https://raw.githubusercontent.com/monarch-initiative/mondo/master/src/ontology/mappings/mondo.sssom.tsv"
 
 # Phase 1+2 data sources
-STITCH_URL = "http://stitch.embl.de/download/chemical_protein.links.v5.0/9606.chemical_protein.links.v5.0.tsv.gz"
+STITCH_URL = "http://stitch.embl.de/download/protein_chemical.links.v5.0/9606.protein_chemical.links.v5.0.tsv.gz"
 CTD_CHEM_DISEASE_URL = "https://ctdbase.org/reports/CTD_chemicals_diseases.tsv.gz"
 TISSUES_URL = "https://download.jensenlab.org/human_tissue_knowledge_full.tsv"
 OPEN_TARGETS_ASSOC_URL = "https://ftp.ebi.ac.uk/pub/databases/opentargets/platform/latest/output/associationByOverallDirect/"
@@ -4371,6 +4371,7 @@ class BulkLoader:
         entities: dict[str, tuple[str, str, str]] = {}
         claim_rows: list[tuple] = []
         skipped = 0
+        total_ingested = 0
 
         def _pbn_entity_id(identifier: str, label: str, name: str) -> tuple[str, str, str] | None:
             """Convert PharMeBINet node to (attest_id, entity_type, display_name)."""
@@ -4476,21 +4477,28 @@ class BulkLoader:
                 if len(claim_rows) % 2_000_000 == 0:
                     logger.info("PharMeBINet: %dM edges processed...", len(claim_rows) // 1_000_000)
 
+                # Flush periodically to limit peak memory (~500K rows ≈ 500MB)
+                if len(claim_rows) >= 500_000:
+                    self._ingest_append_direct(entities, claim_rows, timestamp)
+                    total_ingested += len(claim_rows)
+                    claim_rows.clear()
+
         logger.info(
-            "PharMeBINet: %d edges parsed, %d skipped",
-            len(claim_rows), skipped,
+            "PharMeBINet: %d edges parsed (total), %d skipped",
+            total_ingested + len(claim_rows), skipped,
         )
 
-        if not claim_rows:
-            return BatchResult(ingested=0)
+        # Flush remaining
+        if claim_rows:
+            self._ingest_append_direct(entities, claim_rows, timestamp)
+            total_ingested += len(claim_rows)
 
-        result = self._ingest_append_direct(entities, claim_rows, timestamp)
         elapsed = time.time() - t0
         logger.info(
             "PharMeBINet loaded: %d entities, %d claims in %.1fs",
-            len(entities), len(claim_rows), elapsed,
+            len(entities), total_ingested, elapsed,
         )
-        return result
+        return BatchResult(ingested=total_ingested)
 
     def _ingest_append_direct(
         self,
@@ -4506,9 +4514,16 @@ class BulkLoader:
         store = self._pipeline._store
 
         # Fast path: batch insert entirely in Rust (release GIL for Phase 2)
+        # Chunk to limit dirty page memory in redb and PyO3 transfer size.
         if hasattr(store, "insert_bulk"):
-            ingested = store.insert_bulk(entities, claim_rows, timestamp)
-            return BatchResult(ingested=ingested)
+            CHUNK = 500_000
+            total = 0
+            for i in range(0, len(claim_rows), CHUNK):
+                chunk = claim_rows[i:i + CHUNK]
+                total += store.insert_bulk(entities, chunk, timestamp)
+                if i + CHUNK < len(claim_rows):
+                    logger.info("  bulk insert progress: %d/%d", i + CHUNK, len(claim_rows))
+            return BatchResult(ingested=total)
 
         # Slow path: per-claim Python→Rust insertion
         from attestdb.core.types import (

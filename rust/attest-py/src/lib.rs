@@ -624,10 +624,8 @@ impl PyRustStore {
         }
 
         // Phase 2: Insert in Rust (GIL held — mutation must be single-threaded)
-        // Upsert all entities
-        for (id, etype, display, ext_ids) in &entity_vec {
-            self.inner.upsert_entity(id, etype, display, Some(ext_ids), timestamp);
-        }
+        // Upsert all entities in a single transaction (batched)
+        self.inner.upsert_entities_batch(&entity_vec, timestamp);
 
         // Build all Claim structs
         let claims: Vec<Claim> = rows

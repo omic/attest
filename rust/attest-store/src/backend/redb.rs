@@ -356,6 +356,80 @@ impl RedbBackend {
         let _ = txn.commit();
     }
 
+    /// Upsert multiple entities in a single write transaction.
+    pub fn upsert_entities_batch(
+        &mut self,
+        entities: &[(String, String, String, HashMap<String, String>)],
+        timestamp: i64,
+    ) {
+        if entities.is_empty() {
+            return;
+        }
+        let txn = match self.write_txn() {
+            Ok(t) => t,
+            Err(e) => { log::warn!("upsert_entities_batch: {e}"); return; }
+        };
+
+        let mut entities_table = match txn.open_table(ENTITIES) {
+            Ok(t) => t,
+            Err(e) => { log::warn!("upsert_entities_batch open: {e}"); return; }
+        };
+        let mut type_idx = txn.open_multimap_table(ENTITY_TYPE_IDX).ok();
+        let mut text_idx = txn.open_multimap_table(TEXT_IDX).ok();
+
+        for (entity_id, entity_type, display_name, external_ids) in entities {
+            let existing: Option<EntityData> = entities_table.get(entity_id.as_str()).ok().flatten()
+                .and_then(|data| bincode::deserialize(data.value()).ok());
+
+            if let Some(mut entity) = existing {
+                if !external_ids.is_empty() {
+                    for (k, v) in external_ids {
+                        entity.external_ids.insert(k.clone(), v.clone());
+                    }
+                    if let Ok(bytes) = bincode::serialize(&entity) {
+                        let _ = entities_table.insert(entity_id.as_str(), bytes.as_slice());
+                    }
+                }
+                continue;
+            }
+
+            let display = if display_name.is_empty() {
+                entity_id.as_str()
+            } else {
+                display_name.as_str()
+            };
+
+            let data = EntityData {
+                id: entity_id.clone(),
+                entity_type: entity_type.clone(),
+                display_name: display.to_string(),
+                external_ids: external_ids.clone(),
+                created_at: timestamp,
+            };
+            if let Ok(bytes) = bincode::serialize(&data) {
+                let _ = entities_table.insert(entity_id.as_str(), bytes.as_slice());
+            }
+
+            if let Some(ref mut idx) = type_idx {
+                let _ = idx.insert(entity_type.as_str(), entity_id.as_str());
+            }
+            if let Some(ref mut idx) = text_idx {
+                let mut seen = HashSet::new();
+                for token in tokenize(display).into_iter().chain(tokenize(entity_id)) {
+                    if seen.insert(token.clone()) {
+                        let _ = idx.insert(token.as_str(), entity_id.as_str());
+                    }
+                }
+            }
+            let _ = Self::increment_counter(&txn, ENTITY_TYPE_COUNTS, entity_type);
+        }
+
+        drop(entities_table);
+        drop(type_idx);
+        drop(text_idx);
+        let _ = txn.commit();
+    }
+
     pub fn get_entity(&self, entity_id: &str) -> Option<EntitySummary> {
         let txn = self.read_txn().ok()?;
         let entities = txn.open_table(ENTITIES).ok()?;

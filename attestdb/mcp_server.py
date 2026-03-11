@@ -1090,13 +1090,19 @@ def attest_learned(
     Args:
         subject: What it's about — file path, module name, concept, tool name
         insight: What you learned, in plain English
-        insight_type: One of: bug, fix, pattern, decision, warning, tip, negative_result
+        insight_type: One of: bug, fix, pattern, decision, warning, tip, negative_result,
+                      goal, strategy, architecture, trade_off, convention, dependency, requirement
         confidence: How confident you are (0.0-1.0, default 0.8)
 
     Examples:
         attest_learned("cursor.py", "batch triage fallback was calling per-claim LLM", "bug")
         attest_learned("normalization", "must strip Unicode Cf chars in both Python and Rust", "pattern")
         attest_learned("serde_json::Value", "can't use with bincode — calls deserialize_any", "warning")
+        attest_learned("attestdb", "become the default memory layer for coding agents", "goal")
+        attest_learned("ingestion pipeline", "validate before persist — never mix side effects", "architecture")
+        attest_learned("RustStore", "single-writer with fs2 advisory locks", "convention")
+        attest_learned("embedding_index", "depends on usearch for HNSW", "dependency")
+        attest_learned("ClaimInput vs positional args", "ClaimInput cleaner but must keep backward compat", "trade_off")
     """
     db = _get_db()
 
@@ -1109,14 +1115,29 @@ def attest_learned(
         "warning": "has_warning",
         "tip": "has_tip",
         "negative_result": "no_evidence_for",
+        "goal": "has_goal",
+        "strategy": "has_strategy",
+        "architecture": "has_architecture",
+        "trade_off": "has_trade_off",
+        "convention": "has_convention",
+        "dependency": "depends_on",
+        "requirement": "has_requirement",
     }
     predicate = type_to_predicate.get(insight_type, "has_pattern")
 
     # Auto-detect entity type from subject
-    if "/" in subject or subject.endswith(".py") or subject.endswith(".rs") or subject.endswith(".ts"):
+    if "/" in subject or subject.endswith((".py", ".rs", ".ts", ".js", ".go")):
         entity_type = "source_file"
     elif subject.endswith("()") or "::" in subject:
         entity_type = "function"
+    elif any(kw in subject.lower() for kw in ("api", "endpoint", "route")):
+        entity_type = "api"
+    elif any(kw in subject.lower() for kw in ("service", "server", "worker")):
+        entity_type = "service"
+    elif insight_type == "goal":
+        entity_type = "goal"
+    elif insight_type in ("architecture", "convention", "strategy"):
+        entity_type = "system"
     else:
         entity_type = "concept"
 
@@ -1386,6 +1407,472 @@ def attest_research_context(entity_or_topic: str) -> str:
 
     header = f"# Research context: {entity_or_topic}\n"
     return header + "\n\n".join(sections)
+
+
+# ---------------------------------------------------------------------------
+# Visualization tools (2)
+# ---------------------------------------------------------------------------
+
+
+def _bar(value: float, max_val: float, width: int = 20) -> str:
+    """Render a Unicode bar chart segment."""
+    if max_val <= 0:
+        return " " * width
+    filled = int(round(value / max_val * width))
+    filled = min(filled, width)
+    return "\u2588" * filled + "\u2591" * (width - filled)
+
+
+def _health_indicator(value: float, thresholds: tuple) -> str:
+    """Return a status indicator based on thresholds (bad, ok, good)."""
+    bad, good = thresholds
+    if value >= good:
+        return "[OK]"
+    elif value >= bad:
+        return "[~~]"
+    else:
+        return "[!!]"
+
+
+def _sparkline(values: list[float]) -> str:
+    """Render a sparkline from a list of values."""
+    if not values:
+        return ""
+    blocks = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
+    mn, mx = min(values), max(values)
+    rng = mx - mn if mx != mn else 1
+    return "".join(blocks[min(int((v - mn) / rng * 7), 7)] for v in values)
+
+
+@mcp.tool()
+def attest_dashboard() -> str:
+    """Visual dashboard of knowledge graph health, gaps, and development trajectory.
+
+    Returns a rich Unicode text visualization showing:
+    - Health score with component breakdown
+    - Entity type distribution (bar chart)
+    - Source diversity
+    - Confidence distribution
+    - Identified gaps and recommendations
+
+    Use this to answer "what should we develop next?" and "where are the gaps?"
+    """
+    _track_tool_call("attest_dashboard", "")
+    db = _get_db()
+
+    health = db.knowledge_health()
+    st = db.stats()
+    blindspots = db.blindspots(min_claims=2)
+
+    lines = []
+    W = 58
+
+    # Header
+    lines.append("\u2554" + "\u2550" * W + "\u2557")
+    lines.append("\u2551" + "  ATTEST KNOWLEDGE DASHBOARD".ljust(W) + "\u2551")
+    lines.append("\u2560" + "\u2550" * W + "\u2563")
+
+    # Health score
+    score = health.health_score
+    score_bar = _bar(score, 100, 30)
+    lines.append("\u2551" + f"  Health Score: {score_bar} {score:.0f}/100".ljust(W) + "\u2551")
+    lines.append("\u2551" + f"  Claims: {health.total_claims:<6} Entities: {health.total_entities:<6} Sources: {health.source_diversity}".ljust(W) + "\u2551")
+    lines.append("\u2551" + " " * W + "\u2551")
+
+    # Component scores
+    lines.append("\u2551" + "  COMPONENT SCORES".ljust(W) + "\u2551")
+    components = [
+        ("Confidence", health.avg_confidence, (0.5, 0.8)),
+        ("Freshness", health.freshness_score, (0.3, 0.7)),
+        ("Corroboration", health.corroboration_ratio, (0.1, 0.3)),
+        ("Multi-source", health.multi_source_ratio, (0.2, 0.5)),
+        ("Density", min(health.knowledge_density / 5.0, 1.0), (0.3, 0.6)),
+    ]
+    for name, val, thresh in components:
+        bar = _bar(val, 1.0, 15)
+        ind = _health_indicator(val, thresh)
+        lines.append("\u2551" + f"  {name:<14} {bar} {val:.2f} {ind}".ljust(W) + "\u2551")
+
+    lines.append("\u2551" + " " * W + "\u2551")
+
+    # Entity type distribution
+    entity_types = st.get("entity_types", {})
+    if entity_types:
+        lines.append("\u2551" + "  ENTITY DISTRIBUTION".ljust(W) + "\u2551")
+        sorted_types = sorted(entity_types.items(), key=lambda x: x[1], reverse=True)
+        max_count = max(entity_types.values()) if entity_types else 1
+        for etype, count in sorted_types[:8]:
+            bar = _bar(count, max_count, 15)
+            lines.append("\u2551" + f"  {etype:<16} {bar} {count}".ljust(W) + "\u2551")
+        lines.append("\u2551" + " " * W + "\u2551")
+
+    # Source type distribution
+    source_types = st.get("source_types", {})
+    if source_types:
+        lines.append("\u2551" + "  SOURCE DISTRIBUTION".ljust(W) + "\u2551")
+        sorted_sources = sorted(source_types.items(), key=lambda x: x[1], reverse=True)
+        max_src = max(source_types.values()) if source_types else 1
+        for stype, count in sorted_sources[:6]:
+            bar = _bar(count, max_src, 15)
+            lines.append("\u2551" + f"  {stype:<16} {bar} {count}".ljust(W) + "\u2551")
+        lines.append("\u2551" + " " * W + "\u2551")
+
+    # Knowledge composition — strategic vs operational
+    from attestdb.core.vocabulary import KNOWLEDGE_PRIORITY
+
+    strategic_preds = {p for p, tier in KNOWLEDGE_PRIORITY.items() if tier <= 2}
+    operational_preds = {p for p, tier in KNOWLEDGE_PRIORITY.items() if 3 <= tier <= 5}
+    n_strategic = 0
+    n_operational = 0
+    n_session = 0
+    pred_types = st.get("predicate_types", {})
+    # Count by scanning claims for predicate distribution
+    entities = db.list_entities()
+    pred_counts: dict[str, int] = {}
+    for entity in entities[:100]:
+        for claim in db.claims_for(entity.id):
+            pid = claim.predicate.id
+            pred_counts[pid] = pred_counts.get(pid, 0) + 1
+    for pid, cnt in pred_counts.items():
+        if pid in strategic_preds:
+            n_strategic += cnt
+        elif pid in operational_preds:
+            n_operational += cnt
+        elif pid in {"had_outcome", "produced_by", "has_next_steps", "has_status"}:
+            n_session += cnt
+
+    total_knowledge = n_strategic + n_operational + n_session or 1
+    lines.append("\u2551" + "  KNOWLEDGE COMPOSITION".ljust(W) + "\u2551")
+    s_bar = _bar(n_strategic, total_knowledge, 12)
+    o_bar = _bar(n_operational, total_knowledge, 12)
+    m_bar = _bar(n_session, total_knowledge, 12)
+    lines.append("\u2551" + f"  Strategic    {s_bar} {n_strategic:>3} (goals/arch/decisions)".ljust(W) + "\u2551")
+    lines.append("\u2551" + f"  Operational  {o_bar} {n_operational:>3} (bugs/fixes)".ljust(W) + "\u2551")
+    lines.append("\u2551" + f"  Session      {m_bar} {n_session:>3} (outcomes/status)".ljust(W) + "\u2551")
+
+    if n_strategic == 0 and health.total_claims > 10:
+        lines.append("\u2551" + "  [!!] No strategic knowledge recorded yet".ljust(W) + "\u2551")
+    elif n_strategic < n_operational * 0.3 and n_operational > 5:
+        lines.append("\u2551" + "  [~~] Mostly operational — add goals/architecture".ljust(W) + "\u2551")
+
+    lines.append("\u2551" + " " * W + "\u2551")
+
+    # Confidence trend
+    trend_dir = "\u2191" if health.confidence_trend > 0 else ("\u2193" if health.confidence_trend < 0 else "\u2192")
+    lines.append("\u2551" + f"  CONFIDENCE  avg: {health.avg_confidence:.2f}  trend: {trend_dir} {health.confidence_trend:+.3f}".ljust(W) + "\u2551")
+    lines.append("\u2551" + " " * W + "\u2551")
+
+    # Gaps and recommendations
+    lines.append("\u2551" + "  GAPS & RECOMMENDATIONS".ljust(W) + "\u2551")
+
+    recs = []
+    if health.corroboration_ratio < 0.15:
+        recs.append(("[!!]", f"Low corroboration ({health.corroboration_ratio:.1%} \u2014 target >20%)"))
+    if health.multi_source_ratio < 0.3:
+        recs.append(("[!!]", f"Few multi-source entities ({health.multi_source_ratio:.1%})"))
+    if health.source_diversity < 3:
+        recs.append(("[!!]", f"Low source diversity ({health.source_diversity} types)"))
+    if st.get("embedding_index_size", 0) == 0:
+        recs.append(("[~~]", "No embeddings indexed"))
+    if health.freshness_score > 0.8:
+        recs.append(("[OK]", f"High freshness ({health.freshness_score:.0%})"))
+    if health.avg_confidence > 0.8:
+        recs.append(("[OK]", f"Good confidence ({health.avg_confidence:.2f} avg)"))
+    if health.confidence_trend > 0:
+        recs.append(("[OK]", f"Confidence improving ({health.confidence_trend:+.3f})"))
+
+    # Blindspots
+    if blindspots.single_source_entities:
+        n = len(blindspots.single_source_entities)
+        recs.append(("[!!]", f"{n} single-source entities need corroboration"))
+    if blindspots.low_confidence_areas:
+        n = len(blindspots.low_confidence_areas)
+        recs.append(("[~~]", f"{n} low-confidence areas"))
+    if blindspots.unresolved_warnings:
+        n = len(blindspots.unresolved_warnings)
+        recs.append(("[!!]", f"{n} unresolved warnings/bugs"))
+
+    if not recs:
+        recs.append(("[OK]", "Knowledge graph looks healthy"))
+
+    for indicator, msg in recs:
+        lines.append("\u2551" + f"  {indicator} {msg}"[:W].ljust(W) + "\u2551")
+
+    # Footer with trajectory suggestion
+    lines.append("\u2551" + " " * W + "\u2551")
+
+    # Priority recommendations
+    priorities = []
+    if health.corroboration_ratio < 0.15:
+        priorities.append("Add more sources to existing claims")
+    if blindspots.unresolved_warnings:
+        priorities.append("Fix unresolved warnings/bugs")
+    if blindspots.single_source_entities:
+        top3 = blindspots.single_source_entities[:3]
+        priorities.append(f"Corroborate: {', '.join(top3)}")
+    if health.source_diversity < 4:
+        priorities.append("Diversify ingestion sources")
+    if n_strategic == 0 and health.total_claims > 10:
+        priorities.append("Record goals/architecture/strategy knowledge")
+    elif n_strategic < n_operational * 0.3 and n_operational > 5:
+        priorities.append("Balance: add strategic knowledge (goals, arch)")
+
+    if priorities:
+        lines.append("\u2551" + "  NEXT STEPS".ljust(W) + "\u2551")
+        for i, p in enumerate(priorities[:4], 1):
+            lines.append("\u2551" + f"  {i}. {p}"[:W].ljust(W) + "\u2551")
+
+    lines.append("\u255a" + "\u2550" * W + "\u255d")
+
+    # Auto-generate the interactive graph alongside the dashboard
+    graph_result = json.loads(attest_graph())
+    graph_path = graph_result.get("file", "")
+    n_nodes = graph_result.get("nodes", 0)
+    n_edges = graph_result.get("edges", 0)
+
+    from urllib.parse import quote
+    file_url = "file://" + quote(graph_path, safe="/")
+    lines.append("")
+    lines.append(f"Interactive graph ({n_nodes} entities, {n_edges} relationships):")
+    lines.append(file_url)
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def attest_graph(
+    center_entity: str = "",
+    depth: int = 2,
+    max_nodes: int = 50,
+) -> str:
+    """Generate an interactive HTML knowledge graph visualization.
+
+    Writes an HTML file with an embedded force-directed graph to /tmp/attest_graph.html.
+    Open it in a browser to explore entities, relationships, and confidence levels.
+
+    Args:
+        center_entity: Entity to center the graph on (empty = show all top entities)
+        depth: How many hops from center entity (default: 2)
+        max_nodes: Maximum nodes to include (default: 50)
+    """
+    _track_tool_call("attest_graph", center_entity or "(all)")
+    db = _get_db()
+    import tempfile
+
+    nodes = []
+    edges = []
+    seen_nodes: set[str] = set()
+    seen_edges: set[str] = set()
+
+    def _add_entity(eid: str, etype: str, claim_count: int = 0, is_center: bool = False):
+        if eid in seen_nodes or len(seen_nodes) >= max_nodes:
+            return
+        seen_nodes.add(eid)
+        # Color by entity type
+        colors = {
+            "source_file": "#4fc3f7", "concept": "#81c784", "function": "#ffb74d",
+            "bug": "#ef5350", "fix": "#66bb6a", "warning": "#ffa726",
+            "pattern": "#7e57c2", "decision": "#26c6da", "model": "#ec407a",
+            "gene": "#4db6ac", "disease": "#f06292", "tip": "#9ccc65",
+        }
+        color = colors.get(etype, "#90a4ae")
+        size = 20 + min(claim_count * 3, 40) if not is_center else 40
+        nodes.append({
+            "id": eid, "label": eid[:20], "type": etype,
+            "color": color, "size": size, "claims": claim_count,
+        })
+
+    if center_entity:
+        # Center on a specific entity
+        try:
+            frame = db.query(center_entity, depth=depth)
+            fe = frame.focal_entity
+            _add_entity(fe.id, fe.entity_type, fe.claim_count, is_center=True)
+            for rel in frame.direct_relationships:
+                _add_entity(rel.target.id, rel.target.entity_type, rel.target.claim_count)
+                edge_key = f"{fe.id}-{rel.predicate}-{rel.target.id}"
+                if edge_key not in seen_edges:
+                    seen_edges.add(edge_key)
+                    edges.append({
+                        "from": fe.id, "to": rel.target.id,
+                        "label": rel.predicate, "confidence": rel.confidence,
+                    })
+        except Exception:
+            pass
+    else:
+        # Show top entities by claim count
+        entities = db.list_entities()
+        entities.sort(key=lambda e: e.claim_count, reverse=True)
+        for entity in entities[:max_nodes]:
+            _add_entity(entity.id, entity.entity_type, entity.claim_count)
+
+        # Add edges between known entities
+        for entity in entities[:max_nodes]:
+            if entity.id not in seen_nodes:
+                continue
+            claims = db.claims_for(entity.id)
+            for claim in claims[:20]:
+                if claim.object.id in seen_nodes:
+                    edge_key = f"{entity.id}-{claim.predicate.id}-{claim.object.id}"
+                    if edge_key not in seen_edges:
+                        seen_edges.add(edge_key)
+                        edges.append({
+                            "from": entity.id, "to": claim.object.id,
+                            "label": claim.predicate.id,
+                            "confidence": claim.confidence,
+                        })
+
+    # Generate HTML with inline JS force-directed graph (zero external deps)
+    nodes_json = json.dumps(nodes)
+    edges_json = json.dumps(edges)
+
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Attest Knowledge Graph</title>
+<style>
+body {{ margin:0; background:#1a1a2e; color:#eee; font-family:system-ui; overflow:hidden; }}
+canvas {{ display:block; }}
+#info {{ position:fixed; top:10px; left:10px; background:rgba(0,0,0,0.7); padding:12px; border-radius:8px; font-size:13px; }}
+#tooltip {{ position:fixed; display:none; background:rgba(0,0,0,0.9); color:#fff; padding:8px 12px; border-radius:6px; font-size:12px; pointer-events:none; }}
+#legend {{ position:fixed; bottom:10px; left:10px; background:rgba(0,0,0,0.7); padding:10px; border-radius:8px; font-size:11px; }}
+.legend-item {{ display:flex; align-items:center; margin:2px 0; }}
+.legend-dot {{ width:10px; height:10px; border-radius:50%; margin-right:6px; }}
+</style></head><body>
+<div id="info">{len(nodes)} entities, {len(edges)} relationships</div>
+<div id="tooltip"></div>
+<canvas id="c"></canvas>
+<script>
+const nodes = {nodes_json};
+const edges = {edges_json};
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const tooltip = document.getElementById('tooltip');
+let W, H;
+function resize() {{ W = canvas.width = innerWidth; H = canvas.height = innerHeight; }}
+resize(); addEventListener('resize', resize);
+
+// Initialize positions
+nodes.forEach((n, i) => {{
+    const a = (i / nodes.length) * Math.PI * 2;
+    const r = 150 + Math.random() * 100;
+    n.x = W/2 + Math.cos(a) * r;
+    n.y = H/2 + Math.sin(a) * r;
+    n.vx = 0; n.vy = 0;
+}});
+const nodeMap = Object.fromEntries(nodes.map(n => [n.id, n]));
+
+let dragging = null, mx = 0, my = 0;
+canvas.addEventListener('mousedown', e => {{
+    const n = hitTest(e.offsetX, e.offsetY);
+    if (n) {{ dragging = n; n.fixed = true; }}
+}});
+canvas.addEventListener('mousemove', e => {{
+    mx = e.offsetX; my = e.offsetY;
+    if (dragging) {{ dragging.x = mx; dragging.y = my; }}
+    const n = hitTest(mx, my);
+    if (n) {{
+        tooltip.style.display = 'block';
+        tooltip.style.left = (mx + 15) + 'px';
+        tooltip.style.top = (my - 10) + 'px';
+        tooltip.innerHTML = `<b>${{n.id}}</b><br>Type: ${{n.type}}<br>Claims: ${{n.claims}}`;
+    }} else {{
+        tooltip.style.display = 'none';
+    }}
+}});
+canvas.addEventListener('mouseup', () => {{ if (dragging) dragging.fixed = false; dragging = null; }});
+
+function hitTest(x, y) {{
+    for (const n of nodes) {{
+        const dx = n.x - x, dy = n.y - y;
+        if (dx*dx + dy*dy < (n.size/2+4)**2) return n;
+    }}
+    return null;
+}}
+
+function tick() {{
+    // Repulsion
+    for (let i = 0; i < nodes.length; i++) {{
+        for (let j = i+1; j < nodes.length; j++) {{
+            let dx = nodes[j].x - nodes[i].x, dy = nodes[j].y - nodes[i].y;
+            let d = Math.sqrt(dx*dx + dy*dy) || 1;
+            let f = 800 / (d * d);
+            nodes[i].vx -= dx/d * f; nodes[i].vy -= dy/d * f;
+            nodes[j].vx += dx/d * f; nodes[j].vy += dy/d * f;
+        }}
+    }}
+    // Attraction along edges
+    edges.forEach(e => {{
+        const a = nodeMap[e.from], b = nodeMap[e.to];
+        if (!a || !b) return;
+        let dx = b.x - a.x, dy = b.y - a.y;
+        let d = Math.sqrt(dx*dx + dy*dy) || 1;
+        let f = (d - 120) * 0.01;
+        a.vx += dx/d * f; a.vy += dy/d * f;
+        b.vx -= dx/d * f; b.vy -= dy/d * f;
+    }});
+    // Center gravity
+    nodes.forEach(n => {{
+        n.vx += (W/2 - n.x) * 0.001;
+        n.vy += (H/2 - n.y) * 0.001;
+    }});
+    // Apply velocity
+    nodes.forEach(n => {{
+        if (n.fixed) return;
+        n.vx *= 0.9; n.vy *= 0.9;
+        n.x += n.vx; n.y += n.vy;
+        n.x = Math.max(20, Math.min(W-20, n.x));
+        n.y = Math.max(20, Math.min(H-20, n.y));
+    }});
+}}
+
+function draw() {{
+    ctx.clearRect(0, 0, W, H);
+    // Edges
+    edges.forEach(e => {{
+        const a = nodeMap[e.from], b = nodeMap[e.to];
+        if (!a || !b) return;
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+        ctx.strokeStyle = `rgba(255,255,255,${{e.confidence * 0.4}})`;
+        ctx.lineWidth = 1 + e.confidence;
+        ctx.stroke();
+        // Edge label
+        const mx = (a.x+b.x)/2, my2 = (a.y+b.y)/2;
+        ctx.fillStyle = 'rgba(255,255,255,0.5)';
+        ctx.font = '9px system-ui';
+        ctx.fillText(e.label, mx, my2 - 4);
+    }});
+    // Nodes
+    nodes.forEach(n => {{
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, n.size/2, 0, Math.PI*2);
+        ctx.fillStyle = n.color;
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        // Label
+        ctx.fillStyle = '#fff';
+        ctx.font = '11px system-ui';
+        ctx.textAlign = 'center';
+        ctx.fillText(n.label, n.x, n.y + n.size/2 + 14);
+    }});
+    tick();
+    requestAnimationFrame(draw);
+}}
+draw();
+</script></body></html>"""
+
+    out_path = os.path.join(tempfile.gettempdir(), "attest_graph.html")
+    with open(out_path, "w") as f:
+        f.write(html)
+
+    return json.dumps({
+        "file": out_path,
+        "nodes": len(nodes),
+        "edges": len(edges),
+        "message": f"Graph written to {out_path} — open in browser to explore. "
+                   f"{len(nodes)} entities, {len(edges)} relationships.",
+    })
 
 
 # ---------------------------------------------------------------------------

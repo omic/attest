@@ -131,23 +131,41 @@ KNOWLEDGE_PREDICATES: set[str] = {
     "has_status",
     "had_outcome", "produced_by",
     "has_next_steps",
+    # Strategic predicates
+    "has_goal", "has_strategy", "has_architecture",
+    "has_trade_off", "has_convention", "depends_on",
+    "has_requirement", "supersedes",
 }
 
 # Priority ordering for knowledge predicates (lower = surface first).
 # Warnings and vulnerabilities are most actionable and should always appear
 # before historical bug reports.
 KNOWLEDGE_PRIORITY: dict[str, int] = {
+    # Tier 0: Urgent — surface immediately
     "has_warning": 0,
     "has_vulnerability": 0,
-    "has_pattern": 1,
+    # Tier 1: Strategic — goals, architecture, decisions
+    "has_goal": 1,
+    "has_strategy": 1,
+    "has_architecture": 1,
     "has_decision": 1,
+    "has_pattern": 1,
+    # Tier 2: Constraints — requirements, trade-offs, conventions, dependencies
+    "has_requirement": 2,
+    "has_trade_off": 2,
+    "has_convention": 2,
+    "depends_on": 2,
     "has_tip": 2,
+    # Tier 3: Problem history
     "had_bug": 3,
     "has_issue": 3,
     "failed_on": 3,
+    # Tier 4-5: Resolutions
     "has_fix": 4,
+    "supersedes": 4,
     "resolved": 5,
     "has_status": 5,
+    # Tier 6+: Session metadata
     "had_outcome": 6,
     "produced_by": 7,
     "has_next_steps": 8,
@@ -158,13 +176,21 @@ KNOWLEDGE_PRIORITY: dict[str, int] = {
 KNOWLEDGE_LABEL: dict[str, str] = {
     "has_warning": "warning",
     "has_vulnerability": "vulnerability",
+    "has_goal": "goal",
+    "has_strategy": "strategy",
+    "has_architecture": "architecture",
     "has_pattern": "pattern",
     "has_decision": "decision",
+    "has_requirement": "requirement",
+    "has_trade_off": "trade-off",
+    "has_convention": "convention",
+    "depends_on": "dependency",
     "has_tip": "tip",
     "had_bug": "bug",
     "has_issue": "issue",
     "failed_on": "failed",
     "has_fix": "fix",
+    "supersedes": "supersedes",
     "resolved": "resolved",
     "has_status": "status",
     "had_outcome": "outcome",
