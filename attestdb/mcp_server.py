@@ -646,7 +646,7 @@ def _estimate_tokens(text: str) -> int:
 def _retrieve_candidates(db, query: str, context: str, tenant_id: str) -> list:
     """ISOLATION BOUNDARY for retrieval. Returns Claim objects.
 
-    Searches entity names AND claim content (subject, predicate, object).
+    Searches entity names, claim content, AND embedding similarity (when available).
     """
     claims: list = []
     seen: set[str] = set()
@@ -659,13 +659,33 @@ def _retrieve_candidates(db, query: str, context: str, tenant_id: str) -> list:
             seen.add(claim.claim_id)
             claims.append(claim)
 
-    # 1. Entity search: find entities matching query, get their claims
+    # 1. Semantic search via embedding index (highest quality when available)
+    semantic_claim_ids: set[str] = set()
+    embed_idx = getattr(db, "_embedding_index", None)
+    embed_fn = getattr(getattr(db, "_pipeline", None), "_embed_fn", None)
+    if embed_idx and len(embed_idx) > 0 and embed_fn:
+        try:
+            query_vec = embed_fn(query)
+            hits = embed_idx.search(query_vec, top_k=30)
+            semantic_claim_ids = {claim_id for claim_id, _dist in hits}
+            # Resolve claim_ids to full Claim objects via entity scan
+            if semantic_claim_ids:
+                for entity in db.list_entities():
+                    for claim in db.claims_for(entity.id):
+                        if claim.claim_id in semantic_claim_ids:
+                            _add_claim(claim)
+                    if not semantic_claim_ids - seen:
+                        break  # All hits resolved
+        except Exception:
+            pass  # Embedding search failed — fall through to text search
+
+    # 2. Entity search: find entities matching query, get their claims
     entities = db.search_entities(query, top_k=20)
     for entity in entities:
         for claim in db.claims_for(entity.id):
             _add_claim(claim)
 
-    # 2. Predicate search: scan knowledge predicates for matching claims
+    # 3. Predicate search: scan knowledge predicates for matching claims
     from attestdb.core.vocabulary import KNOWLEDGE_PREDICATES
     knowledge_predicates = KNOWLEDGE_PREDICATES
     query_lower = query.lower()

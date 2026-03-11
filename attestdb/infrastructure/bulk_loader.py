@@ -4149,6 +4149,8 @@ class BulkLoader:
         entities: dict[str, tuple[str, str, str]] = {}
         claim_rows: list[tuple] = []
         skipped = 0
+        total_ingested = 0
+        total_parsed = 0
 
         def _monarch_entity_id(curie: str, category: str, label: str) -> tuple[str, str, str] | None:
             """Convert Monarch CURIE to (attest_id, entity_type, display_name)."""
@@ -4254,6 +4256,7 @@ class BulkLoader:
                 if obj_canonical not in entities:
                     entities[obj_canonical] = (obj_type, obj_name, "{}")
 
+                total_parsed += 1
                 source_id = f"monarch:{source}" if source else "monarch"
                 content_id = compute_content_id(subj_canonical, predicate, obj_canonical)
                 claim_id = compute_claim_id(
@@ -4268,24 +4271,27 @@ class BulkLoader:
                     "", "[]", "", "", "", timestamp, "active",
                 ))
 
-                if len(claim_rows) % 2_000_000 == 0:
-                    logger.info("Monarch KG: %dM edges processed...", len(claim_rows) // 1_000_000)
+                if len(claim_rows) >= 500_000:
+                    self._ingest_append_direct(entities, claim_rows, timestamp)
+                    total_ingested += len(claim_rows)
+                    logger.info("Monarch KG: %dK edges ingested so far...", total_ingested // 1_000)
+                    claim_rows.clear()
 
         logger.info(
-            "Monarch KG: %d edges parsed, %d skipped",
-            len(claim_rows), skipped,
+            "Monarch KG: %d edges parsed, %d skipped, %d ingested so far",
+            total_parsed, skipped, total_ingested,
         )
 
-        if not claim_rows:
-            return BatchResult(ingested=0)
+        if claim_rows:
+            self._ingest_append_direct(entities, claim_rows, timestamp)
+            total_ingested += len(claim_rows)
 
-        result = self._ingest_append_direct(entities, claim_rows, timestamp)
         elapsed = time.time() - t0
         logger.info(
             "Monarch KG loaded: %d entities, %d claims in %.1fs",
-            len(entities), len(claim_rows), elapsed,
+            len(entities), total_ingested, elapsed,
         )
-        return result
+        return BatchResult(ingested=total_ingested)
 
     # ---- PharMeBINet (composite KG, 15.9M edges, 48 sources) ----
 
