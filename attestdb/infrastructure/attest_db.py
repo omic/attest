@@ -422,28 +422,37 @@ class AttestDB:
 
     def ingest(
         self,
-        subject: tuple[str, str],
-        predicate: tuple[str, str],
-        object: tuple[str, str],
-        provenance: dict,
+        subject: "tuple[str, str] | ClaimInput" = None,
+        predicate: tuple[str, str] | None = None,
+        object: tuple[str, str] | None = None,
+        provenance: dict | None = None,
         confidence: float | None = None,
         embedding: list[float] | None = None,
         payload: dict | None = None,
         timestamp: int | None = None,
         external_ids: dict | None = None,
     ) -> str:
-        """Ingest a single claim. Returns claim_id."""
-        ci = ClaimInput(
-            subject=subject,
-            predicate=predicate,
-            object=object,
-            provenance=provenance,
-            confidence=confidence,
-            embedding=embedding,
-            payload=payload,
-            timestamp=timestamp,
-            external_ids=external_ids,
-        )
+        """Ingest a single claim. Returns claim_id.
+
+        Accepts either a ClaimInput object or individual fields::
+
+            db.ingest(claim_input)
+            db.ingest(subject=(...), predicate=(...), object=(...), provenance={...})
+        """
+        if isinstance(subject, ClaimInput):
+            ci = subject
+        else:
+            ci = ClaimInput(
+                subject=subject,
+                predicate=predicate,
+                object=object,
+                provenance=provenance,
+                confidence=confidence,
+                embedding=embedding,
+                payload=payload,
+                timestamp=timestamp,
+                external_ids=external_ids,
+            )
         claim_id = self._pipeline.ingest(ci)
         self._append_chain(claim_id)
         self._flush_chain_log()
@@ -663,6 +672,39 @@ class AttestDB:
         resolver = EntityResolver(self._store, mode="external_ids")
         resolver.build_index()
         return resolver.find_duplicates(min_confidence)
+
+    def auto_merge_duplicates(
+        self, min_confidence: float = 0.95,
+    ) -> dict:
+        """Auto-merge detected duplicate entities above confidence threshold.
+
+        Calls find_duplicate_entities(), ingests same_as claims for each pair.
+        Returns dict with merged_count, skipped_count, claim_ids, merged_pairs.
+        """
+        dupes = self.find_duplicate_entities(min_confidence=min_confidence)
+        merged_count = 0
+        skipped_count = 0
+        claim_ids: list[str] = []
+        merged_pairs: list[tuple[str, str, float]] = []
+
+        for entity_a, entity_b, confidence in dupes:
+            try:
+                claim_id = self.merge_entities(
+                    entity_a, entity_b,
+                    reason=f"auto-merged (confidence={confidence:.3f})",
+                )
+                merged_count += 1
+                claim_ids.append(claim_id)
+                merged_pairs.append((entity_a, entity_b, confidence))
+            except Exception:
+                skipped_count += 1
+
+        return {
+            "merged_count": merged_count,
+            "skipped_count": skipped_count,
+            "claim_ids": claim_ids,
+            "merged_pairs": merged_pairs,
+        }
 
     def search_entities(self, query: str, top_k: int = 10) -> list[EntitySummary]:
         """Search entities by text matching on id and display_name."""

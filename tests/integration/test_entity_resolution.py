@@ -287,3 +287,61 @@ def test_resolve_entity_without_enable(make_db):
     eid, conf = db.resolve_entity("Gene_672")
     assert eid == normalize_entity_id("Gene_672")
     assert conf == 1.0
+
+
+# --- Auto-merge duplicates ---
+
+
+def test_auto_merge_duplicates(make_db):
+    """auto_merge_duplicates finds ext ID collisions and merges via same_as."""
+    db = make_db(embedding_dim=None)
+
+    db.ingest(
+        subject=("P53_HUMAN", "gene"),
+        predicate=("associated_with", "relates_to"),
+        object=("Cancer", "disease"),
+        provenance={"source_type": "lit", "source_id": "PMID:2"},
+        external_ids={"subject": {"uniprot": "P04637"}},
+    )
+    db.ingest(
+        subject=("TP53_ALT", "gene"),
+        predicate=("regulates", "relates_to"),
+        object=("MDM2", "gene"),
+        provenance={"source_type": "lit", "source_id": "PMID:3"},
+        external_ids={"subject": {"uniprot": "P04637"}},
+    )
+
+    db.enable_entity_resolution(mode="external_ids")
+    result = db.auto_merge_duplicates(min_confidence=0.95)
+
+    assert result["merged_count"] == 1
+    assert result["skipped_count"] == 0
+    assert len(result["claim_ids"]) == 1
+
+    # After merge, both resolve to the same canonical
+    r1 = db.resolve(normalize_entity_id("P53_HUMAN"))
+    r2 = db.resolve(normalize_entity_id("TP53_ALT"))
+    assert r1 == r2
+
+
+# --- ClaimInput ingest overload ---
+
+
+def test_ingest_claim_input_directly(make_db):
+    """db.ingest(ClaimInput) works as an alternative to keyword args."""
+    db = make_db(embedding_dim=None)
+
+    ci = ClaimInput(
+        subject=("BRCA1", "gene"),
+        predicate=("associated_with", "relates_to"),
+        object=("Breast Cancer", "disease"),
+        provenance={"source_type": "literature", "source_id": "PMID:1"},
+        confidence=0.9,
+    )
+    claim_id = db.ingest(ci)
+    assert claim_id
+    assert db.stats()["total_claims"] == 1
+
+    frame = db.query("BRCA1", depth=1)
+    assert frame.focal_entity.name == "BRCA1"
+    assert len(frame.direct_relationships) == 1
