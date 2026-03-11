@@ -19,6 +19,7 @@ def _register_vocabs(db, vocabs):
         "bio": ("attestdb.intelligence.bio_vocabulary", "register_bio_vocabulary"),
         "devops": ("attestdb.intelligence.devops_vocabulary", "register_devops_vocabulary"),
         "ml": ("attestdb.intelligence.ml_vocabulary", "register_ml_vocabulary"),
+        "codegen": ("attestdb.intelligence.codegen_vocabulary", "register_codegen_vocabulary"),
     }
     for v in vocabs:
         if v not in _vocab_map:

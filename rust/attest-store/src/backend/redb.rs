@@ -469,48 +469,66 @@ impl RedbBackend {
     }
 
     pub fn insert_claims_batch(&mut self, claims: Vec<Claim>, _checkpoint_interval: u64) -> usize {
-        let txn = match self.write_txn() {
-            Ok(t) => t,
-            Err(_) => return 0,
-        };
+        // Dedup within the batch first (cheap, in-memory)
+        let mut seen = HashSet::new();
+        let unique_claims: Vec<Claim> = claims.into_iter()
+            .filter(|c| seen.insert(c.claim_id.clone()))
+            .collect();
 
-        // Filter new claims: skip duplicates within the batch AND against existing data
-        let new_claims: Vec<Claim> = {
-            let table = match txn.open_table(CLAIM_ID_IDX) {
-                Ok(t) => t,
-                Err(_) => return 0,
-            };
-            let mut seen = HashSet::new();
-            claims.into_iter().filter(|c| {
-                seen.insert(c.claim_id.clone())
-                    && table.get(c.claim_id.as_str()).ok().flatten().is_none()
-            }).collect()
-        };
-
-        if new_claims.is_empty() {
+        if unique_claims.is_empty() {
             return 0;
         }
 
-        let mut inserted = 0usize;
-        let mut seq = self.next_seq;
-        for claim in &new_claims {
-            if self.write_claim_to_txn(&txn, seq, claim).is_ok() {
-                seq += 1;
-                inserted += 1;
+        // Chunk into multiple transactions to limit dirty page memory.
+        // Without chunking, 15M claims in one txn can require 20+ GB of dirty pages,
+        // stalling indefinitely on spinning disks.
+        const CHUNK_SIZE: usize = 100_000;
+        let mut total_inserted = 0usize;
+
+        for chunk in unique_claims.chunks(CHUNK_SIZE) {
+            let txn = match self.write_txn() {
+                Ok(t) => t,
+                Err(_) => break,
+            };
+
+            // Filter against existing data within this transaction
+            let new_in_chunk: Vec<&Claim> = {
+                let table = match txn.open_table(CLAIM_ID_IDX) {
+                    Ok(t) => t,
+                    Err(_) => break,
+                };
+                chunk.iter().filter(|c| {
+                    table.get(c.claim_id.as_str()).ok().flatten().is_none()
+                }).collect()
+            };
+
+            if new_in_chunk.is_empty() {
+                // Drop txn without commit (read-only)
+                continue;
+            }
+
+            let mut seq = self.next_seq;
+            let mut chunk_inserted = 0usize;
+            for claim in &new_in_chunk {
+                if self.write_claim_to_txn(&txn, seq, claim).is_ok() {
+                    seq += 1;
+                    chunk_inserted += 1;
+                }
+            }
+
+            match txn.commit() {
+                Ok(_) => {
+                    self.next_seq = seq;
+                    for claim in &new_in_chunk {
+                        self.apply_alias_predicate(claim);
+                    }
+                    total_inserted += chunk_inserted;
+                }
+                Err(_) => break,
             }
         }
 
-        match txn.commit() {
-            Ok(_) => {
-                self.next_seq = seq;
-                // Apply alias mutations AFTER successful commit
-                for claim in &new_claims {
-                    self.apply_alias_predicate(claim);
-                }
-                inserted
-            }
-            Err(_) => 0,
-        }
+        total_inserted
     }
 
     /// Write a single claim into all tables within an existing write transaction.

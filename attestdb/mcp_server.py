@@ -1389,6 +1389,530 @@ def attest_research_context(entity_or_topic: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Autoresearch tools (3)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def autoresearch_log_experiment(
+    metric_name: str,
+    baseline_value: float,
+    new_value: float,
+    change_description: str,
+    kept: bool,
+    model: str = "",
+    duration_seconds: float = 0.0,
+    tokens_in: int = 0,
+    tokens_out: int = 0,
+) -> str:
+    """Log an autoresearch experiment iteration: what changed, what was measured, keep or revert.
+
+    Use this in autonomous code-generation loops to build a persistent record of
+    what modifications improve or degrade a metric. Future iterations can query
+    past experiments to avoid repeating failures.
+
+    Args:
+        metric_name: The metric being optimized (e.g. "pass_rate", "latency_p99", "accuracy")
+        baseline_value: Metric value before the change
+        new_value: Metric value after the change
+        change_description: What was modified (e.g. "switched to chain-of-thought prompt")
+        kept: Whether the change was kept (True) or reverted (False)
+        model: LLM model used (e.g. "gpt-4o", "claude-sonnet-4-20250514")
+        duration_seconds: Wall-clock time for the experiment
+        tokens_in: Input tokens consumed
+        tokens_out: Output tokens consumed
+    """
+    db = _get_db()
+    sid = _session_tracker["session_id"] if _session_tracker else "manual"
+
+    delta = new_value - baseline_value
+    predicate = "improved_by" if kept and delta > 0 else "degraded_by"
+
+    payload = {
+        "schema_ref": "experiment_result",
+        "data": {
+            "metric_name": metric_name,
+            "baseline_value": baseline_value,
+            "new_value": new_value,
+            "delta": delta,
+            "kept": kept,
+        },
+    }
+    if duration_seconds or tokens_in or tokens_out:
+        payload["data"]["run_metrics"] = {
+            "duration_seconds": duration_seconds,
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+        }
+
+    claim_id = db.ingest(
+        subject=(f"experiment_{sid[:8]}_{int(time.time())}", "experiment_run"),
+        predicate=(predicate, "relates_to"),
+        object=(change_description, "code_pattern"),
+        provenance={"source_type": "experiment_loop", "source_id": sid},
+        confidence=0.95 if kept else 0.6,
+        payload=payload,
+    )
+    _track_claims_ingested(1)
+
+    # Also record the model association if provided
+    if model:
+        db.ingest(
+            subject=(model, "model"),
+            predicate=("benchmarked_at" if kept else "fails_at", "relates_to"),
+            object=(metric_name, "intent_category"),
+            provenance={"source_type": "experiment_loop", "source_id": sid},
+            confidence=0.8,
+            payload={"schema_ref": "quality_score", "data": {
+                "dimension": metric_name, "score": new_value, "method": "autoresearch",
+            }},
+        )
+        _track_claims_ingested(1)
+
+    direction = "+" if delta >= 0 else ""
+    return json.dumps({
+        "claim_id": claim_id,
+        "recorded": f"[{'kept' if kept else 'reverted'}] {change_description}: "
+                    f"{metric_name} {baseline_value} → {new_value} ({direction}{delta:.4f})",
+        "delta": delta,
+        "kept": kept,
+    })
+
+
+@mcp.tool()
+def autoresearch_get_priors(metric_name: str, limit: int = 20) -> str:
+    """Get past experiment results for a metric — what worked and what didn't.
+
+    Use this before starting a new experiment iteration to learn from prior runs.
+    Results are sorted by delta (best improvements first).
+
+    Args:
+        metric_name: The metric to query (e.g. "pass_rate", "accuracy")
+        limit: Maximum number of results to return (default: 20)
+    """
+    _track_tool_call("autoresearch_get_priors", metric_name)
+    db = _get_db()
+
+    # Search for experiment runs related to this metric
+    results = db.search_entities(metric_name, limit=50)
+    experiments = []
+
+    for entity in results:
+        claims = db.claims_for(entity.id)
+        for claim in claims:
+            if claim.predicate.id in ("improved_by", "degraded_by"):
+                payload_data = {}
+                if hasattr(claim, "payload") and claim.payload:
+                    pd = claim.payload if isinstance(claim.payload, dict) else {}
+                    payload_data = pd.get("data", {})
+
+                if payload_data.get("metric_name") == metric_name or not payload_data:
+                    experiments.append({
+                        "change": claim.object.name,
+                        "effect": claim.predicate.id,
+                        "delta": payload_data.get("delta", 0),
+                        "baseline": payload_data.get("baseline_value"),
+                        "new_value": payload_data.get("new_value"),
+                        "kept": payload_data.get("kept", claim.predicate.id == "improved_by"),
+                        "confidence": claim.confidence,
+                        "timestamp": claim.timestamp,
+                    })
+
+    # Sort by absolute delta descending
+    experiments.sort(key=lambda x: abs(x.get("delta", 0)), reverse=True)
+    experiments = experiments[:limit]
+
+    kept_count = sum(1 for e in experiments if e.get("kept"))
+    reverted_count = len(experiments) - kept_count
+
+    return json.dumps({
+        "metric": metric_name,
+        "total_experiments": len(experiments),
+        "kept": kept_count,
+        "reverted": reverted_count,
+        "experiments": experiments,
+        "message": f"{len(experiments)} prior experiments for '{metric_name}': "
+                   f"{kept_count} kept, {reverted_count} reverted",
+    })
+
+
+@mcp.tool()
+def autoresearch_suggest_next(
+    metric_name: str,
+    current_value: float,
+    target_value: float = 0.0,
+) -> str:
+    """Suggest the next experiment based on what has and hasn't worked before.
+
+    Analyzes past experiments to identify patterns: which changes improved the metric,
+    which degraded it, and what hasn't been tried yet. Returns a prioritized list of
+    suggestions.
+
+    Args:
+        metric_name: The metric being optimized
+        current_value: Current metric value
+        target_value: Target metric value (0 = no specific target)
+    """
+    _track_tool_call("autoresearch_suggest_next", metric_name)
+    db = _get_db()
+
+    # Gather past experiments
+    results = db.search_entities(metric_name, limit=50)
+    improvements = []
+    failures = []
+
+    for entity in results:
+        claims = db.claims_for(entity.id)
+        for claim in claims:
+            payload_data = {}
+            if hasattr(claim, "payload") and claim.payload:
+                pd = claim.payload if isinstance(claim.payload, dict) else {}
+                payload_data = pd.get("data", {})
+
+            if claim.predicate.id == "improved_by" and payload_data.get("kept"):
+                improvements.append({
+                    "change": claim.object.name,
+                    "delta": payload_data.get("delta", 0),
+                })
+            elif claim.predicate.id == "degraded_by":
+                failures.append({
+                    "change": claim.object.name,
+                    "delta": payload_data.get("delta", 0),
+                })
+
+    # Check for negative results (dead ends)
+    dead_ends = []
+    neg_results = db.search_entities("no_evidence_for", limit=20)
+    for entity in neg_results:
+        claims = db.claims_for(entity.id)
+        for claim in claims:
+            if claim.predicate.id == "no_evidence_for":
+                dead_ends.append(claim.object.name)
+
+    suggestions = []
+
+    # Suggest scaling up what worked
+    for imp in sorted(improvements, key=lambda x: x["delta"], reverse=True)[:3]:
+        suggestions.append({
+            "action": f"Scale up or iterate on: {imp['change']}",
+            "reason": f"Previously improved {metric_name} by {imp['delta']:.4f}",
+            "priority": "high",
+        })
+
+    # Suggest avoiding what failed
+    avoid_patterns = [f["change"] for f in failures[:5]]
+    if avoid_patterns:
+        suggestions.append({
+            "action": f"Avoid: {'; '.join(avoid_patterns[:3])}",
+            "reason": "These changes degraded the metric in past experiments",
+            "priority": "info",
+        })
+
+    gap = target_value - current_value if target_value else None
+    return json.dumps({
+        "metric": metric_name,
+        "current_value": current_value,
+        "target_value": target_value or "(none)",
+        "gap": gap,
+        "suggestions": suggestions,
+        "improvements_seen": len(improvements),
+        "failures_seen": len(failures),
+        "dead_ends": dead_ends[:5],
+    })
+
+
+# ---------------------------------------------------------------------------
+# OpenClaw tools (5)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def openclaw_ingest_action(
+    agent_id: str,
+    action_type: str,
+    description: str,
+    target: str = "",
+    result: str = "",
+    success: bool = True,
+    metadata: str = "",
+) -> str:
+    """Record an autonomous agent action with full provenance.
+
+    For self-hosted agents (OpenClaw-style) that need to build verified
+    knowledge over time. Every action — code commit, message sent, API call,
+    decision made — becomes a provenanced claim in the knowledge graph.
+
+    Args:
+        agent_id: Unique identifier for the agent instance
+        action_type: Type of action (e.g. "code_commit", "message_sent", "api_call", "decision")
+        description: What the agent did
+        target: What it acted on (repo, channel, endpoint)
+        result: Outcome description
+        success: Whether the action succeeded
+        metadata: JSON string of additional key-value pairs
+    """
+    db = _get_db()
+
+    predicate = "performed" if success else "failed_at"
+    confidence = 0.95 if success else 0.5
+
+    payload_data = {
+        "action_type": action_type,
+        "success": success,
+    }
+    if result:
+        payload_data["result"] = result
+    if metadata:
+        try:
+            payload_data["metadata"] = json.loads(metadata)
+        except json.JSONDecodeError:
+            payload_data["metadata_raw"] = metadata
+
+    target_entity = target or action_type
+    target_type = "code_pattern" if action_type in ("code_commit", "code_review") else "intent"
+
+    claim_id = db.ingest(
+        subject=(agent_id, "model"),
+        predicate=(predicate, "relates_to"),
+        object=(target_entity, target_type),
+        provenance={"source_type": "pipeline_run", "source_id": agent_id},
+        confidence=confidence,
+        payload={"schema_ref": "run_metrics", "data": payload_data},
+    )
+    _track_claims_ingested(1)
+
+    return json.dumps({
+        "claim_id": claim_id,
+        "recorded": f"[{action_type}] {agent_id}: {description}" + (f" → {result}" if result else ""),
+        "success": success,
+    })
+
+
+@mcp.tool()
+def openclaw_query_knowledge(
+    query: str,
+    agent_id: str = "",
+    action_type: str = "",
+    limit: int = 20,
+) -> str:
+    """Query the knowledge graph for an autonomous agent's accumulated knowledge.
+
+    Retrieves actions, learnings, and patterns relevant to a query. Optionally
+    filter by agent_id or action_type.
+
+    Args:
+        query: What to search for (entity name, topic, or keyword)
+        agent_id: Filter to a specific agent's knowledge (optional)
+        action_type: Filter to a specific action type (optional)
+        limit: Maximum results (default: 20)
+    """
+    _track_tool_call("openclaw_query_knowledge", query)
+    db = _get_db()
+
+    results = db.search_entities(query, limit=limit)
+    knowledge = []
+
+    for entity in results:
+        claims = db.claims_for(entity.id)
+        for claim in claims:
+            # Filter by agent_id if specified
+            if agent_id and claim.provenance.source_id != agent_id:
+                continue
+            # Filter by action_type if specified
+            if action_type:
+                payload_data = {}
+                if hasattr(claim, "payload") and claim.payload:
+                    pd = claim.payload if isinstance(claim.payload, dict) else {}
+                    payload_data = pd.get("data", {})
+                if payload_data.get("action_type") != action_type:
+                    continue
+
+            knowledge.append({
+                "subject": claim.subject.name,
+                "predicate": claim.predicate.id,
+                "object": claim.object.name,
+                "confidence": claim.confidence,
+                "source": claim.provenance.source_id,
+                "timestamp": claim.timestamp,
+            })
+
+    knowledge.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+    knowledge = knowledge[:limit]
+
+    return json.dumps({
+        "query": query,
+        "results": len(knowledge),
+        "knowledge": knowledge,
+        "filters": {"agent_id": agent_id or "(all)", "action_type": action_type or "(all)"},
+    })
+
+
+@mcp.tool()
+def openclaw_heartbeat_check(agent_id: str, window_minutes: int = 30) -> str:
+    """Check if an autonomous agent has been active within a time window.
+
+    Used for liveness monitoring — has the agent reported any actions recently?
+    Returns the last action timestamp and a summary of recent activity.
+
+    Args:
+        agent_id: The agent to check
+        window_minutes: How far back to look (default: 30 minutes)
+    """
+    _track_tool_call("openclaw_heartbeat_check", agent_id)
+    db = _get_db()
+
+    cutoff = time.time() - (window_minutes * 60)
+    results = db.search_entities(agent_id, limit=10)
+
+    recent_actions = []
+    last_seen = 0
+
+    for entity in results:
+        claims = db.claims_for(entity.id)
+        for claim in claims:
+            if claim.provenance.source_id == agent_id and claim.timestamp:
+                ts = claim.timestamp
+                if ts > last_seen:
+                    last_seen = ts
+                if ts >= cutoff:
+                    recent_actions.append({
+                        "predicate": claim.predicate.id,
+                        "object": claim.object.name,
+                        "timestamp": ts,
+                    })
+
+    alive = last_seen >= cutoff if last_seen else False
+
+    return json.dumps({
+        "agent_id": agent_id,
+        "alive": alive,
+        "last_seen": last_seen or None,
+        "recent_actions": len(recent_actions),
+        "window_minutes": window_minutes,
+        "actions": recent_actions[:10],
+        "message": f"{agent_id}: {'alive' if alive else 'no heartbeat'}"
+                   + (f" ({len(recent_actions)} actions in last {window_minutes}m)" if alive else ""),
+    })
+
+
+@mcp.tool()
+def openclaw_ingest_conversation(
+    agent_id: str,
+    platform: str,
+    channel: str,
+    message: str,
+    author: str = "",
+    intent: str = "",
+) -> str:
+    """Ingest a conversation message from any platform into the knowledge graph.
+
+    For multi-platform messaging bridge agents that aggregate conversations
+    from Slack, Discord, email, etc. Each message becomes a provenanced claim
+    linking the author/channel to the content/intent.
+
+    Args:
+        agent_id: The agent doing the ingestion
+        platform: Source platform (e.g. "slack", "discord", "email", "matrix")
+        channel: Channel or thread identifier
+        message: The message content (will be stored as the claim object)
+        author: Message author (optional)
+        intent: Detected intent or topic (optional, e.g. "bug_report", "feature_request")
+    """
+    db = _get_db()
+
+    subject_name = f"{platform}/{channel}"
+    if author:
+        subject_name = f"{author}@{platform}/{channel}"
+
+    object_name = intent if intent else message[:200]
+    object_type = "intent" if intent else "concept"
+
+    claim_id = db.ingest(
+        subject=(subject_name, "concept"),
+        predicate=("discussed", "relates_to"),
+        object=(object_name, object_type),
+        provenance={"source_type": "pipeline_run", "source_id": agent_id},
+        confidence=0.7 if not intent else 0.85,
+        payload={"data": {
+            "platform": platform,
+            "channel": channel,
+            "message": message[:2000],
+            "author": author,
+        }},
+    )
+    _track_claims_ingested(1)
+
+    return json.dumps({
+        "claim_id": claim_id,
+        "recorded": f"[{platform}/{channel}] {author or 'unknown'}: {message[:100]}...",
+        "intent": intent or "(not classified)",
+    })
+
+
+@mcp.tool()
+def openclaw_get_preferences(
+    agent_id: str,
+    category: str = "",
+) -> str:
+    """Get learned preferences and patterns for an autonomous agent.
+
+    Aggregates the agent's historical actions to surface patterns: what it does most,
+    what succeeds, what fails, preferred targets and action types.
+
+    Args:
+        agent_id: The agent to profile
+        category: Optional category filter (e.g. "code_commit", "message_sent")
+    """
+    _track_tool_call("openclaw_get_preferences", agent_id)
+    db = _get_db()
+
+    results = db.search_entities(agent_id, limit=20)
+
+    action_counts: dict[str, int] = {}
+    success_counts: dict[str, int] = {}
+    failure_counts: dict[str, int] = {}
+    targets: dict[str, int] = {}
+
+    for entity in results:
+        claims = db.claims_for(entity.id)
+        for claim in claims:
+            if claim.provenance.source_id != agent_id:
+                continue
+
+            payload_data = {}
+            if hasattr(claim, "payload") and claim.payload:
+                pd = claim.payload if isinstance(claim.payload, dict) else {}
+                payload_data = pd.get("data", {})
+
+            action = payload_data.get("action_type", claim.predicate.id)
+            if category and action != category:
+                continue
+
+            action_counts[action] = action_counts.get(action, 0) + 1
+            if claim.predicate.id == "performed":
+                success_counts[action] = success_counts.get(action, 0) + 1
+            elif claim.predicate.id == "failed_at":
+                failure_counts[action] = failure_counts.get(action, 0) + 1
+
+            targets[claim.object.name] = targets.get(claim.object.name, 0) + 1
+
+    top_actions = sorted(action_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+    top_targets = sorted(targets.items(), key=lambda x: x[1], reverse=True)[:10]
+
+    return json.dumps({
+        "agent_id": agent_id,
+        "total_actions": sum(action_counts.values()),
+        "top_actions": [{"action": a, "count": c} for a, c in top_actions],
+        "top_targets": [{"target": t, "count": c} for t, c in top_targets],
+        "success_rate": {
+            action: success_counts.get(action, 0) / max(count, 1)
+            for action, count in action_counts.items()
+        },
+        "category_filter": category or "(all)",
+    })
+
+
+# ---------------------------------------------------------------------------
 # Resources (2)
 # ---------------------------------------------------------------------------
 
@@ -1453,6 +1977,12 @@ def main():
         register_ai_tools_vocabulary(_db)
     except ImportError:
         pass  # AI tools vocabulary requires attestdb-intelligence
+
+    try:
+        from attestdb.intelligence.codegen_vocabulary import register_codegen_vocabulary
+        register_codegen_vocabulary(_db)
+    except ImportError:
+        pass  # Codegen vocabulary requires attestdb-intelligence
 
     _init_session_tracker()
 
