@@ -466,6 +466,54 @@ def attest_consensus(topic: str) -> str:
 
 
 @mcp.tool()
+def attest_corroboration(min_sources: int = 2) -> str:
+    """Report on corroboration status: what's independently confirmed vs single-source.
+
+    Shows which claims have been attested by multiple independent sources (with
+    confidence boost info) and which need corroboration. Use this to understand
+    knowledge reliability and identify where independent confirmation is needed.
+
+    Args:
+        min_sources: Minimum independent sources to count as corroborated (default: 2)
+    """
+    _track_tool_call("attest_corroboration", str(min_sources))
+    db = _get_db()
+    report = db.corroboration_report(min_sources=min_sources)
+
+    lines = []
+    total = report["total_content_ids"]
+    n_corr = report["corroborated_count"]
+    n_single = report["single_source_count"]
+    ratio = report["corroboration_ratio"]
+
+    lines.append(f"## Corroboration Report")
+    lines.append(f"**{n_corr}/{total}** facts corroborated ({ratio:.1%}), "
+                 f"**{n_single}** single-source")
+    lines.append("")
+
+    if report["corroborated"]:
+        lines.append("### Corroborated (independently confirmed)")
+        for c in report["corroborated"][:15]:
+            sources = ", ".join(c["source_types"])
+            lines.append(
+                f"  - {c['subject']} {c['predicate']} {c['object']} "
+                f"({c['n_independent_sources']} sources, {c['confidence_boost']}x boost, "
+                f"via: {sources})"
+            )
+        lines.append("")
+
+    if report["needs_corroboration"]:
+        lines.append("### Needs corroboration (single-source)")
+        for c in report["needs_corroboration"][:15]:
+            lines.append(
+                f"  - {c['subject']} {c['predicate']} {c['object']} "
+                f"(conf={c['confidence']:.2f}, source: {c['source_type']})"
+            )
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
 def attest_fragile(max_sources: int = 1, min_age_days: int = 0) -> str:
     """Find claims backed by few independent sources."""
     db = _get_db()
@@ -1153,14 +1201,51 @@ def attest_learned(
         confidence=confidence,
     )
 
+    extra_claims = 0
+
+    # Auto-link fixes to existing bugs on the same subject
+    if insight_type == "fix":
+        existing = db.claims_for(subject)
+        for c in existing:
+            if c.predicate.id == "had_bug":
+                db.ingest(
+                    subject=(subject, entity_type),
+                    predicate=("resolved", "resolved"),
+                    object=(c.object.id, "error_class"),
+                    provenance={
+                        "source_type": "agent_learning",
+                        "source_id": sid,
+                        "chain": [c.claim_id],
+                    },
+                    confidence=confidence,
+                )
+                extra_claims += 1
+
+    # Auto-generate inverse for dependency relationships
+    if insight_type == "dependency":
+        db.ingest(
+            subject=(insight, "concept"),
+            predicate=("is_dependency_of", "predicate"),
+            object=(subject, entity_type),
+            provenance={
+                "source_type": "agent_learning",
+                "source_id": sid,
+                "chain": [claim_id],
+            },
+            confidence=confidence,
+        )
+        extra_claims += 1
+
+    total_claims = 1 + extra_claims
     if _session_tracker is not None:
         _session_tracker["learnings_recorded"] += 1
-    _track_claims_ingested(1)
+    _track_claims_ingested(total_claims)
 
     return json.dumps({
         "claim_id": claim_id,
         "recorded": f"[{insight_type}] {subject}: {insight}",
         "confidence": confidence,
+        "extra_claims": extra_claims,
     })
 
 
@@ -2215,9 +2300,9 @@ def openclaw_query_knowledge(
                     continue
 
             knowledge.append({
-                "subject": claim.subject.name,
+                "subject": claim.subject.id,
                 "predicate": claim.predicate.id,
-                "object": claim.object.name,
+                "object": claim.object.id,
                 "confidence": claim.confidence,
                 "source": claim.provenance.source_id,
                 "timestamp": claim.timestamp,

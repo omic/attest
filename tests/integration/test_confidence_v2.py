@@ -111,3 +111,42 @@ def test_dependent_sources_grouped(make_db):
 
     # They share upstream parent_claim_id, so count as 1 independent source
     assert count_independent_sources(ccnd1_claims) == 1
+
+
+def test_corroboration_report(make_db):
+    """corroboration_report() identifies corroborated and single-source claims."""
+    db = make_db(embedding_dim=None)
+
+    # Corroborated: 2 independent sources for same fact
+    db.ingest(
+        subject=("BRCA1", "gene"),
+        predicate=("associated_with", "relates_to"),
+        object=("breast_cancer", "disease"),
+        provenance={"source_type": "experimental", "source_id": "lab1"},
+    )
+    db.ingest(
+        subject=("BRCA1", "gene"),
+        predicate=("associated_with", "relates_to"),
+        object=("breast_cancer", "disease"),
+        provenance={"source_type": "database_import", "source_id": "hetionet"},
+    )
+
+    # Single-source
+    db.ingest(
+        subject=("TP53", "gene"),
+        predicate=("inhibits", "relates_to"),
+        object=("MDM2", "gene"),
+        provenance={"source_type": "experimental", "source_id": "lab2"},
+    )
+
+    report = db.corroboration_report(min_sources=2)
+    assert report["corroborated_count"] >= 1
+    assert report["single_source_count"] >= 1
+    assert report["corroboration_ratio"] > 0
+
+    # The BRCA1-breast_cancer fact should be corroborated
+    corr = report["corroborated"]
+    brca_corr = [c for c in corr if c["subject"] == "brca1" and c["object"] == "breast_cancer"]
+    assert len(brca_corr) == 1
+    assert brca_corr[0]["n_independent_sources"] == 2
+    assert brca_corr[0]["confidence_boost"] > 1.0

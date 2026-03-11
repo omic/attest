@@ -1267,6 +1267,66 @@ class AttestDB:
             for d in self._store.claims_by_source_id(source_id)
         ]
 
+    def corroboration_report(self, min_sources: int = 2) -> dict:
+        """Report on corroboration status across the knowledge graph.
+
+        Returns corroborated claims (grouped by content_id) and single-source
+        claims that need independent confirmation.
+        """
+        from attestdb.core.confidence import count_independent_sources, corroboration_boost
+
+        entities = self.list_entities()
+        content_id_claims: dict[str, list] = {}
+
+        for entity in entities:
+            for claim in self.claims_for(entity.id):
+                cid = claim.content_id
+                if cid not in content_id_claims:
+                    content_id_claims[cid] = []
+                # Deduplicate by claim_id
+                if not any(c.claim_id == claim.claim_id for c in content_id_claims[cid]):
+                    content_id_claims[cid].append(claim)
+
+        corroborated = []
+        single_source = []
+
+        for cid, claims in content_id_claims.items():
+            n_indep = count_independent_sources(claims)
+            if n_indep >= min_sources:
+                boost = corroboration_boost(n_indep)
+                corroborated.append({
+                    "content_id": cid,
+                    "subject": claims[0].subject.id,
+                    "predicate": claims[0].predicate.id,
+                    "object": claims[0].object.id,
+                    "n_claims": len(claims),
+                    "n_independent_sources": n_indep,
+                    "confidence_boost": round(boost, 3),
+                    "source_types": list({c.provenance.source_type for c in claims}),
+                })
+            elif len(claims) == 1:
+                single_source.append({
+                    "content_id": cid,
+                    "subject": claims[0].subject.id,
+                    "predicate": claims[0].predicate.id,
+                    "object": claims[0].object.id,
+                    "source_type": claims[0].provenance.source_type,
+                    "confidence": claims[0].confidence,
+                })
+
+        corroborated.sort(key=lambda x: x["n_independent_sources"], reverse=True)
+        single_source.sort(key=lambda x: x["confidence"])
+
+        total = len(content_id_claims)
+        return {
+            "total_content_ids": total,
+            "corroborated_count": len(corroborated),
+            "single_source_count": len(single_source),
+            "corroboration_ratio": len(corroborated) / total if total else 0,
+            "corroborated": corroborated,
+            "needs_corroboration": single_source[:50],
+        }
+
     def claims_for_predicate(self, predicate_id: str) -> list[Claim]:
         """Return all claims with the given predicate id via Rust index (O(k))."""
         return [
@@ -1618,11 +1678,24 @@ class AttestDB:
         chain_lengths: list[int] = []
         multi_source_count = 0
 
+        # Session metadata predicates that don't represent real knowledge
+        _session_predicates = {
+            "awaiting_outcome", "had_outcome", "used_tool",
+            "session_metadata", "has_status",
+        }
+
         for entity in entities:
             claims = self.claims_for(entity.id)
             entity_sources: set[str] = set()
 
             for claim in claims:
+                # Skip session bookkeeping claims from health calculations
+                if (
+                    claim.provenance.source_type in ("session_end", "outcome_report")
+                    or claim.predicate.id in _session_predicates
+                ):
+                    continue
+
                 # Count sources per entity before dedup (shared claims still contribute sources)
                 entity_sources.add(claim.provenance.source_id)
 
