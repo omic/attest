@@ -581,6 +581,158 @@ def complete_task(
 
 
 # ---------------------------------------------------------------------------
+# Phase 2.5 — AttestAgent SDK
+# ---------------------------------------------------------------------------
+
+
+class AttestAgent:
+    """High-level SDK for building research agents on AttestDB.
+
+    Wraps the full agent lifecycle: register, get tasks, research,
+    report findings + negative results, and record session outcomes.
+    """
+
+    def __init__(
+        self,
+        db: "AttestDB",
+        agent_id: str,
+        model: str | None = None,
+        capabilities: list[str] | None = None,
+    ):
+        self.db = db
+        self.agent_id = agent_id
+        self.model = model
+        self.capabilities = capabilities
+        self._entity_id = register_agent(
+            db, agent_id, capabilities=capabilities, model=model
+        )
+
+    def next_task(
+        self,
+        gap_types: list[str] | None = None,
+        entity_types: list[str] | None = None,
+    ) -> tuple[ResearchTask, dict] | None:
+        """Claim the highest-priority task from the queue.
+
+        Returns (task, context) where context is the research context for the
+        task's entity, or None if no tasks are available.
+        """
+        tasks = generate_tasks(
+            self.db, max_tasks=1, gap_types=gap_types, entity_types=entity_types
+        )
+        if not tasks:
+            return None
+        task = tasks[0]
+        claim_task(self.db, self.agent_id, task.entity_id)
+        task.claimed_by = self.agent_id
+        context = get_task_context(self.db, task.entity_id)
+        return task, context
+
+    def report(
+        self,
+        claims: list[ClaimInput],
+        narrative: str | None = None,
+        topic: str | None = None,
+        gaps_discovered: list[str] | None = None,
+    ) -> ResearchResult:
+        """Submit research findings."""
+        return submit_research(
+            self.db,
+            self.agent_id,
+            claims,
+            narrative=narrative,
+            topic=topic,
+            gaps_discovered=gaps_discovered,
+        )
+
+    def report_negative(
+        self,
+        subject: tuple[str, str],
+        hypothesis: tuple[str, str],
+        search_strategy: str | None = None,
+        confidence: float = 0.7,
+    ) -> NegativeResult:
+        """Record a negative result -- something looked for and not found."""
+        return submit_negative_result(
+            self.db,
+            self.agent_id,
+            subject=subject,
+            hypothesis=hypothesis,
+            confidence=confidence,
+            search_strategy=search_strategy,
+        )
+
+    def publish_strategy(
+        self,
+        entity: str,
+        strategy: str,
+        rationale: str | None = None,
+        confidence: float = 0.8,
+    ) -> ResearchResult:
+        """Publish a strategy claim (for curator agents).
+
+        Records a has_strategy claim linking the entity to the strategy,
+        with an optional rationale in the payload.
+        """
+        source_id = f"agent:{self.agent_id}"
+        payload = None
+        if rationale:
+            payload = {
+                "schema_ref": "strategy",
+                "data": {"rationale": rationale},
+            }
+        claims = [
+            ClaimInput(
+                subject=(entity, "entity"),
+                predicate=("has_strategy", "research"),
+                object=(strategy, "strategy"),
+                provenance={"source_id": source_id, "source_type": "agent"},
+                confidence=confidence,
+                payload=payload,
+            )
+        ]
+        return submit_research(self.db, self.agent_id, claims)
+
+    def done(
+        self,
+        outcome: str = "success",
+        summary: str = "",
+        next_steps: str = "",
+    ) -> ResearchResult:
+        """Record session end with outcome metadata."""
+        source_id = f"agent:{self.agent_id}"
+        payload_data: dict = {"outcome": outcome}
+        if summary:
+            payload_data["summary"] = summary
+        if next_steps:
+            payload_data["next_steps"] = next_steps
+
+        claims = [
+            ClaimInput(
+                subject=(f"agent:{self.agent_id}", "agent"),
+                predicate=("has_session_outcome", "agent_meta"),
+                object=(outcome, "outcome"),
+                provenance={"source_id": source_id, "source_type": "agent"},
+                confidence=1.0,
+                payload={
+                    "schema_ref": "session_outcome",
+                    "data": payload_data,
+                },
+            )
+        ]
+        return submit_research(self.db, self.agent_id, claims)
+
+    @property
+    def stats(self) -> AgentInfo | None:
+        """Get this agent's leaderboard stats."""
+        leaderboard = agent_leaderboard(self.db, min_claims=0)
+        for info in leaderboard:
+            if info.agent_id == self.agent_id:
+                return info
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Phase 3 — Federation
 # ---------------------------------------------------------------------------
 
