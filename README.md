@@ -151,12 +151,25 @@ attest-mcp install              # Install MCP for your coding tool
 attest-mcp metrics              # View hook performance metrics
 ```
 
+## Common Errors
+
+**`ProvenanceError`** -- Every claim needs `provenance={"source_type": "...", "source_id": "..."}`. This is by design: claims without provenance can't be verified.
+
+**`ImportError: requires attestdb-enterprise`** -- Methods like `ingest_chat()`, `ingest_text()`, and `connect()` need the enterprise package. Use `db.ingest()` for structured claims without it.
+
+**`ValueError: Unknown vocabulary`** -- Valid vocab names are `bio`, `devops`, `ml`, `ai_tools`, or `all`. Not `biology`.
+
+**`database is locked`** -- Only one process can write to a `.attest` file. Kill stale processes or use `:memory:` for testing.
+
+See `docs/10_getting_started.md` for a full troubleshooting guide.
+
 ## Documentation
 
 See `docs/` for full architecture and design documentation:
 - `docs/02_architecture.md` -- Full technical architecture
 - `docs/06_api_spec.md` -- API contract and validation rules
 - `docs/07_design_decisions.md` -- Critical decisions with rationale
+- `docs/10_getting_started.md` -- Getting started + troubleshooting
 
 ## Running Tests
 

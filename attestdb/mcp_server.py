@@ -138,7 +138,11 @@ def ingest_claim(
     confidence: Optional[float] = None,
     payload: Optional[dict] = None,
 ) -> str:
-    """Add a claim to the knowledge graph. Returns claim_id."""
+    """Add a claim (subject-predicate-object triple) to the knowledge graph.
+
+    Returns the claim_id (SHA-256 hash). Requires all fields — omitting
+    source_type or source_id will raise a ProvenanceError.
+    """
     _track_tool_call("ingest_claim", f"{subject_id} {predicate_id} {object_id}")
     _track_claims_ingested(1)
     db = _get_db()
@@ -154,7 +158,13 @@ def ingest_claim(
 
 @mcp.tool()
 def ingest_text(text: str, source_id: str = "") -> str:
-    """Extract claims from unstructured text and ingest them. Returns extraction results."""
+    """Extract claims from unstructured text and ingest them.
+
+    Returns JSON with n_valid (claims ingested), raw_count, and warnings.
+    May return 0 claims if text has no extractable relationships — this is
+    normal, not an error. Requires attestdb-enterprise for LLM extraction;
+    falls back to heuristic patterns without it.
+    """
     db = _get_db()
     result = db.ingest_text(text, source_id=source_id)
     return json.dumps(result, default=str)
@@ -175,7 +185,13 @@ def _to_pair(val: str | list | tuple, default_type: str = "entity") -> tuple[str
 
 @mcp.tool()
 def ingest_batch(claims: list[dict]) -> str:
-    """Bulk-ingest a list of claims. Each dict needs: subject, predicate, object, provenance."""
+    """Bulk-ingest a list of claims. Returns {ingested, duplicates, errors}.
+
+    Each dict needs: subject, predicate, object, provenance.
+    subject/predicate/object can be a string ("entity_name") or
+    a pair ["entity_name", "entity_type"]. provenance must be a dict
+    with at least {source_type, source_id}.
+    """
     from attestdb.core.types import ClaimInput
 
     db = _get_db()
@@ -201,7 +217,11 @@ def ingest_batch(claims: list[dict]) -> str:
 
 @mcp.tool()
 def query_entity(entity_id: str, depth: int = 1) -> str:
-    """Query the knowledge graph around an entity. Returns narrative + relationships."""
+    """Query the knowledge graph around an entity. Returns narrative + relationships.
+
+    Returns empty relationships if entity_id doesn't exist (not an error).
+    Use search_entities first if you're unsure of the exact entity ID.
+    """
     _track_tool_call("query_entity", entity_id)
     _track_entity_queried(entity_id)
     db = _get_db()
@@ -402,8 +422,8 @@ def attest_ask(question: str, top_k: int = 10) -> str:
                 ],
                 "meta": result.meta,
             })
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Full ask() failed, falling back to text search: %s", e)
 
     # Fallback: text search when ask() returns empty (no LLM / no embeddings)
     from attestdb.core.vocabulary import knowledge_label, knowledge_sort_key
@@ -1144,7 +1164,8 @@ def attest_confidence_trail(
             "net_confidence": round(diff.net_confidence, 4),
             "summary": diff.summary,
         }
-    except Exception:
+    except Exception as e:
+        logger.warning("Failed to compute diff: %s", e)
         diff_summary = {}
 
     result = {
@@ -1826,8 +1847,8 @@ def attest_graph(
                         "from": fe.id, "to": rel.target.id,
                         "label": rel.predicate, "confidence": rel.confidence,
                     })
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Failed to build entity graph for %s: %s", entity_id, e)
     else:
         # Show top entities by claim count
         entities = db.list_entities()

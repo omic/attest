@@ -153,12 +153,16 @@ def install(tools: list[str] | None = None, scope: str = "project") -> list[str]
     for tool_key in targets:
         tool = TOOLS.get(tool_key)
         if not tool:
-            print(f"  Unknown tool: {tool_key}", file=sys.stderr)
+            print(f"  Unknown tool: {tool_key}. Valid options: {sorted(TOOLS.keys())}", file=sys.stderr)
             continue
 
         # Auto-detect: skip tools that aren't installed (unless explicitly requested)
         if tools is None and not tool["detect"]():
             continue
+
+        # When explicitly requested, warn if tool is not installed
+        if tools is not None and not tool["detect"]():
+            print(f"  Warning: {tool['name']} not detected on this system. Installing config anyway.", file=sys.stderr)
 
         config_paths = tool.get("config_paths", {})
         config_path_fn = config_paths.get(scope) or config_paths.get("user") or config_paths.get("project")

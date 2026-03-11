@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 
 import numpy as np
 from usearch.index import Index
 
 from attestdb.core.errors import DimensionalityError
+
+logger = logging.getLogger(__name__)
 
 
 class EmbeddingIndex:
@@ -49,7 +52,8 @@ class EmbeddingIndex:
             return None
         try:
             return np.asarray(self._index.get(key), dtype=np.float32)
-        except Exception:
+        except Exception as e:
+            logger.warning("Failed to retrieve embedding for %s: %s", claim_id, e)
             return None
 
     def search(
