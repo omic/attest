@@ -319,6 +319,27 @@ class AttestDB:
             for d in self._store.all_claims()
         ]
 
+    def iter_claims(self, batch_size: int = 10000):
+        """Yield all claims by paging through the Rust store.
+
+        Generator that fetches ``batch_size`` claims at a time, avoiding
+        materializing the entire claim set in memory.
+        """
+        offset = 0
+        while True:
+            batch = self._store.all_claims(offset, batch_size)
+            if not batch:
+                break
+            for d in batch:
+                yield self._apply_status_overrides(claim_from_dict(d))
+            if len(batch) < batch_size:
+                break
+            offset += batch_size
+
+    def count_claims(self) -> int:
+        """Return the total number of claims without materializing them."""
+        return self._store.count_claims()
+
     # --- Database lifecycle ---
 
     def close(self) -> None:
@@ -647,15 +668,16 @@ class AttestDB:
         offset: int = 0,
         limit: int | None = None,
     ) -> list[EntitySummary]:
-        entities = [
+        # Rust uses limit=0 to mean "no limit"; Python uses None.
+        rust_limit = 0 if limit is None else limit
+        return [
             entity_summary_from_dict(d)
-            for d in self._store.list_entities(entity_type, min_claims)
+            for d in self._store.list_entities(entity_type, min_claims, offset, rust_limit)
         ]
-        if offset:
-            entities = entities[offset:]
-        if limit is not None:
-            entities = entities[:limit]
-        return entities
+
+    def count_entities(self, entity_type: str | None = None, min_claims: int = 0) -> int:
+        """Return the number of entities without materializing them."""
+        return self._store.count_entities(entity_type, min_claims)
 
     # --- Entity resolution ---
 

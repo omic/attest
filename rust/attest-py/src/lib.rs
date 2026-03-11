@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PySet, PyTuple};
 use pyo3::IntoPyObjectExt;
@@ -224,6 +224,27 @@ impl PyRustStore {
         }
     }
 
+    /// Open a database in read-only mode (copies to temp file, no lock conflict).
+    #[staticmethod]
+    fn open_read_only(db_path: &str) -> PyResult<Self> {
+        let inner = RustStore::open_read_only(db_path)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self { inner })
+    }
+
+    /// Compact the database file, reclaiming free pages.
+    /// Returns True if compaction freed any space.
+    fn compact(&mut self) -> PyResult<bool> {
+        self.inner
+            .compact()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Returns True if this store was opened in read-only mode.
+    fn is_read_only(&self) -> bool {
+        self.inner.is_read_only()
+    }
+
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
         // Release the GIL during persistence — serialization + fsync can be slow
         py.allow_threads(|| self.inner.close())
@@ -361,19 +382,30 @@ impl PyRustStore {
         }
     }
 
-    #[pyo3(signature = (entity_type=None, min_claims=0))]
+    #[pyo3(signature = (entity_type=None, min_claims=0, offset=0, limit=0))]
     fn list_entities<'py>(
         &self,
         entity_type: Option<&str>,
         min_claims: usize,
+        offset: usize,
+        limit: usize,
         py: Python<'py>,
     ) -> PyResult<PyObject> {
-        let entities = self.inner.list_entities(entity_type, min_claims);
+        let entities = self.inner.list_entities(entity_type, min_claims, offset, limit);
         let list = PyList::empty(py);
         for es in &entities {
             list.append(entity_summary_to_dict(py, es)?)?;
         }
         Ok(list.into())
+    }
+
+    #[pyo3(signature = (entity_type=None, min_claims=0))]
+    fn count_entities(
+        &self,
+        entity_type: Option<&str>,
+        min_claims: usize,
+    ) -> usize {
+        self.inner.count_entities(entity_type, min_claims)
     }
 
     // ── Claim operations ───────────────────────────────────────────
@@ -424,13 +456,18 @@ impl PyRustStore {
         self.inner.get_claim_provenance_chain(claim_id)
     }
 
-    fn all_claims<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
-        let claims = self.inner.all_claims();
+    #[pyo3(signature = (offset=0, limit=0))]
+    fn all_claims<'py>(&self, offset: usize, limit: usize, py: Python<'py>) -> PyResult<PyObject> {
+        let claims = self.inner.all_claims(offset, limit);
         let list = PyList::empty(py);
         for c in &claims {
             list.append(claim_to_dict(py, c)?)?;
         }
         Ok(list.into())
+    }
+
+    fn count_claims(&self) -> usize {
+        self.inner.count_claims()
     }
 
     fn claims_by_source_id<'py>(

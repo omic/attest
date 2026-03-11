@@ -4,6 +4,7 @@
 //! lives in the backend modules (`backend::memory`, `backend::redb`).
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use attest_core::errors::AttestError;
 use attest_core::types::{Claim, EntitySummary};
@@ -31,6 +32,10 @@ pub struct RustStore {
     backend: Backend,
     /// Auto-checkpoint after this many WAL entries. 0 = disabled.
     checkpoint_interval: u64,
+    /// When true, all write operations return an error.
+    read_only: bool,
+    /// Temp file path for read-only copies (deleted on close).
+    temp_path: Option<PathBuf>,
 }
 
 impl RustStore {
@@ -49,6 +54,8 @@ impl RustStore {
             return Ok(Self {
                 backend: Backend::File(Box::new(backend)),
                 checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
+                read_only: false,
+                temp_path: None,
             });
         }
 
@@ -57,6 +64,8 @@ impl RustStore {
         Ok(Self {
             backend: Backend::File(Box::new(backend)),
             checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
+            read_only: false,
+            temp_path: None,
         })
     }
 
@@ -68,6 +77,8 @@ impl RustStore {
         Ok(Self {
             backend: Backend::InMemory(Box::new(backend)),
             checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
+            read_only: false,
+            temp_path: None,
         })
     }
 
@@ -76,17 +87,74 @@ impl RustStore {
         Self {
             backend: Backend::InMemory(Box::new(MemoryBackend::new_empty())),
             checkpoint_interval: 0,
+            read_only: false,
+            temp_path: None,
         }
+    }
+
+    /// Open a database in read-only mode by copying it to a temp file.
+    ///
+    /// This avoids acquiring the exclusive write lock on the original file,
+    /// allowing MCP hooks and other readers to inspect the database while
+    /// a writer holds the lock on the real file.
+    ///
+    /// All write operations will return an error. On `close()`, the temp
+    /// file is deleted.
+    pub fn open_read_only(db_path: &str) -> Result<Self, AttestError> {
+        let src = std::path::Path::new(db_path);
+        if !src.exists() {
+            return Err(AttestError::Provenance(format!(
+                "database not found: {db_path}"
+            )));
+        }
+
+        // Copy to temp file so we don't contend for the lock
+        let temp_dir = std::env::temp_dir();
+        let temp_file = temp_dir.join(format!(
+            "attest_ro_{}_{}.attest",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::copy(src, &temp_file).map_err(|e| {
+            AttestError::Provenance(format!("failed to copy for read-only: {e}"))
+        })?;
+
+        let temp_path_str = temp_file.to_str().ok_or_else(|| {
+            AttestError::Provenance("invalid temp path".to_string())
+        })?;
+        let backend = RedbBackend::open(temp_path_str)?;
+
+        Ok(Self {
+            backend: Backend::File(Box::new(backend)),
+            checkpoint_interval: 0,
+            read_only: true,
+            temp_path: Some(temp_file),
+        })
+    }
+
+    /// Returns true if this store was opened in read-only mode.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     // ── Lifecycle ──────────────────────────────────────────────────────
 
     /// Persist state and close. Releases the file lock.
+    /// For read-only stores, deletes the temp file.
     pub fn close(&mut self) -> Result<(), AttestError> {
-        match &mut self.backend {
+        let result = match &mut self.backend {
             Backend::InMemory(m) => m.close(),
             Backend::File(r) => r.close(),
+        };
+        // Clean up temp file for read-only copies
+        if let Some(ref temp) = self.temp_path {
+            let _ = std::fs::remove_file(temp);
+            self.temp_path = None;
         }
+        result
     }
 
     /// Write a full checkpoint without releasing the lock.
@@ -97,9 +165,20 @@ impl RustStore {
         }
     }
 
+    /// Compact the database file, reclaiming free pages.
+    /// Returns `true` if compaction freed any space.
+    /// No-op (returns `false`) for in-memory backends.
+    pub fn compact(&mut self) -> Result<bool, AttestError> {
+        match &mut self.backend {
+            Backend::InMemory(_) => Ok(false),
+            Backend::File(r) => r.compact(),
+        }
+    }
+
     // ── Metadata ───────────────────────────────────────────────────────
 
     pub fn register_vocabulary(&mut self, namespace: &str, vocab: Vocabulary) {
+        if self.read_only { return; }
         match &mut self.backend {
             Backend::InMemory(m) => m.register_vocabulary(namespace, vocab),
             Backend::File(r) => r.register_vocabulary(namespace, vocab),
@@ -107,6 +186,7 @@ impl RustStore {
     }
 
     pub fn register_predicate(&mut self, predicate_id: &str, constraints: serde_json::Value) {
+        if self.read_only { return; }
         match &mut self.backend {
             Backend::InMemory(m) => m.register_predicate(predicate_id, constraints),
             Backend::File(r) => r.register_predicate(predicate_id, constraints),
@@ -114,6 +194,7 @@ impl RustStore {
     }
 
     pub fn register_payload_schema(&mut self, schema_id: &str, schema: serde_json::Value) {
+        if self.read_only { return; }
         match &mut self.backend {
             Backend::InMemory(m) => m.register_payload_schema(schema_id, schema),
             Backend::File(r) => r.register_payload_schema(schema_id, schema),
@@ -179,6 +260,7 @@ impl RustStore {
         external_ids: Option<&HashMap<String, String>>,
         timestamp: i64,
     ) {
+        if self.read_only { return; }
         match &mut self.backend {
             Backend::InMemory(m) => {
                 m.upsert_entity(entity_id, entity_type, display_name, external_ids, timestamp)
@@ -195,6 +277,7 @@ impl RustStore {
         entities: &[(String, String, String, HashMap<String, String>)],
         timestamp: i64,
     ) {
+        if self.read_only { return; }
         match &mut self.backend {
             Backend::InMemory(m) => {
                 for (id, etype, display, ext_ids) in entities {
@@ -216,10 +299,32 @@ impl RustStore {
         &self,
         entity_type: Option<&str>,
         min_claims: usize,
+        offset: usize,
+        limit: usize,
     ) -> Vec<EntitySummary> {
         match &self.backend {
-            Backend::InMemory(m) => m.list_entities(entity_type, min_claims),
-            Backend::File(r) => r.list_entities(entity_type, min_claims),
+            Backend::InMemory(m) => m.list_entities(entity_type, min_claims, offset, limit),
+            Backend::File(r) => r.list_entities(entity_type, min_claims, offset, limit),
+        }
+    }
+
+    /// Count entities matching the given filter without materializing results.
+    pub fn count_entities(
+        &self,
+        entity_type: Option<&str>,
+        min_claims: usize,
+    ) -> usize {
+        match &self.backend {
+            Backend::InMemory(m) => m.count_entities(entity_type, min_claims),
+            Backend::File(r) => r.count_entities(entity_type, min_claims),
+        }
+    }
+
+    /// Count total claims without materializing.
+    pub fn count_claims(&self) -> usize {
+        match &self.backend {
+            Backend::InMemory(m) => m.count_claims(),
+            Backend::File(r) => r.count_claims(),
         }
     }
 
@@ -228,8 +333,10 @@ impl RustStore {
     /// Insert a validated claim. Caller must ensure entities exist.
     ///
     /// The claim is appended to the WAL and fsynced BEFORE being applied
-    /// to in-memory state. Returns `false` if the claim_id already exists.
+    /// to in-memory state. Returns `false` if the claim_id already exists
+    /// or if the store is read-only.
     pub fn insert_claim(&mut self, claim: Claim) -> bool {
+        if self.read_only { return false; }
         let interval = self.checkpoint_interval;
         match &mut self.backend {
             Backend::InMemory(m) => m.insert_claim(claim, interval),
@@ -238,7 +345,9 @@ impl RustStore {
     }
 
     /// Insert a batch of claims with a single WAL sync at the end.
+    /// Returns 0 if the store is read-only.
     pub fn insert_claims_batch(&mut self, claims: Vec<Claim>) -> usize {
+        if self.read_only { return 0; }
         let interval = self.checkpoint_interval;
         match &mut self.backend {
             Backend::InMemory(m) => m.insert_claims_batch(claims, interval),
@@ -260,11 +369,11 @@ impl RustStore {
         }
     }
 
-    /// Get all claims.
-    pub fn all_claims(&self) -> Vec<Claim> {
+    /// Get all claims with optional pagination.
+    pub fn all_claims(&self, offset: usize, limit: usize) -> Vec<Claim> {
         match &self.backend {
-            Backend::InMemory(m) => m.all_claims(),
-            Backend::File(r) => r.all_claims(),
+            Backend::InMemory(m) => m.all_claims(offset, limit),
+            Backend::File(r) => r.all_claims(offset, limit),
         }
     }
 
@@ -486,16 +595,16 @@ mod tests {
     #[test]
     fn test_list_entities() {
         let store = setup_store();
-        assert_eq!(store.list_entities(Some("gene"), 0).len(), 2);
-        assert_eq!(store.list_entities(Some("compound"), 0).len(), 1);
-        assert_eq!(store.list_entities(None, 0).len(), 3);
+        assert_eq!(store.list_entities(Some("gene"), 0, 0, 0).len(), 2);
+        assert_eq!(store.list_entities(Some("compound"), 0, 0, 0).len(), 1);
+        assert_eq!(store.list_entities(None, 0, 0, 0).len(), 3);
     }
 
     #[test]
     fn test_list_entities_min_claims() {
         let store = setup_store();
         // tp53 has 2 claims, brca1 and aspirin have 1 each
-        let high = store.list_entities(None, 2);
+        let high = store.list_entities(None, 2, 0, 0);
         assert_eq!(high.len(), 1);
         assert_eq!(high[0].id, "tp53");
     }
@@ -1265,16 +1374,16 @@ mod redb_tests {
     fn test_redb_list_entities() {
         let (path, _guard) = temp_db();
         let store = setup_store(path.to_str().unwrap());
-        assert_eq!(store.list_entities(Some("gene"), 0).len(), 2);
-        assert_eq!(store.list_entities(Some("compound"), 0).len(), 1);
-        assert_eq!(store.list_entities(None, 0).len(), 3);
+        assert_eq!(store.list_entities(Some("gene"), 0, 0, 0).len(), 2);
+        assert_eq!(store.list_entities(Some("compound"), 0, 0, 0).len(), 1);
+        assert_eq!(store.list_entities(None, 0, 0, 0).len(), 3);
     }
 
     #[test]
     fn test_redb_list_entities_min_claims() {
         let (path, _guard) = temp_db();
         let store = setup_store(path.to_str().unwrap());
-        let high = store.list_entities(None, 2);
+        let high = store.list_entities(None, 2, 0, 0);
         assert_eq!(high.len(), 1);
         assert_eq!(high[0].id, "tp53");
     }
@@ -1475,7 +1584,7 @@ mod redb_tests {
     fn test_redb_all_claims() {
         let (path, _guard) = temp_db();
         let store = setup_store(path.to_str().unwrap());
-        let all = store.all_claims();
+        let all = store.all_claims(0, 0);
         assert_eq!(all.len(), 2);
     }
 

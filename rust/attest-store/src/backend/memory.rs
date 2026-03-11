@@ -290,8 +290,10 @@ impl MemoryBackend {
         &self,
         entity_type: Option<&str>,
         min_claims: usize,
+        offset: usize,
+        limit: usize,
     ) -> Vec<EntitySummary> {
-        self.entities
+        let filtered = self.entities
             .list(entity_type)
             .into_iter()
             .filter_map(|e| {
@@ -301,8 +303,37 @@ impl MemoryBackend {
                 } else {
                     None
                 }
-            })
-            .collect()
+            });
+        if limit == 0 {
+            filtered.skip(offset).collect()
+        } else {
+            filtered.skip(offset).take(limit).collect()
+        }
+    }
+
+    /// Count entities matching the given filter without materializing results.
+    pub fn count_entities(
+        &self,
+        entity_type: Option<&str>,
+        min_claims: usize,
+    ) -> usize {
+        if min_claims == 0 {
+            match entity_type {
+                Some(_) => self.entities.list(entity_type).len(),
+                None => self.entities.len(),
+            }
+        } else {
+            self.entities
+                .list(entity_type)
+                .into_iter()
+                .filter(|e| self.claims.count_for_entity(&e.id) >= min_claims)
+                .count()
+        }
+    }
+
+    /// Count total claims.
+    pub fn count_claims(&self) -> usize {
+        self.claims.len()
     }
 
     // ── Claim operations ───────────────────────────────────────────────
@@ -415,8 +446,13 @@ impl MemoryBackend {
             .collect()
     }
 
-    pub fn all_claims(&self) -> Vec<Claim> {
-        self.claims.all_claims().to_vec()
+    pub fn all_claims(&self, offset: usize, limit: usize) -> Vec<Claim> {
+        let all = self.claims.all_claims();
+        if limit == 0 {
+            all.iter().skip(offset).cloned().collect()
+        } else {
+            all.iter().skip(offset).take(limit).cloned().collect()
+        }
     }
 
     pub fn claims_by_source_id(&self, source_id: &str) -> Vec<Claim> {

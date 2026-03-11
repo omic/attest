@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
+use std::io::Cursor;
 use std::path::PathBuf;
 
 use attest_core::errors::AttestError;
@@ -13,6 +14,12 @@ use attest_core::normalization::normalize_entity_id;
 use attest_core::types::{Claim, EntitySummary};
 use attest_core::vocabulary::ALIAS_PREDICATES;
 use redb::{Database, ReadableMultimapTable, ReadableTable, ReadableTableMetadata, TableDefinition};
+
+/// Compression header bytes for claim storage.
+const COMPRESSION_NONE: u8 = 0x00;
+const COMPRESSION_ZSTD: u8 = 0x01;
+/// Zstd compression level (3 = good balance of speed vs ratio).
+const ZSTD_LEVEL: i32 = 3;
 
 use crate::entity_store::{tokenize, EntityData};
 use crate::metadata::{MetadataStore, Vocabulary};
@@ -162,6 +169,36 @@ impl RedbBackend {
         self.db()?.begin_write().map_err(|e| redb_err("begin_write", e))
     }
 
+    /// Compress claim bytes with zstd and prepend header byte.
+    fn compress_claim(data: &[u8]) -> Result<Vec<u8>, AttestError> {
+        let compressed = zstd::encode_all(Cursor::new(data), ZSTD_LEVEL)
+            .map_err(|e| redb_err("zstd compress", e))?;
+        let mut buf = Vec::with_capacity(1 + compressed.len());
+        buf.push(COMPRESSION_ZSTD);
+        buf.extend_from_slice(&compressed);
+        Ok(buf)
+    }
+
+    /// Decompress claim bytes, handling both compressed and legacy uncompressed data.
+    fn decompress_claim(data: &[u8]) -> Result<Claim, AttestError> {
+        if data.is_empty() {
+            return Err(redb_err("decompress", "empty claim data"));
+        }
+        let raw = match data[0] {
+            COMPRESSION_ZSTD => {
+                zstd::decode_all(Cursor::new(&data[1..]))
+                    .map_err(|e| redb_err("zstd decompress", e))?
+            }
+            COMPRESSION_NONE => data[1..].to_vec(),
+            _ => {
+                // Legacy: no header byte, raw bincode data
+                data.to_vec()
+            }
+        };
+        bincode::deserialize(&raw)
+            .map_err(|e| redb_err("deserialize claim", e))
+    }
+
     /// Increment a u64 counter in the given table.
     fn increment_counter(
         txn: &redb::WriteTransaction,
@@ -187,6 +224,13 @@ impl RedbBackend {
 
     pub fn checkpoint(&mut self) -> Result<(), AttestError> {
         self.flush_in_memory_state()
+    }
+
+    /// Compact the database file, reclaiming free pages.
+    /// Returns `true` if compaction freed any space.
+    pub fn compact(&mut self) -> Result<bool, AttestError> {
+        let db = self.db.as_mut().ok_or_else(|| AttestError::Provenance("database closed".to_string()))?;
+        db.compact().map_err(|e| redb_err("compact", e))
     }
 
     /// Flush dirty aliases/metadata to META_BLOBS.
@@ -448,6 +492,8 @@ impl RedbBackend {
         &self,
         entity_type: Option<&str>,
         min_claims: usize,
+        offset: usize,
+        limit: usize,
     ) -> Vec<EntitySummary> {
         let txn = match self.read_txn() {
             Ok(t) => t,
@@ -461,6 +507,14 @@ impl RedbBackend {
                 .and_then(|idx| idx.get(eid).ok())
                 .map(|iter| iter.count())
                 .unwrap_or(0)
+        };
+
+        let apply_pagination = |iter: Box<dyn Iterator<Item = EntitySummary>>| -> Vec<EntitySummary> {
+            if limit == 0 {
+                iter.skip(offset).collect()
+            } else {
+                iter.skip(offset).take(limit).collect()
+            }
         };
 
         match entity_type {
@@ -480,12 +534,13 @@ impl RedbBackend {
                     Ok(t) => t,
                     Err(_) => return Vec::new(),
                 };
-                entity_ids.into_iter().filter_map(|eid| {
+                let filtered = entity_ids.into_iter().filter_map(|eid| {
                     let data_bytes = entities_table.get(eid.as_str()).ok()??;
                     let entity: EntityData = bincode::deserialize(data_bytes.value()).ok()?;
                     let cc = count_claims(&eid);
                     (cc >= min_claims).then(|| entity.to_summary(cc))
-                }).collect()
+                });
+                apply_pagination(Box::new(filtered))
             }
             None => {
                 // Scan ENTITIES directly — no intermediate ID collection
@@ -493,18 +548,97 @@ impl RedbBackend {
                     Ok(t) => t,
                     Err(_) => return Vec::new(),
                 };
-                entities_table.iter().ok()
-                    .map(|iter| {
-                        iter.filter_map(|entry| {
+                let iter = entities_table.iter().ok();
+                match iter {
+                    Some(table_iter) => {
+                        let filtered = table_iter.filter_map(|entry| {
                             let (k, v) = entry.ok()?;
                             let entity: EntityData = bincode::deserialize(v.value()).ok()?;
                             let cc = count_claims(k.value());
                             (cc >= min_claims).then(|| entity.to_summary(cc))
-                        }).collect()
-                    })
-                    .unwrap_or_default()
+                        });
+                        apply_pagination(Box::new(filtered))
+                    }
+                    None => Vec::new(),
+                }
             }
         }
+    }
+
+    /// Count entities matching the given filter without materializing results.
+    pub fn count_entities(
+        &self,
+        entity_type: Option<&str>,
+        min_claims: usize,
+    ) -> usize {
+        let txn = match self.read_txn() {
+            Ok(t) => t,
+            Err(_) => return 0,
+        };
+
+        if min_claims == 0 {
+            // Fast path: use table lengths directly
+            match entity_type {
+                Some(et) => {
+                    txn.open_multimap_table(ENTITY_TYPE_IDX).ok()
+                        .and_then(|idx| idx.get(et).ok())
+                        .map(|iter| iter.count())
+                        .unwrap_or(0)
+                }
+                None => {
+                    txn.open_table(ENTITIES).ok()
+                        .and_then(|t| t.len().ok())
+                        .unwrap_or(0) as usize
+                }
+            }
+        } else {
+            // Need to check claim counts — use list_entities logic without pagination
+            let claims_idx = txn.open_multimap_table(ENTITY_CLAIMS_IDX).ok();
+            let count_claims = |eid: &str| -> usize {
+                claims_idx.as_ref()
+                    .and_then(|idx| idx.get(eid).ok())
+                    .map(|iter| iter.count())
+                    .unwrap_or(0)
+            };
+
+            match entity_type {
+                Some(et) => {
+                    txn.open_multimap_table(ENTITY_TYPE_IDX).ok()
+                        .and_then(|idx| idx.get(et).ok())
+                        .map(|iter| {
+                            iter.filter_map(|v| v.ok())
+                                .filter(|v| count_claims(v.value()) >= min_claims)
+                                .count()
+                        })
+                        .unwrap_or(0)
+                }
+                None => {
+                    let table = match txn.open_table(ENTITIES).ok() {
+                        Some(t) => t,
+                        None => return 0,
+                    };
+                    match table.iter() {
+                        Ok(iter) => {
+                            iter.filter_map(|e| e.ok())
+                                .filter(|(k, _)| count_claims(k.value()) >= min_claims)
+                                .count()
+                        }
+                        Err(_) => 0,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Count total claims without materializing.
+    pub fn count_claims(&self) -> usize {
+        let txn = match self.read_txn() {
+            Ok(t) => t,
+            Err(_) => return 0,
+        };
+        txn.open_table(CLAIMS).ok()
+            .and_then(|t| t.len().ok())
+            .unwrap_or(0) as usize
     }
 
     // ── Claim operations ───────────────────────────────────────────────
@@ -612,10 +746,11 @@ impl RedbBackend {
         seq: u64,
         claim: &Claim,
     ) -> Result<(), AttestError> {
-        let bytes = bincode::serialize(claim)
+        let raw_bytes = bincode::serialize(claim)
             .map_err(|e| redb_err("serialize claim", e))?;
+        let bytes = Self::compress_claim(&raw_bytes)?;
 
-        // CLAIMS: seq → bytes
+        // CLAIMS: seq → compressed bytes
         {
             let mut table = txn.open_table(CLAIMS)
                 .map_err(|e| redb_err("open table", e))?;
@@ -698,7 +833,7 @@ impl RedbBackend {
     fn load_claim_by_seq(&self, txn: &redb::ReadTransaction, seq: u64) -> Option<Claim> {
         let table = txn.open_table(CLAIMS).ok()?;
         let data = table.get(seq).ok()??;
-        bincode::deserialize(data.value()).ok()
+        Self::decompress_claim(data.value()).ok()
     }
 
     /// Load claims for a set of seq numbers.
@@ -709,7 +844,7 @@ impl RedbBackend {
         };
         seqs.iter().filter_map(|&seq| {
             table.get(seq).ok()?.and_then(|data| {
-                bincode::deserialize::<Claim>(data.value()).ok()
+                Self::decompress_claim(data.value()).ok()
             })
         }).collect()
     }
@@ -749,7 +884,7 @@ impl RedbBackend {
         self.claims_by_str_index(CONTENT_ID_IDX, content_id)
     }
 
-    pub fn all_claims(&self) -> Vec<Claim> {
+    pub fn all_claims(&self, offset: usize, limit: usize) -> Vec<Claim> {
         let txn = match self.read_txn() {
             Ok(t) => t,
             Err(_) => return Vec::new(),
@@ -758,16 +893,18 @@ impl RedbBackend {
             Ok(t) => t,
             Err(_) => return Vec::new(),
         };
-        let capacity = table.len().unwrap_or(0) as usize;
-        let mut claims = Vec::with_capacity(capacity);
         if let Ok(iter) = table.iter() {
-            for (_, v) in iter.flatten() {
-                if let Ok(claim) = bincode::deserialize::<Claim>(v.value()) {
-                    claims.push(claim);
-                }
+            let decoded = iter.flatten().filter_map(|(_, v)| {
+                Self::decompress_claim(v.value()).ok()
+            });
+            if limit == 0 {
+                decoded.skip(offset).collect()
+            } else {
+                decoded.skip(offset).take(limit).collect()
             }
+        } else {
+            Vec::new()
         }
-        claims
     }
 
     pub fn claims_by_source_id(&self, source_id: &str) -> Vec<Claim> {
@@ -1018,7 +1155,7 @@ impl RedbBackend {
                     break;
                 }
                 if let Ok((_, v)) = entry {
-                    if let Ok(claim) = bincode::deserialize::<Claim>(v.value()) {
+                    if let Ok(claim) = Self::decompress_claim(v.value()) {
                         claims.push(claim);
                     }
                 }

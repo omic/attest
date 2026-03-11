@@ -45,7 +45,7 @@ pub fn migrate_to_redb(db_path: &str) -> Result<RedbBackend, AttestError> {
     let mut redb = RedbBackend::open(temp_str)?;
 
     // 3. Copy entities (must be done before claims for entity claim counts)
-    let entities = old.list_entities(None, 0);
+    let entities = old.list_entities(None, 0, 0, 0);
     for entity in &entities {
         let external_ids: std::collections::HashMap<String, String> = entity.external_ids.clone();
         let ext_ref = if external_ids.is_empty() {
@@ -61,7 +61,7 @@ pub fn migrate_to_redb(db_path: &str) -> Result<RedbBackend, AttestError> {
     }
 
     // 4. Copy all claims in batch
-    let claims = old.all_claims();
+    let claims = old.all_claims(0, 0);
     let inserted = redb.insert_claims_batch(claims, 0);
     log::info!("Migrated {inserted} claims");
 
