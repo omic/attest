@@ -8,9 +8,7 @@
 
 > Licensed under the [Business Source License 1.1](LICENSE). Free to use, modify, and self-host. Cannot be offered as a competing managed service. Converts to Apache 2.0 after 4 years.
 
-A **claim-native database** for building reality models -- structured, provenanced, continuously-learning representations of organizational knowledge.
-
-Claims are the atomic primitive. The graph is derived, not primary. Everything can be rebuilt from the claim log. Provenance is structural -- the engine rejects writes without a valid provenance chain.
+**The database for agents.** Persistent memory that compounds across sessions -- every fact sourced, every claim confidence-weighted, every failure a data point that prunes the search tree for everyone. `pip install`, single file, no server.
 
 ## Install
 

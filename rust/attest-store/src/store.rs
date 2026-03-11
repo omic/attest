@@ -1077,4 +1077,33 @@ mod tests {
         let results = store.search_entities("brca1", 0);
         assert!(results.is_empty());
     }
+
+    #[test]
+    fn test_batch_dedup_within_batch() {
+        // Verifies that duplicate claim_ids within a single batch are deduplicated
+        let dir = std::env::temp_dir().join("attest_batch_dedup_test.attest");
+        let _ = std::fs::remove_file(&dir);
+
+        let mut store = RustStore::new(dir.to_str().unwrap()).unwrap();
+        store.upsert_entity("a", "entity", "A", None, 0);
+        store.upsert_entity("b", "entity", "B", None, 0);
+
+        let c1 = make_claim("dup1", "a", "rel", "b", "exp");
+        let c1_copy = make_claim("dup1", "a", "rel", "b", "exp");
+        let c2 = make_claim("unique1", "a", "rel", "b", "obs");
+
+        let inserted = store.insert_claims_batch(vec![c1, c1_copy, c2]);
+        assert_eq!(inserted, 2, "Should insert 2 unique claims, not 3");
+        assert_eq!(store.stats().total_claims, 2);
+
+        // Second batch with one already-existing and one new
+        let c1_again = make_claim("dup1", "a", "rel", "b", "exp");
+        let c3 = make_claim("unique2", "b", "rel", "a", "lit");
+        let inserted2 = store.insert_claims_batch(vec![c1_again, c3]);
+        assert_eq!(inserted2, 1, "Should only insert the new claim");
+        assert_eq!(store.stats().total_claims, 3);
+
+        store.close().unwrap();
+        let _ = std::fs::remove_file(&dir);
+    }
 }

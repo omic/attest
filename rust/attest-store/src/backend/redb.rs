@@ -474,14 +474,16 @@ impl RedbBackend {
             Err(_) => return 0,
         };
 
-        // Filter new claims using the write transaction (single check, not N read txns)
+        // Filter new claims: skip duplicates within the batch AND against existing data
         let new_claims: Vec<Claim> = {
             let table = match txn.open_table(CLAIM_ID_IDX) {
                 Ok(t) => t,
                 Err(_) => return 0,
             };
+            let mut seen = HashSet::new();
             claims.into_iter().filter(|c| {
-                table.get(c.claim_id.as_str()).ok().flatten().is_none()
+                seen.insert(c.claim_id.clone())
+                    && table.get(c.claim_id.as_str()).ok().flatten().is_none()
             }).collect()
         };
 
