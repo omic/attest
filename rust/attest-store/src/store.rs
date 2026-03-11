@@ -1107,3 +1107,458 @@ mod tests {
         let _ = std::fs::remove_file(&dir);
     }
 }
+
+// ── Redb backend tests ─────────────────────────────────────────────────
+// Mirrors the in-memory tests above but uses RustStore::new() (RedbBackend).
+
+#[cfg(test)]
+mod redb_tests {
+    use super::*;
+    use attest_core::types::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// Generate a unique temp path per test to avoid conflicts.
+    fn temp_db() -> (std::path::PathBuf, TempGuard) {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tid = std::thread::current().id();
+        let path = std::env::temp_dir().join(format!("attest_redb_{tid:?}_{n}.attest"));
+        let _ = std::fs::remove_file(&path);
+        (path.clone(), TempGuard(path))
+    }
+
+    /// RAII cleanup for temp files.
+    struct TempGuard(std::path::PathBuf);
+    impl Drop for TempGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn make_claim(
+        claim_id: &str,
+        subj: &str,
+        pred: &str,
+        obj: &str,
+        source_type: &str,
+    ) -> Claim {
+        Claim {
+            claim_id: claim_id.to_string(),
+            content_id: attest_core::compute_content_id(subj, pred, obj),
+            subject: EntityRef {
+                id: subj.to_string(),
+                entity_type: "entity".to_string(),
+                display_name: subj.to_string(),
+                external_ids: Default::default(),
+            },
+            predicate: PredicateRef {
+                id: pred.to_string(),
+                predicate_type: "relates_to".to_string(),
+            },
+            object: EntityRef {
+                id: obj.to_string(),
+                entity_type: "entity".to_string(),
+                display_name: obj.to_string(),
+                external_ids: Default::default(),
+            },
+            confidence: 0.7,
+            provenance: Provenance {
+                source_type: source_type.to_string(),
+                source_id: "test".to_string(),
+                method: None,
+                chain: vec![],
+                model_version: None,
+                organization: None,
+            },
+            embedding: None,
+            payload: None,
+            timestamp: 1000,
+            status: ClaimStatus::Active,
+        }
+    }
+
+    fn setup_store(path: &str) -> RustStore {
+        let mut store = RustStore::new(path).unwrap();
+        store.upsert_entity("brca1", "gene", "BRCA1", None, 0);
+        store.upsert_entity("tp53", "gene", "TP53", None, 0);
+        store.upsert_entity("aspirin", "compound", "Aspirin", None, 0);
+        store.insert_claim(make_claim("c1", "brca1", "binds_to", "tp53", "experimental"));
+        store.insert_claim(make_claim("c2", "tp53", "inhibits", "aspirin", "literature"));
+        store
+    }
+
+    #[test]
+    fn test_redb_entity_upsert_and_get() {
+        let (path, _guard) = temp_db();
+        let store = setup_store(path.to_str().unwrap());
+        let entity = store.get_entity("brca1").unwrap();
+        assert_eq!(entity.name, "BRCA1");
+        assert_eq!(entity.entity_type, "gene");
+        assert_eq!(entity.claim_count, 1);
+    }
+
+    #[test]
+    fn test_redb_claim_exists() {
+        let (path, _guard) = temp_db();
+        let store = setup_store(path.to_str().unwrap());
+        assert!(store.claim_exists("c1"));
+        assert!(!store.claim_exists("c99"));
+    }
+
+    #[test]
+    fn test_redb_claims_by_content_id() {
+        let (path, _guard) = temp_db();
+        let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
+        store.upsert_entity("a", "entity", "A", None, 0);
+        store.upsert_entity("b", "entity", "B", None, 0);
+
+        let c1 = make_claim("c1", "a", "rel", "b", "obs");
+        let content_id = c1.content_id.clone();
+        store.insert_claim(c1);
+
+        let mut c2 = make_claim("c2", "a", "rel", "b", "exp");
+        c2.content_id.clone_from(&content_id);
+        store.insert_claim(c2);
+
+        assert_eq!(store.claims_by_content_id(&content_id).len(), 2);
+    }
+
+    #[test]
+    fn test_redb_claims_for() {
+        let (path, _guard) = temp_db();
+        let mut store = setup_store(path.to_str().unwrap());
+        let claims = store.claims_for("brca1", None, None, 0.0);
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].claim_id, "c1");
+
+        let claims = store.claims_for("tp53", None, None, 0.0);
+        assert_eq!(claims.len(), 2);
+    }
+
+    #[test]
+    fn test_redb_claims_for_with_filters() {
+        let (path, _guard) = temp_db();
+        let mut store = setup_store(path.to_str().unwrap());
+        let claims = store.claims_for("tp53", None, Some("experimental"), 0.0);
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].claim_id, "c1");
+    }
+
+    #[test]
+    fn test_redb_list_entities() {
+        let (path, _guard) = temp_db();
+        let store = setup_store(path.to_str().unwrap());
+        assert_eq!(store.list_entities(Some("gene"), 0).len(), 2);
+        assert_eq!(store.list_entities(Some("compound"), 0).len(), 1);
+        assert_eq!(store.list_entities(None, 0).len(), 3);
+    }
+
+    #[test]
+    fn test_redb_list_entities_min_claims() {
+        let (path, _guard) = temp_db();
+        let store = setup_store(path.to_str().unwrap());
+        let high = store.list_entities(None, 2);
+        assert_eq!(high.len(), 1);
+        assert_eq!(high[0].id, "tp53");
+    }
+
+    #[test]
+    fn test_redb_alias_resolution() {
+        let (path, _guard) = temp_db();
+        let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
+        store.upsert_entity("gene_a", "gene", "A", None, 0);
+        store.upsert_entity("gene_a_alias", "gene", "A alias", None, 0);
+
+        let alias_claim = Claim {
+            claim_id: "alias1".to_string(),
+            content_id: "alias_content".to_string(),
+            subject: EntityRef {
+                id: "gene_a".to_string(),
+                entity_type: "gene".to_string(),
+                display_name: "A".to_string(),
+                external_ids: Default::default(),
+            },
+            predicate: PredicateRef {
+                id: "same_as".to_string(),
+                predicate_type: "same_as".to_string(),
+            },
+            object: EntityRef {
+                id: "gene_a_alias".to_string(),
+                entity_type: "gene".to_string(),
+                display_name: "A alias".to_string(),
+                external_ids: Default::default(),
+            },
+            confidence: 1.0,
+            provenance: Provenance {
+                source_type: "human_annotation".to_string(),
+                source_id: "test".to_string(),
+                method: None,
+                chain: vec![],
+                model_version: None,
+                organization: None,
+            },
+            embedding: None,
+            payload: None,
+            timestamp: 1000,
+            status: ClaimStatus::Active,
+        };
+        store.insert_claim(alias_claim);
+
+        let r1 = store.resolve("gene_a");
+        let r2 = store.resolve("gene_a_alias");
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn test_redb_bfs_claims() {
+        let (path, _guard) = temp_db();
+        let mut store = setup_store(path.to_str().unwrap());
+        let results = store.bfs_claims("brca1", 1);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0.claim_id, "c1");
+        assert_eq!(results[0].1, 1);
+
+        let results = store.bfs_claims("brca1", 2);
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn test_redb_path_exists() {
+        let (path, _guard) = temp_db();
+        let mut store = setup_store(path.to_str().unwrap());
+        assert!(store.path_exists("brca1", "tp53", 1));
+        assert!(store.path_exists("brca1", "aspirin", 2));
+        assert!(!store.path_exists("brca1", "aspirin", 1));
+    }
+
+    #[test]
+    fn test_redb_adjacency_list() {
+        let (path, _guard) = temp_db();
+        let store = setup_store(path.to_str().unwrap());
+        let adj = store.get_adjacency_list();
+        assert!(adj["brca1"].contains("tp53"));
+        assert!(adj["tp53"].contains("brca1"));
+        assert!(adj["tp53"].contains("aspirin"));
+    }
+
+    #[test]
+    fn test_redb_stats() {
+        let (path, _guard) = temp_db();
+        let store = setup_store(path.to_str().unwrap());
+        let stats = store.stats();
+        assert_eq!(stats.total_claims, 2);
+        assert_eq!(stats.entity_count, 3);
+        assert_eq!(stats.entity_types["gene"], 2);
+        assert_eq!(stats.entity_types["compound"], 1);
+    }
+
+    #[test]
+    fn test_redb_claims_in_range() {
+        let (path, _guard) = temp_db();
+        let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
+        store.upsert_entity("a", "entity", "A", None, 0);
+        store.upsert_entity("b", "entity", "B", None, 0);
+
+        let mut c1 = make_claim("c1", "a", "rel", "b", "obs");
+        c1.timestamp = 1000;
+        let mut c2 = make_claim("c2", "a", "rel", "b", "obs");
+        c2.claim_id = "c2".to_string();
+        c2.timestamp = 2000;
+        let mut c3 = make_claim("c3", "a", "rel", "b", "obs");
+        c3.claim_id = "c3".to_string();
+        c3.timestamp = 3000;
+
+        store.insert_claim(c1);
+        store.insert_claim(c2);
+        store.insert_claim(c3);
+
+        assert_eq!(store.claims_in_range(1500, 2500).len(), 1);
+        assert_eq!(store.claims_in_range(1000, 3000).len(), 3);
+        assert_eq!(store.claims_in_range(4000, 5000).len(), 0);
+    }
+
+    #[test]
+    fn test_redb_most_recent_claims() {
+        let (path, _guard) = temp_db();
+        let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
+        store.upsert_entity("a", "entity", "A", None, 0);
+        store.upsert_entity("b", "entity", "B", None, 0);
+
+        for i in 0..5 {
+            let mut c = make_claim(&format!("c{i}"), "a", "rel", "b", "obs");
+            c.timestamp = (i + 1) * 1000;
+            store.insert_claim(c);
+        }
+
+        let recent = store.most_recent_claims(2);
+        assert_eq!(recent.len(), 2);
+        assert!(recent[0].timestamp >= recent[1].timestamp);
+    }
+
+    #[test]
+    fn test_redb_search_entities() {
+        let (path, _guard) = temp_db();
+        let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
+        store.upsert_entity("brca1", "gene", "BRCA1 DNA repair", None, 0);
+        store.upsert_entity("tp53", "gene", "TP53 tumor protein", None, 0);
+        store.upsert_entity("aspirin", "compound", "Aspirin", None, 0);
+
+        let results = store.search_entities("brca1", 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "brca1");
+
+        let results = store.search_entities("protein", 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "tp53");
+
+        let results = store.search_entities("aspirin", 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "aspirin");
+    }
+
+    #[test]
+    fn test_redb_persistence_roundtrip() {
+        let (path, _guard) = temp_db();
+
+        // Create, populate, close
+        {
+            let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
+            store.upsert_entity("brca1", "gene", "BRCA1", None, 0);
+            store.upsert_entity("tp53", "gene", "TP53", None, 0);
+            store.insert_claim(make_claim("c1", "brca1", "binds_to", "tp53", "exp"));
+            store.close().unwrap();
+        }
+
+        // Reopen, verify
+        {
+            let store = RustStore::new(path.to_str().unwrap()).unwrap();
+            assert!(store.claim_exists("c1"));
+            assert_eq!(store.get_entity("brca1").unwrap().name, "BRCA1");
+            assert_eq!(store.stats().total_claims, 1);
+        }
+    }
+
+    #[test]
+    fn test_redb_batch_insert() {
+        let (path, _guard) = temp_db();
+        let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
+        store.upsert_entity("a", "entity", "A", None, 0);
+        store.upsert_entity("b", "entity", "B", None, 0);
+
+        let c1 = make_claim("dup1", "a", "rel", "b", "exp");
+        let c1_copy = make_claim("dup1", "a", "rel", "b", "exp");
+        let c2 = make_claim("unique1", "a", "rel", "b", "obs");
+
+        let inserted = store.insert_claims_batch(vec![c1, c1_copy, c2]);
+        assert_eq!(inserted, 2, "Should insert 2 unique claims, not 3");
+        assert_eq!(store.stats().total_claims, 2);
+    }
+
+    #[test]
+    fn test_redb_all_claims() {
+        let (path, _guard) = temp_db();
+        let store = setup_store(path.to_str().unwrap());
+        let all = store.all_claims();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn test_redb_provenance_chain() {
+        let (path, _guard) = temp_db();
+        let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
+        store.upsert_entity("a", "entity", "A", None, 0);
+        store.upsert_entity("b", "entity", "B", None, 0);
+
+        let mut claim = make_claim("c1", "a", "rel", "b", "obs");
+        claim.provenance.chain = vec!["upstream1".to_string(), "upstream2".to_string()];
+        store.insert_claim(claim);
+
+        let chain = store.get_claim_provenance_chain("c1");
+        assert_eq!(chain, vec!["upstream1", "upstream2"]);
+        assert!(store.get_claim_provenance_chain("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn test_redb_metadata_persists() {
+        let (path, _guard) = temp_db();
+
+        // Create store with metadata, close
+        {
+            let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
+            store.register_vocabulary(
+                "bio",
+                Vocabulary {
+                    entity_types: vec!["gene".to_string()],
+                    predicate_types: vec!["binds_to".to_string()],
+                    source_types: vec!["experimental".to_string()],
+                },
+            );
+            store.close().unwrap();
+        }
+
+        // Reopen, verify metadata survived
+        {
+            let store = RustStore::new(path.to_str().unwrap()).unwrap();
+            let vocabs = store.get_registered_vocabularies();
+            assert!(vocabs.contains_key("bio"));
+            assert!(vocabs["bio"].entity_types.contains(&"gene".to_string()));
+        }
+    }
+
+    #[test]
+    fn test_redb_alias_persists() {
+        let (path, _guard) = temp_db();
+
+        // Create store with alias, close
+        {
+            let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
+            store.upsert_entity("gene_a", "gene", "A", None, 0);
+            store.upsert_entity("gene_a_alias", "gene", "A alias", None, 0);
+
+            let alias_claim = Claim {
+                claim_id: "alias1".to_string(),
+                content_id: "alias_content".to_string(),
+                subject: EntityRef {
+                    id: "gene_a".to_string(),
+                    entity_type: "gene".to_string(),
+                    display_name: "A".to_string(),
+                    external_ids: Default::default(),
+                },
+                predicate: PredicateRef {
+                    id: "same_as".to_string(),
+                    predicate_type: "same_as".to_string(),
+                },
+                object: EntityRef {
+                    id: "gene_a_alias".to_string(),
+                    entity_type: "gene".to_string(),
+                    display_name: "A alias".to_string(),
+                    external_ids: Default::default(),
+                },
+                confidence: 1.0,
+                provenance: Provenance {
+                    source_type: "human_annotation".to_string(),
+                    source_id: "test".to_string(),
+                    method: None,
+                    chain: vec![],
+                    model_version: None,
+                    organization: None,
+                },
+                embedding: None,
+                payload: None,
+                timestamp: 1000,
+                status: ClaimStatus::Active,
+            };
+            store.insert_claim(alias_claim);
+            store.close().unwrap();
+        }
+
+        // Reopen, verify alias survived
+        {
+            let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
+            let r1 = store.resolve("gene_a");
+            let r2 = store.resolve("gene_a_alias");
+            assert_eq!(r1, r2, "Alias should persist across close/reopen");
+        }
+    }
+}
