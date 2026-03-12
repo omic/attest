@@ -7,6 +7,12 @@ import json
 from dataclasses import dataclass, field
 
 
+class Role(enum.Enum):
+    ADMIN = "admin"      # Full access: ingest, retract, query, grant/revoke
+    WRITER = "writer"    # Ingest + query (no retract, no grant/revoke)
+    READER = "reader"    # Query only
+
+
 class ClaimStatus(enum.Enum):
     ACTIVE = "active"
     ARCHIVED = "archived"
@@ -57,6 +63,8 @@ class Claim:
     payload: Payload | None = None
     timestamp: int = 0
     status: ClaimStatus = ClaimStatus.ACTIVE
+    namespace: str = ""
+    expires_at: int = 0  # Nanosecond timestamp. 0 = never expires.
 
 
 @dataclass
@@ -71,6 +79,8 @@ class ClaimInput:
     payload: dict | None = None
     timestamp: int | None = None
     external_ids: dict[str, dict[str, str]] | None = None
+    namespace: str = ""
+    ttl_seconds: int = 0  # Time-to-live in seconds. 0 = never expires.
 
 
 @dataclass
@@ -338,6 +348,18 @@ class ConsensusReport:
     agreement_ratio: float = 0.0
     claims_by_source: dict[str, int] = field(default_factory=dict)
     corroborated_content_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
+class AuditEvent:
+    """A single entry in the mutation audit log."""
+    event: str  # claim_ingested, source_retracted, status_changed, namespace_set
+    timestamp: int = 0
+    actor: str = ""
+    claim_id: str = ""
+    source_id: str = ""
+    namespace: str = ""
+    details: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -905,6 +927,8 @@ def _claim_from_dict_inner(d: dict) -> Claim:
         payload=payload,
         timestamp=d["timestamp"],
         status=status,
+        namespace=d.get("namespace", ""),
+        expires_at=d.get("expires_at", 0),
     )
 
 

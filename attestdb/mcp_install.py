@@ -18,7 +18,6 @@ import json
 import os
 import shutil
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -499,27 +498,11 @@ def recall(task: str | None = None, db_path: str | None = None) -> None:
     _merge_session_end(memory_db)
     _merge_auto_learnings(memory_db)
 
-    # Copy the DB file (and WAL if present) to a temp location to avoid
-    # fs2 lock conflicts. The MCP server may hold the advisory lock on the
-    # original file, and claims recorded during the session live in the WAL
-    # until close() checkpoints them into the main file.
-    tmp_copy = None
-    tmp_wal = None
+    # Open read-only to avoid fs2 lock conflicts with the MCP server.
+    # The Rust engine copies the DB to a temp file internally.
     try:
-        tmp_fd, tmp_copy = tempfile.mkstemp(suffix=".attest")
-        os.close(tmp_fd)
-        shutil.copy2(str(memory_db), tmp_copy)
-        # Also copy the WAL — it contains claims not yet checkpointed
-        wal_path = str(memory_db) + ".wal"
-        if os.path.exists(wal_path):
-            tmp_wal = tmp_copy + ".wal"
-            shutil.copy2(wal_path, tmp_wal)
-        db = AttestDB(tmp_copy, embedding_dim=None)
+        db = AttestDB.open_read_only(str(memory_db))
     except Exception:
-        if tmp_copy and os.path.exists(tmp_copy):
-            os.unlink(tmp_copy)
-        if tmp_wal and os.path.exists(tmp_wal):
-            os.unlink(tmp_wal)
         return
 
     try:
@@ -622,10 +605,6 @@ def recall(task: str | None = None, db_path: str | None = None) -> None:
         print("\n".join(lines))
     finally:
         db.close()
-        if tmp_copy and os.path.exists(tmp_copy):
-            os.unlink(tmp_copy)
-        if tmp_wal and os.path.exists(tmp_wal):
-            os.unlink(tmp_wal)
 
 
 def _git_context() -> tuple[list[str], set[str]]:
@@ -806,22 +785,9 @@ def pre_edit_check() -> None:
     except ImportError:
         return
 
-    tmp_copy = None
-    tmp_wal = None
     try:
-        tmp_fd, tmp_copy = tempfile.mkstemp(suffix=".attest")
-        os.close(tmp_fd)
-        shutil.copy2(str(memory_db), tmp_copy)
-        wal_path = str(memory_db) + ".wal"
-        if os.path.exists(wal_path):
-            tmp_wal = tmp_copy + ".wal"
-            shutil.copy2(wal_path, tmp_wal)
-        db = AttestDB(tmp_copy, embedding_dim=None)
+        db = AttestDB.open_read_only(str(memory_db))
     except Exception:
-        if tmp_copy and os.path.exists(tmp_copy):
-            os.unlink(tmp_copy)
-        if tmp_wal and os.path.exists(tmp_wal):
-            os.unlink(tmp_wal)
         return
 
     try:
@@ -870,10 +836,6 @@ def pre_edit_check() -> None:
         )
     finally:
         db.close()
-        if tmp_copy and os.path.exists(tmp_copy):
-            os.unlink(tmp_copy)
-        if tmp_wal and os.path.exists(tmp_wal):
-            os.unlink(tmp_wal)
 
 
 # ---------------------------------------------------------------------------
@@ -938,22 +900,9 @@ def post_test_check() -> None:
     except ImportError:
         return
 
-    tmp_copy = None
-    tmp_wal = None
     try:
-        tmp_fd, tmp_copy = tempfile.mkstemp(suffix=".attest")
-        os.close(tmp_fd)
-        shutil.copy2(str(memory_db), tmp_copy)
-        wal_path = str(memory_db) + ".wal"
-        if os.path.exists(wal_path):
-            tmp_wal = tmp_copy + ".wal"
-            shutil.copy2(wal_path, tmp_wal)
-        db = AttestDB(tmp_copy, embedding_dim=None)
+        db = AttestDB.open_read_only(str(memory_db))
     except Exception:
-        if tmp_copy and os.path.exists(tmp_copy):
-            os.unlink(tmp_copy)
-        if tmp_wal and os.path.exists(tmp_wal):
-            os.unlink(tmp_wal)
         return
 
     try:
@@ -1008,10 +957,6 @@ def post_test_check() -> None:
         )
     finally:
         db.close()
-        if tmp_copy and os.path.exists(tmp_copy):
-            os.unlink(tmp_copy)
-        if tmp_wal and os.path.exists(tmp_wal):
-            os.unlink(tmp_wal)
 
 
 # ---------------------------------------------------------------------------
@@ -1400,24 +1345,11 @@ def benchmark(db_path: str | None = None) -> None:
         print("attestdb not installed.")
         return
 
-    # Open DB (copy to avoid lock)
-    tmp_copy = None
-    tmp_wal = None
+    # Open DB in read-only mode (copies to temp internally, no lock conflict)
     try:
-        tmp_fd, tmp_copy = tempfile.mkstemp(suffix=".attest")
-        os.close(tmp_fd)
-        shutil.copy2(str(memory_db), tmp_copy)
-        wal_path = str(memory_db) + ".wal"
-        if os.path.exists(wal_path):
-            tmp_wal = tmp_copy + ".wal"
-            shutil.copy2(wal_path, tmp_wal)
-        db = AttestDB(tmp_copy, embedding_dim=None)
+        db = AttestDB.open_read_only(str(memory_db))
     except Exception as e:
         print(f"Failed to open memory database: {e}")
-        if tmp_copy and os.path.exists(tmp_copy):
-            os.unlink(tmp_copy)
-        if tmp_wal and os.path.exists(tmp_wal):
-            os.unlink(tmp_wal)
         return
 
     try:
@@ -1660,10 +1592,6 @@ def benchmark(db_path: str | None = None) -> None:
 
     finally:
         db.close()
-        if tmp_copy and os.path.exists(tmp_copy):
-            os.unlink(tmp_copy)
-        if tmp_wal and os.path.exists(tmp_wal):
-            os.unlink(tmp_wal)
 
 
 # ---------------------------------------------------------------------------

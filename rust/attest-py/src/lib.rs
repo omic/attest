@@ -84,6 +84,8 @@ fn claim_to_dict(py: Python<'_>, c: &Claim) -> PyResult<PyObject> {
 
     dict.set_item("timestamp", c.timestamp)?;
     dict.set_item("status", c.status.as_str())?;
+    dict.set_item("namespace", &c.namespace)?;
+    dict.set_item("expires_at", c.expires_at)?;
 
     Ok(dict.into())
 }
@@ -154,6 +156,16 @@ fn claim_from_py(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Claim> {
     let status = status_str.parse::<ClaimStatus>()
         .map_err(|_| PyValueError::new_err(format!("invalid claim status: {status_str}")))?;
 
+    // Namespace (optional, default "")
+    let namespace: String = obj.getattr("namespace")
+        .and_then(|v| v.extract())
+        .unwrap_or_default();
+
+    // expires_at (optional, default 0)
+    let expires_at: i64 = obj.getattr("expires_at")
+        .and_then(|v| v.extract())
+        .unwrap_or(0);
+
     Ok(Claim {
         claim_id,
         content_id,
@@ -166,6 +178,8 @@ fn claim_from_py(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Claim> {
         payload,
         timestamp,
         status,
+        namespace,
+        expires_at,
     })
 }
 
@@ -418,6 +432,14 @@ impl PyRustStore {
 
     fn claim_exists(&self, claim_id: &str) -> bool {
         self.inner.claim_exists(claim_id)
+    }
+
+    /// Get a single claim by ID. Returns None if not found.
+    fn get_claim<'py>(&self, claim_id: &str, py: Python<'py>) -> PyResult<Option<PyObject>> {
+        match self.inner.get_claim(claim_id) {
+            Some(c) => Ok(Some(claim_to_dict(py, &c)?)),
+            None => Ok(None),
+        }
     }
 
     fn claims_by_content_id<'py>(
@@ -709,6 +731,8 @@ impl PyRustStore {
                     payload: None,
                     timestamp: row.ts,
                     status: ClaimStatus::Active,
+                    namespace: String::new(),
+            expires_at: 0,
                 }
             })
             .collect();
@@ -717,6 +741,64 @@ impl PyRustStore {
         let count = self.inner.insert_claims_batch(claims);
 
         Ok(count)
+    }
+
+    // ── Retraction / status overlay ─────────────────────────────────
+
+    /// Retract a claim by ID (set status to Tombstoned).
+    /// Returns True if the claim existed, False otherwise.
+    fn retract_claim(&mut self, claim_id: &str) -> PyResult<bool> {
+        self.inner.retract_claim(claim_id)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Retract all claims from a source. Returns list of retracted claim IDs.
+    fn retract_source(&mut self, source_id: &str) -> PyResult<Vec<String>> {
+        self.inner.retract_source(source_id)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Update the status of a claim by string name.
+    /// Accepted values: "active", "archived", "tombstoned"/"retracted", "provenance_degraded"/"degraded".
+    fn update_claim_status(&mut self, claim_id: &str, status: &str) -> PyResult<bool> {
+        self.inner.update_claim_status(claim_id, status)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Batch-update claim statuses. Each element is (claim_id, status_string).
+    /// Returns the number of claims actually updated.
+    fn update_claim_status_batch(&mut self, updates: Vec<(String, String)>) -> PyResult<usize> {
+        let mut parsed: Vec<(String, attest_core::types::ClaimStatus)> = Vec::with_capacity(updates.len());
+        for (id, s) in updates {
+            let status = match s.to_lowercase().as_str() {
+                "active" => attest_core::types::ClaimStatus::Active,
+                "archived" => attest_core::types::ClaimStatus::Archived,
+                "tombstoned" | "retracted" => attest_core::types::ClaimStatus::Tombstoned,
+                "provenance_degraded" | "degraded" => attest_core::types::ClaimStatus::ProvenanceDegraded,
+                other => return Err(PyValueError::new_err(format!("Unknown claim status: {other}"))),
+            };
+            parsed.push((id, status));
+        }
+        let updates = parsed;
+        self.inner.update_claim_status_batch(&updates)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Set whether query methods include retracted (Tombstoned) claims.
+    fn set_include_retracted(&mut self, include: bool) -> PyResult<()> {
+        self.inner.set_include_retracted(include);
+        Ok(())
+    }
+
+    /// Set the namespace filter. Empty list = no filter (all namespaces visible).
+    fn set_namespace_filter(&mut self, namespaces: Vec<String>) -> PyResult<()> {
+        self.inner.set_namespace_filter(namespaces);
+        Ok(())
+    }
+
+    /// Get the current namespace filter.
+    fn get_namespace_filter(&self) -> PyResult<Vec<String>> {
+        Ok(self.inner.get_namespace_filter().to_vec())
     }
 
     // ── Raw query (not applicable for Rust backend) ────────────────

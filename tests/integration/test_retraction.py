@@ -40,12 +40,16 @@ def test_retract_marks_claims_tombstoned(retract_db):
     assert result.reason == "Paper retracted by journal"
     assert len(result.claim_ids) == 3
 
-    # Verify original claims are tombstoned (exclude the retraction meta-claim)
-    claims = retract_db.claims_by_source_id("paper_123")
-    original_claims = [c for c in claims if c.predicate.id != "retracted"]
-    assert len(original_claims) == 3
-    for c in original_claims:
-        assert c.status == ClaimStatus.TOMBSTONED
+    # Verify original claims are tombstoned (must include retracted to see them)
+    retract_db._store.set_include_retracted(True)
+    try:
+        claims = retract_db.claims_by_source_id("paper_123")
+        original_claims = [c for c in claims if c.predicate.id != "retracted"]
+        assert len(original_claims) == 3
+        for c in original_claims:
+            assert c.status == ClaimStatus.TOMBSTONED
+    finally:
+        retract_db._store.set_include_retracted(False)
 
 
 def test_retracted_claims_excluded_from_query(retract_db):

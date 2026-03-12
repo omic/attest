@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use attest_core::errors::AttestError;
 use attest_core::normalization::normalize_entity_id;
-use attest_core::types::{Claim, EntitySummary};
+use attest_core::types::{Claim, ClaimStatus, EntitySummary};
 use attest_core::vocabulary::ALIAS_PREDICATES;
 
 use crate::claim_log::ClaimLog;
@@ -26,6 +26,8 @@ struct StoreState {
     entities: EntityStore,
     metadata: MetadataStore,
     aliases: UnionFind,
+    #[serde(default)]
+    status_overrides: HashMap<String, u8>,
 }
 
 /// Borrowed view of store state for serialization (avoids cloning).
@@ -35,6 +37,7 @@ struct StoreStateRef<'a> {
     entities: &'a EntityStore,
     metadata: &'a MetadataStore,
     aliases: &'a UnionFind,
+    status_overrides: &'a HashMap<String, u8>,
 }
 
 /// Default: auto-checkpoint after this many WAL entries.
@@ -49,6 +52,14 @@ pub struct MemoryBackend {
     aliases: UnionFind,
     lock_file: Option<std::fs::File>,
     wal: Option<Wal>,
+    /// Status overrides: claim_id → ClaimStatus. Persisted in checkpoint + WAL.
+    status_overrides: HashMap<String, ClaimStatus>,
+    /// In-memory set of tombstoned IDs for O(1) filtering.
+    retracted_ids: HashSet<String>,
+    /// Whether query methods should include retracted claims.
+    include_retracted: bool,
+    /// Namespace filter: empty = all namespaces visible.
+    namespace_filter: Vec<String>,
 }
 
 impl MemoryBackend {
@@ -62,6 +73,10 @@ impl MemoryBackend {
             aliases: UnionFind::new(),
             lock_file: None,
             wal: None,
+            status_overrides: HashMap::new(),
+            retracted_ids: HashSet::new(),
+            include_retracted: false,
+            namespace_filter: Vec::new(),
         }
     }
 
@@ -87,6 +102,15 @@ impl MemoryBackend {
                     claims.rebuild_derived_indexes();
                     entities.rebuild_text_index();
                     aliases.rebuild_groups();
+                    // Rebuild status overrides and retracted_ids from persisted map
+                    let status_overrides: HashMap<String, ClaimStatus> = state.status_overrides
+                        .into_iter()
+                        .map(|(k, v)| (k, Self::u8_to_status(v)))
+                        .collect();
+                    let retracted_ids: HashSet<String> = status_overrides.iter()
+                        .filter(|(_, s)| **s == ClaimStatus::Tombstoned)
+                        .map(|(k, _)| k.clone())
+                        .collect();
                     Self {
                         db_path: path.clone(),
                         claims,
@@ -95,6 +119,10 @@ impl MemoryBackend {
                         aliases,
                         lock_file: Some(lock_file),
                         wal: None,
+                        status_overrides,
+                        retracted_ids,
+                        include_retracted: false,
+                        namespace_filter: Vec::new(),
                     }
                 }
                 Err(file_format::FileError::ChecksumMismatch { expected, actual }) => {
@@ -112,6 +140,10 @@ impl MemoryBackend {
                         aliases: UnionFind::new(),
                         lock_file: Some(lock_file),
                         wal: None,
+                        status_overrides: HashMap::new(),
+                        retracted_ids: HashSet::new(),
+                        include_retracted: false,
+                        namespace_filter: Vec::new(),
                     }
                 }
                 Err(e) => {
@@ -130,6 +162,10 @@ impl MemoryBackend {
                 aliases: UnionFind::new(),
                 lock_file: Some(lock_file),
                 wal: None,
+                status_overrides: HashMap::new(),
+                retracted_ids: HashSet::new(),
+                include_retracted: false,
+                namespace_filter: Vec::new(),
             }
         };
 
@@ -141,6 +177,15 @@ impl MemoryBackend {
                     match entry {
                         WalEntry::InsertClaim(claim) => {
                             backend.insert_claim_no_wal(claim);
+                        }
+                        WalEntry::UpdateClaimStatus(claim_id, status_u8) => {
+                            let status = Self::u8_to_status(status_u8);
+                            if status == ClaimStatus::Tombstoned {
+                                backend.retracted_ids.insert(claim_id.clone());
+                            } else {
+                                backend.retracted_ids.remove(&claim_id);
+                            }
+                            backend.status_overrides.insert(claim_id, status);
                         }
                     }
                 }
@@ -169,11 +214,15 @@ impl MemoryBackend {
         if self.db_path.as_os_str().is_empty() || self.lock_file.is_none() {
             return Ok(()); // in-memory or already closed
         }
+        let status_overrides_u8: HashMap<String, u8> = self.status_overrides.iter()
+            .map(|(k, v)| (k.clone(), Self::status_to_u8(v)))
+            .collect();
         let state = StoreStateRef {
             claims: &self.claims,
             entities: &self.entities,
             metadata: &self.metadata,
             aliases: &self.aliases,
+            status_overrides: &status_overrides_u8,
         };
         let write_result = file_format::write_store(&self.db_path, &state);
 
@@ -201,11 +250,15 @@ impl MemoryBackend {
         if self.db_path.as_os_str().is_empty() || self.lock_file.is_none() {
             return Ok(());
         }
+        let status_overrides_u8: HashMap<String, u8> = self.status_overrides.iter()
+            .map(|(k, v)| (k.clone(), Self::status_to_u8(v)))
+            .collect();
         let state = StoreStateRef {
             claims: &self.claims,
             entities: &self.entities,
             metadata: &self.metadata,
             aliases: &self.aliases,
+            status_overrides: &status_overrides_u8,
         };
         file_format::write_store(&self.db_path, &state)
             .map_err(|e| AttestError::Provenance(format!("checkpoint failed: {e}")))?;
@@ -438,20 +491,143 @@ impl MemoryBackend {
         self.claims.contains(claim_id)
     }
 
+    // ── Retraction / status overlay helpers ─────────────────────────────
+
+    /// Whether a claim should be included in query results.
+    fn should_include_claim(&self, claim_id: &str) -> bool {
+        self.include_retracted || !self.retracted_ids.contains(claim_id)
+    }
+
+    /// Apply status overlay from in-memory overrides map.
+    fn apply_status_overlay(overrides: &HashMap<String, ClaimStatus>, claim: &mut Claim) {
+        if let Some(status) = overrides.get(&claim.claim_id) {
+            claim.status = status.clone();
+        }
+    }
+
+    fn status_to_u8(status: &ClaimStatus) -> u8 {
+        match status {
+            ClaimStatus::Active => 0,
+            ClaimStatus::Archived => 1,
+            ClaimStatus::Tombstoned => 2,
+            ClaimStatus::ProvenanceDegraded => 3,
+        }
+    }
+
+    fn u8_to_status(v: u8) -> ClaimStatus {
+        match v {
+            0 => ClaimStatus::Active,
+            1 => ClaimStatus::Archived,
+            2 => ClaimStatus::Tombstoned,
+            3 => ClaimStatus::ProvenanceDegraded,
+            _ => ClaimStatus::Active,
+        }
+    }
+
+    pub fn update_claim_status(&mut self, claim_id: &str, status: ClaimStatus) -> Result<bool, AttestError> {
+        if !self.claims.contains(claim_id) {
+            return Ok(false);
+        }
+
+        // WAL write
+        if let Some(ref mut wal) = self.wal {
+            let status_u8 = Self::status_to_u8(&status);
+            if let Err(e) = wal.append_status_update(claim_id, status_u8) {
+                log::error!("WAL write failed for status update {claim_id}: {e}");
+                return Err(AttestError::Provenance(format!("WAL write failed: {e}")));
+            }
+        }
+
+        if status == ClaimStatus::Tombstoned {
+            self.retracted_ids.insert(claim_id.to_string());
+        } else {
+            self.retracted_ids.remove(claim_id);
+        }
+        self.status_overrides.insert(claim_id.to_string(), status);
+        Ok(true)
+    }
+
+    pub fn update_claim_status_batch(&mut self, updates: &[(String, ClaimStatus)]) -> Result<usize, AttestError> {
+        let mut count = 0usize;
+        for (claim_id, status) in updates {
+            if !self.claims.contains(claim_id) {
+                continue;
+            }
+
+            // WAL write (no sync per entry)
+            if let Some(ref mut wal) = self.wal {
+                let status_u8 = Self::status_to_u8(status);
+                if let Err(e) = wal.append_entry(&WalEntry::UpdateClaimStatus(claim_id.clone(), status_u8)) {
+                    log::error!("WAL write failed for batch status update {claim_id}: {e}");
+                    continue;
+                }
+            }
+
+            if *status == ClaimStatus::Tombstoned {
+                self.retracted_ids.insert(claim_id.clone());
+            } else {
+                self.retracted_ids.remove(claim_id);
+            }
+            self.status_overrides.insert(claim_id.clone(), status.clone());
+            count += 1;
+        }
+
+        // Sync WAL after batch
+        if let Some(ref mut wal) = self.wal {
+            if let Err(e) = wal.sync() {
+                log::error!("WAL sync failed after batch status update: {e}");
+            }
+        }
+
+        Ok(count)
+    }
+
+    pub fn set_include_retracted(&mut self, include: bool) {
+        self.include_retracted = include;
+    }
+
+    /// Check if a claim's namespace passes the current filter.
+    fn should_include_namespace(&self, namespace: &str) -> bool {
+        self.namespace_filter.is_empty() || self.namespace_filter.iter().any(|ns| ns == namespace)
+    }
+
+    pub fn set_namespace_filter(&mut self, namespaces: Vec<String>) {
+        self.namespace_filter = namespaces;
+    }
+
+    pub fn get_namespace_filter(&self) -> &[String] {
+        &self.namespace_filter
+    }
+
+    pub fn get_claim(&self, claim_id: &str) -> Option<Claim> {
+        let mut claim = self.claims.get(claim_id)?.clone();
+        // Apply status overlay
+        if let Some(status) = self.status_overrides.get(claim_id) {
+            claim.status = status.clone();
+        }
+        Some(claim)
+    }
+
     pub fn claims_by_content_id(&self, content_id: &str) -> Vec<Claim> {
         self.claims
             .by_content_id(content_id)
             .into_iter()
+            .filter(|c| self.should_include_claim(&c.claim_id) && self.should_include_namespace(&c.namespace))
             .cloned()
+            .map(|mut c| { Self::apply_status_overlay(&self.status_overrides, &mut c); c })
             .collect()
     }
 
     pub fn all_claims(&self, offset: usize, limit: usize) -> Vec<Claim> {
         let all = self.claims.all_claims();
+        let filtered = all.iter()
+            .filter(|c| self.should_include_claim(&c.claim_id) && self.should_include_namespace(&c.namespace))
+            .cloned()
+            .map(|mut c| { Self::apply_status_overlay(&self.status_overrides, &mut c); c });
         if limit == 0 {
-            all.iter().skip(offset).cloned().collect()
+            filtered.skip(offset).collect()
         } else {
-            all.iter().skip(offset).take(limit).cloned().collect()
+            filtered.skip(offset).take(limit).collect()
         }
     }
 
@@ -459,7 +635,9 @@ impl MemoryBackend {
         self.claims
             .by_source_id(source_id)
             .into_iter()
+            .filter(|c| self.should_include_claim(&c.claim_id) && self.should_include_namespace(&c.namespace))
             .cloned()
+            .map(|mut c| { Self::apply_status_overlay(&self.status_overrides, &mut c); c })
             .collect()
     }
 
@@ -467,7 +645,9 @@ impl MemoryBackend {
         self.claims
             .by_predicate_id(predicate_id)
             .into_iter()
+            .filter(|c| self.should_include_claim(&c.claim_id) && self.should_include_namespace(&c.namespace))
             .cloned()
+            .map(|mut c| { Self::apply_status_overlay(&self.status_overrides, &mut c); c })
             .collect()
     }
 
@@ -483,7 +663,9 @@ impl MemoryBackend {
         self.claims
             .for_entity_filtered(&aliases, predicate_type, source_type, min_confidence)
             .into_iter()
+            .filter(|c| self.should_include_claim(&c.claim_id) && self.should_include_namespace(&c.namespace))
             .cloned()
+            .map(|mut c| { Self::apply_status_overlay(&self.status_overrides, &mut c); c })
             .collect()
     }
 
@@ -514,7 +696,12 @@ impl MemoryBackend {
             let mut next_frontier = HashSet::new();
 
             for claim in claims {
-                results.push((claim.clone(), hop));
+                if !self.should_include_claim(&claim.claim_id) || !self.should_include_namespace(&claim.namespace) {
+                    continue;
+                }
+                let mut c = claim.clone();
+                Self::apply_status_overlay(&self.status_overrides, &mut c);
+                results.push((c, hop));
                 for eid in [&claim.subject.id, &claim.object.id] {
                     if !visited.contains(eid) {
                         next_frontier.insert(eid.clone());
@@ -577,16 +764,33 @@ impl MemoryBackend {
 
     /// Get claims within a timestamp range [min_ts, max_ts] (inclusive).
     pub fn claims_in_range(&mut self, min_ts: i64, max_ts: i64) -> Vec<Claim> {
+        let include_retracted = self.include_retracted;
+        let retracted_ids = &self.retracted_ids;
+        let ns_filter = &self.namespace_filter;
         self.claims
             .in_time_range(min_ts, max_ts)
             .into_iter()
+            .filter(|c| (include_retracted || !retracted_ids.contains(&c.claim_id))
+                && (ns_filter.is_empty() || ns_filter.iter().any(|ns| ns == &c.namespace)))
             .cloned()
+            .map(|mut c| { Self::apply_status_overlay(&self.status_overrides, &mut c); c })
             .collect()
     }
 
     /// Get the most recent N claims by timestamp.
     pub fn most_recent_claims(&mut self, n: usize) -> Vec<Claim> {
-        self.claims.most_recent(n).into_iter().cloned().collect()
+        let extra = self.retracted_ids.len();
+        let include_retracted = self.include_retracted;
+        let retracted_ids = &self.retracted_ids;
+        let ns_filter = &self.namespace_filter;
+        self.claims.most_recent(n + extra)
+            .into_iter()
+            .filter(|c| (include_retracted || !retracted_ids.contains(&c.claim_id))
+                && (ns_filter.is_empty() || ns_filter.iter().any(|ns| ns == &c.namespace)))
+            .take(n)
+            .cloned()
+            .map(|mut c| { Self::apply_status_overlay(&self.status_overrides, &mut c); c })
+            .collect()
     }
 
     /// Search entities by text query.

@@ -247,6 +247,12 @@ class IngestionPipeline:
         subj_ext = (claim_input.external_ids or {}).get("subject", {})
         obj_ext = (claim_input.external_ids or {}).get("object", {})
 
+        # Compute expires_at from ttl_seconds
+        ttl_seconds = getattr(claim_input, "ttl_seconds", 0) or 0
+        expires_at = 0
+        if ttl_seconds > 0:
+            expires_at = timestamp + ttl_seconds * 1_000_000_000
+
         claim = Claim(
             claim_id=claim_id,
             content_id=content_id,
@@ -271,6 +277,8 @@ class IngestionPipeline:
             payload=payload,
             timestamp=timestamp,
             status=ClaimStatus.ACTIVE,
+            namespace=getattr(claim_input, "namespace", "") or "",
+            expires_at=expires_at,
         )
         return claim, embedding
 

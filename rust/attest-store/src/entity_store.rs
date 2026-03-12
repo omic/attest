@@ -14,6 +14,22 @@ pub(crate) fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// BM25 scoring parameters
+const BM25_K1: f64 = 1.2;
+const BM25_B: f64 = 0.75;
+
+/// Compute BM25 score for a document matching a single query term.
+/// - tf: term frequency in document
+/// - df: document frequency (how many docs contain this term)
+/// - dl: document length (number of tokens)
+/// - avgdl: average document length across corpus
+/// - n: total number of documents
+pub fn bm25_score(tf: f64, df: f64, dl: f64, avgdl: f64, n: f64) -> f64 {
+    let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+    let tf_norm = (tf * (BM25_K1 + 1.0)) / (tf + BM25_K1 * (1.0 - BM25_B + BM25_B * dl / avgdl));
+    idf * tf_norm
+}
+
 /// Stored entity data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntityData {
@@ -145,27 +161,72 @@ impl EntityStore {
     }
 
     /// Search entities by text query. Returns entities matching any query token,
-    /// ranked by number of matching tokens (BM25-lite).
+    /// ranked by BM25 relevance score.
     pub fn search(&self, query: &str, top_k: usize) -> Vec<&EntityData> {
         let tokens = tokenize(query);
         if tokens.is_empty() {
             return Vec::new();
         }
 
-        // Count matching tokens per entity
-        let mut scores: HashMap<&str, usize> = HashMap::new();
+        let n = self.entities.len() as f64;
+        if n == 0.0 {
+            return Vec::new();
+        }
+
+        // Compute average document length (number of indexed tokens per entity).
+        // Sum up all posting list lengths; each entity contributes one entry per
+        // unique token, so the sum equals total (entity, token) pairs.
+        let total_tokens: usize = self.text_index.values().map(|v| v.len()).sum();
+        let avgdl = total_tokens as f64 / n;
+
+        // Collect per-entity token hits and document frequencies
+        // tf_map: entity_id -> { token -> count }
+        let mut tf_map: HashMap<&str, HashMap<&str, usize>> = HashMap::new();
+        let mut df_map: HashMap<&str, usize> = HashMap::new();
+
         for token in &tokens {
-            if let Some(entity_ids) = self.text_index.get(token) {
+            if let Some(entity_ids) = self.text_index.get(token.as_str()) {
+                // df = number of distinct entities containing this token
+                *df_map.entry(token.as_str()).or_insert(0) = entity_ids.len();
                 for eid in entity_ids {
-                    *scores.entry(eid.as_str()).or_insert(0) += 1;
+                    *tf_map
+                        .entry(eid.as_str())
+                        .or_default()
+                        .entry(token.as_str())
+                        .or_insert(0) += 1;
                 }
             }
         }
 
-        // Sort by score descending, take top_k
-        let mut ranked: Vec<(&str, usize)> = scores.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1));
-        ranked
+        // Pre-compute document lengths (number of tokens per entity)
+        // We cache this to avoid re-scanning the text_index for each entity.
+        let mut dl_cache: HashMap<&str, usize> = HashMap::new();
+        for entity_ids in self.text_index.values() {
+            for eid in entity_ids {
+                *dl_cache.entry(eid.as_str()).or_insert(0) += 1;
+            }
+        }
+
+        // Compute BM25 score for each matching entity
+        let mut scored: Vec<(&str, f64)> = tf_map
+            .iter()
+            .map(|(&eid, token_counts)| {
+                let dl = *dl_cache.get(eid).unwrap_or(&1) as f64;
+                let score: f64 = token_counts
+                    .iter()
+                    .map(|(&tok, &tf)| {
+                        let df = *df_map.get(tok).unwrap_or(&1) as f64;
+                        bm25_score(tf as f64, df, dl, avgdl, n)
+                    })
+                    .sum();
+                (eid, score)
+            })
+            .collect();
+
+        // Sort by score descending
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        scored
             .into_iter()
             .take(top_k)
             .filter_map(|(eid, _)| self.entities.get(eid))
@@ -351,5 +412,47 @@ mod tests {
         // top_k=100 but only 2 entities match "dna" — should return 2 without error
         let results = store.search("dna", 100);
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_bm25_score_basic() {
+        // With tf=1, df=1, dl=avgdl, the score should be positive
+        let score = bm25_score(1.0, 1.0, 5.0, 5.0, 10.0);
+        assert!(score > 0.0, "BM25 score should be positive for matching terms");
+
+        // Higher TF should give higher score (same doc length)
+        let score_tf1 = bm25_score(1.0, 1.0, 5.0, 5.0, 10.0);
+        let score_tf3 = bm25_score(3.0, 1.0, 5.0, 5.0, 10.0);
+        assert!(score_tf3 > score_tf1, "Higher TF should increase score");
+
+        // Rarer term (lower DF) should give higher score
+        let score_common = bm25_score(1.0, 8.0, 5.0, 5.0, 10.0);
+        let score_rare = bm25_score(1.0, 1.0, 5.0, 5.0, 10.0);
+        assert!(score_rare > score_common, "Rarer terms should score higher");
+
+        // Shorter document should score higher (same TF)
+        let score_short = bm25_score(1.0, 1.0, 3.0, 5.0, 10.0);
+        let score_long = bm25_score(1.0, 1.0, 10.0, 5.0, 10.0);
+        assert!(score_short > score_long, "Shorter docs should score higher for same TF");
+    }
+
+    #[test]
+    fn test_bm25_ranking_in_entity_store() {
+        let mut store = EntityStore::new();
+        // Short doc with "brca1" — high term density
+        store.upsert("brca1_gene", "gene", "brca1 gene", None, 0);
+        // Long doc with "brca1" — lower term density
+        store.upsert(
+            "brca1_pathway",
+            "pathway",
+            "brca1 related dna repair signaling pathway",
+            None,
+            0,
+        );
+
+        let results = store.search("brca1", 10);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id, "brca1_gene", "short doc should rank first");
+        assert_eq!(results[1].id, "brca1_pathway", "long doc should rank second");
     }
 }

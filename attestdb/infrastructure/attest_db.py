@@ -8,6 +8,7 @@ import logging
 import os
 import shutil
 import tempfile
+import time
 from collections import deque
 from typing import TYPE_CHECKING
 
@@ -29,7 +30,9 @@ from attestdb.core.normalization import normalize_entity_id
 from attestdb.core.types import (
     Analogy,
     AskResult,
+    AuditEvent,
     BatchResult,
+    Role,
     BeliefChange,
     BriefSection,
     CascadeResult,
@@ -80,21 +83,76 @@ from attestdb.core.types import (
 from attestdb.infrastructure.embedding_index import EmbeddingIndex
 from attestdb.infrastructure.ingestion import IngestionPipeline
 from attestdb.infrastructure.query_engine import QueryEngine
+from attestdb.infrastructure.tracing import span as _span, set_attribute as _set_attr, record_exception as _record_exc
 
 logger = logging.getLogger(__name__)
 
+# ── Defaults (extracted from method signatures) ─────────────────────────
+DEFAULT_ITER_BATCH_SIZE = 10_000
 
-def _make_store(db_path: str):
+
+def _claim_is_expired(claim, now_ns: int) -> bool:
+    """Return True if a claim has a TTL and has expired."""
+    expires_at = getattr(claim, "expires_at", 0) or 0
+    return expires_at > 0 and now_ns >= expires_at
+DEFAULT_MAX_CLAIMS = 500
+DEFAULT_MAX_TOKENS = 4000
+DEFAULT_MAX_RELATIONSHIPS = 400
+ENTITY_BUDGET_FLOOR = 60
+FRESHNESS_HALF_LIFE_DAYS = 30
+
+
+def _make_store(db_path: str, *, read_only: bool = False):
     """Create the raw Rust store backend."""
     from attest_rust import RustStore
     if db_path == ":memory:":
         return RustStore.in_memory()
     rust_path = db_path if db_path.endswith((".substrate", ".attest")) else db_path + ".attest"
+    if read_only:
+        return RustStore.open_read_only(rust_path)
     return RustStore(rust_path)
 
 
 class AttestDB:
     """Main entry point for Attest — wraps all infrastructure components."""
+
+    @classmethod
+    def open_read_only(cls, db_path: str) -> "AttestDB":
+        """Open a database in read-only mode (no lock contention).
+
+        Copies the DB to a temp file internally. All write operations
+        are silently ignored. Use for hooks and concurrent readers.
+        """
+        instance = cls.__new__(cls)
+        instance._db_path = db_path
+        instance._embedding_dim = None
+        instance._strict = False
+        instance._store = _make_store(db_path, read_only=True)
+        # Read-only: no sidecar migration needed (status is in Rust engine)
+        instance._embedding_index = None
+        instance._pipeline = None
+        instance._query_engine = QueryEngine(
+            instance._store,
+            claim_converter=lambda d: claim_from_dict(d),
+        )
+        instance._event_hooks = {}
+        instance._scheduler = None
+        instance._chain_log = []
+        instance._last_chain_hash = "genesis"
+        instance._actor = ""
+        instance._audit_path = None
+        instance._rbac = {}
+        instance._rbac_path = None
+        instance._rbac_enabled = False
+        instance._curator = None
+        instance._text_extractor = None
+        instance._insight_engine = None
+        instance._researcher = None
+        instance._curator_model = "heuristic"
+        instance._curator_api_key = None
+        instance._curator_env_path = None
+        instance._domain_context = None
+        return instance
 
     def __init__(
         self,
@@ -108,9 +166,8 @@ class AttestDB:
 
         self._store = _make_store(db_path)
 
-        # Status overrides (for retractions — sidecar file)
-        self._status_overrides: dict[str, str] = {}
-        self._load_status_overrides()
+        # Migrate legacy retraction sidecar to Rust engine (one-time)
+        self._migrate_retraction_sidecar()
 
         # Embedding index
         self._embedding_index: EmbeddingIndex | None = None
@@ -125,10 +182,8 @@ class AttestDB:
             self._store, self._embedding_index, embedding_dim, strict
         )
 
-        # Query engine — pass claim converter that applies status overrides
-        def _convert_claim(d):
-            return self._apply_status_overrides(claim_from_dict(d))
-        self._query_engine = QueryEngine(self._store, claim_converter=_convert_claim)
+        # Query engine — Rust engine handles status filtering natively
+        self._query_engine = QueryEngine(self._store, claim_converter=claim_from_dict)
 
         # Event hooks
         self._event_hooks: dict[str, list] = {}
@@ -141,6 +196,20 @@ class AttestDB:
         self._last_chain_hash: str = "genesis"
         self._load_chain_log()
 
+        # Audit log (append-only JSONL)
+        self._actor: str = ""
+        self._audit_path: str | None = None
+        if not self._is_memory_db:
+            self._audit_path = self._db_path + ".audit.jsonl"
+
+        # RBAC (per-namespace role-based access control)
+        self._rbac: dict[str, dict[str, str]] = {}  # {principal: {namespace: role}}
+        self._rbac_path: str | None = None
+        self._rbac_enabled: bool = False
+        if not self._is_memory_db:
+            self._rbac_path = self._db_path + ".rbac.json"
+            self._load_rbac()
+
         # Lazy-init intelligence components
         self._curator = None
         self._text_extractor = None
@@ -151,47 +220,25 @@ class AttestDB:
         self._curator_env_path = None
         self._domain_context: str | None = None
 
-    # --- Status overrides (retraction sidecar) ---
+    # --- Retraction sidecar migration ---
 
-    def _sidecar_path(self) -> str:
-        return self._db_path + ".retracted.json"
-
-    def _load_status_overrides(self) -> None:
-        path = self._sidecar_path()
-        if os.path.exists(path):
-            with builtins.open(path) as f:
-                self._status_overrides = json.load(f)
-
-    def _save_status_overrides(self) -> None:
+    def _migrate_retraction_sidecar(self) -> None:
+        """One-time migration: import legacy .retracted.json into Rust engine."""
         if self._is_memory_db:
             return
-        path = self._sidecar_path()
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", suffix=".tmp")
+        sidecar = self._db_path + ".retracted.json"
+        if not os.path.exists(sidecar):
+            return
         try:
-            with os.fdopen(fd, "w") as f:
-                json.dump(self._status_overrides, f)
-            os.replace(tmp, path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-
-    def _apply_status_overrides(self, claim: Claim) -> Claim:
-        """Apply status overrides from retraction sidecar."""
-        if claim.claim_id in self._status_overrides:
-            try:
-                claim.status = ClaimStatus(self._status_overrides[claim.claim_id])
-            except ValueError:
-                pass
-        return claim
-
-    def _update_claim_status(self, claim_ids: list[str], new_status: str) -> None:
-        """Update claim status via in-memory overrides + sidecar file."""
-        for cid in claim_ids:
-            self._status_overrides[cid] = new_status
-        self._save_status_overrides()
+            with builtins.open(sidecar) as f:
+                overrides = json.load(f)
+            if overrides:
+                updates = [(cid, status) for cid, status in overrides.items()]
+                self._store.update_claim_status_batch(updates)
+                logger.info("Migrated %d retraction overrides from sidecar to Rust engine", len(updates))
+            os.rename(sidecar, sidecar + ".migrated")
+        except Exception as e:
+            logger.warning("Failed to migrate retraction sidecar: %s", e)
 
     # --- Embedding provider ---
 
@@ -312,26 +359,37 @@ class AttestDB:
             prev = expected_hash
         return {"valid": True, "length": len(self._chain_log), "error": None}
 
+    def get_claim(self, claim_id: str) -> "Claim | None":
+        """Get a single claim by ID. O(1) via Rust index lookup."""
+        d = self._store.get_claim(claim_id)
+        if d is None:
+            return None
+        return claim_from_dict(d)
+
     def _all_claims(self) -> list[Claim]:
         """Return all claims via Rust store."""
-        return [
-            self._apply_status_overrides(claim_from_dict(d))
-            for d in self._store.all_claims()
-        ]
+        return [claim_from_dict(d) for d in self._store.all_claims()]
 
-    def iter_claims(self, batch_size: int = 10000):
+    def iter_claims(self, batch_size: int = DEFAULT_ITER_BATCH_SIZE, exclude_expired: bool = False):
         """Yield all claims by paging through the Rust store.
 
         Generator that fetches ``batch_size`` claims at a time, avoiding
         materializing the entire claim set in memory.
+
+        Args:
+            exclude_expired: If True, skip claims whose ``expires_at`` has passed.
         """
+        now_ns = int(time.time() * 1_000_000_000) if exclude_expired else 0
         offset = 0
         while True:
             batch = self._store.all_claims(offset, batch_size)
             if not batch:
                 break
             for d in batch:
-                yield self._apply_status_overrides(claim_from_dict(d))
+                claim = claim_from_dict(d)
+                if exclude_expired and _claim_is_expired(claim, now_ns):
+                    continue
+                yield claim
             if len(batch) < batch_size:
                 break
             offset += batch_size
@@ -360,6 +418,266 @@ class AttestDB:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
         return False
+
+    # --- Namespace isolation ---
+
+    def set_namespace(self, namespace: str) -> None:
+        """Filter all queries to a single namespace.
+
+        Claims without a matching namespace are invisible to queries,
+        entity listings, and claim iteration.  Pass an empty string
+        to clear the filter (all namespaces visible).
+        """
+        if namespace:
+            self._store.set_namespace_filter([namespace])
+        else:
+            self._store.set_namespace_filter([])
+
+    def set_namespaces(self, namespaces: list[str]) -> None:
+        """Filter queries to multiple namespaces.
+
+        Pass an empty list to clear the filter.
+        """
+        self._store.set_namespace_filter(namespaces)
+
+    def get_namespaces(self) -> list[str]:
+        """Return the current namespace filter (empty = all visible)."""
+        return self._store.get_namespace_filter()
+
+    # --- Audit log ---
+
+    def set_actor(self, actor: str) -> None:
+        """Set the current actor identity for audit logging.
+
+        All subsequent mutations (ingest, retract, etc.) will be
+        attributed to this actor in the audit log.
+        """
+        self._actor = actor
+
+    def _audit_write(self, event: str, **kwargs) -> None:
+        """Append an audit event to the JSONL log."""
+        if not self._audit_path:
+            return
+        import time as _time
+
+        entry = {
+            "event": event,
+            "timestamp": int(_time.time() * 1_000_000_000),
+            "actor": self._actor,
+            **kwargs,
+        }
+        try:
+            with builtins.open(self._audit_path, "a") as f:
+                f.write(json.dumps(entry, default=str) + "\n")
+        except Exception as exc:
+            logger.warning("Failed to write audit event: %s", exc)
+
+    def audit_log(
+        self,
+        since: int = 0,
+        event_type: str | None = None,
+        actor: str | None = None,
+        limit: int = 1000,
+    ) -> list[AuditEvent]:
+        """Query the audit log.
+
+        Args:
+            since: Nanosecond timestamp. Returns events after this time.
+            event_type: Filter to a specific event type (e.g. "claim_ingested").
+            actor: Filter to a specific actor.
+            limit: Max events to return.
+
+        Returns:
+            List of AuditEvent, oldest first.
+        """
+        if not self._audit_path or not os.path.exists(self._audit_path):
+            return []
+        events = []
+        with builtins.open(self._audit_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts = d.get("timestamp", 0)
+                if ts <= since:
+                    continue
+                if event_type and d.get("event") != event_type:
+                    continue
+                if actor and d.get("actor") != actor:
+                    continue
+                evt = d.get("event", "")
+                events.append(AuditEvent(
+                    event=evt,
+                    timestamp=ts,
+                    actor=d.get("actor", ""),
+                    claim_id=d.get("claim_id", ""),
+                    source_id=d.get("source_id", ""),
+                    namespace=d.get("namespace", ""),
+                    details={k: v for k, v in d.items()
+                             if k not in ("event", "timestamp", "actor",
+                                          "claim_id", "source_id", "namespace")},
+                ))
+                if len(events) >= limit:
+                    break
+        return events
+
+    # --- RBAC (role-based access control) ---
+
+    def _load_rbac(self) -> None:
+        """Load RBAC config from sidecar file."""
+        if self._rbac_path and os.path.exists(self._rbac_path):
+            try:
+                with builtins.open(self._rbac_path) as f:
+                    data = json.load(f)
+                self._rbac = data.get("grants", {})
+                self._rbac_enabled = data.get("enabled", False)
+            except Exception as exc:
+                logger.warning("Failed to load RBAC config: %s", exc)
+
+    def _save_rbac(self) -> None:
+        """Persist RBAC config to sidecar file."""
+        if not self._rbac_path:
+            return
+        try:
+            with builtins.open(self._rbac_path, "w") as f:
+                json.dump({"enabled": self._rbac_enabled, "grants": self._rbac}, f, indent=2)
+        except Exception as exc:
+            logger.warning("Failed to save RBAC config: %s", exc)
+
+    def enable_rbac(self) -> None:
+        """Enable RBAC enforcement. Once enabled, all mutations require a
+        matching grant for the current actor + active namespace."""
+        self._rbac_enabled = True
+        self._save_rbac()
+
+    def disable_rbac(self) -> None:
+        """Disable RBAC enforcement (all operations permitted)."""
+        self._rbac_enabled = False
+        self._save_rbac()
+
+    def grant(self, principal: str, namespace: str, role: str | Role) -> None:
+        """Grant a role to a principal on a namespace.
+
+        Args:
+            principal: User or service identity (e.g. "alice@corp.com").
+            namespace: Namespace to grant access to. Use "*" for all namespaces.
+            role: One of "admin", "writer", "reader" (or Role enum).
+
+        Example::
+
+            db.grant("alice@corp.com", "team_a", "writer")
+            db.grant("bob@corp.com", "*", "admin")
+        """
+        if isinstance(role, Role):
+            role = role.value
+        if role not in ("admin", "writer", "reader"):
+            raise ValueError(f"Invalid role: {role}. Must be admin, writer, or reader.")
+        self._check_permission("admin")
+        grants = self._rbac.setdefault(principal, {})
+        grants[namespace] = role
+        self._save_rbac()
+        self._audit_write("rbac_grant", principal=principal, namespace=namespace, role=role)
+
+    def revoke(self, principal: str, namespace: str) -> None:
+        """Revoke a principal's access to a namespace.
+
+        Args:
+            principal: User or service identity.
+            namespace: Namespace to revoke. Use "*" to revoke global access.
+        """
+        self._check_permission("admin")
+        grants = self._rbac.get(principal, {})
+        grants.pop(namespace, None)
+        if not grants:
+            self._rbac.pop(principal, None)
+        self._save_rbac()
+        self._audit_write("rbac_revoke", principal=principal, namespace=namespace)
+
+    def list_grants(self, principal: str | None = None) -> dict:
+        """List all RBAC grants, optionally filtered by principal.
+
+        Returns dict: {principal: {namespace: role}}.
+        """
+        if principal:
+            grants = self._rbac.get(principal, {})
+            return {principal: grants} if grants else {}
+        return dict(self._rbac)
+
+    def _get_actor_role(self, namespace: str = "") -> str | None:
+        """Get the current actor's effective role for a namespace."""
+        if not self._actor:
+            return None
+        grants = self._rbac.get(self._actor, {})
+        # Check specific namespace first, then wildcard
+        role = grants.get(namespace) or grants.get("*")
+        return role
+
+    def _check_permission(self, required_role: str) -> None:
+        """Raise PermissionError if RBAC is enabled and actor lacks permission.
+
+        Role hierarchy: admin > writer > reader.
+        """
+        if not self._rbac_enabled:
+            return
+        if not self._actor:
+            raise PermissionError("RBAC is enabled but no actor set. Call db.set_actor() first.")
+
+        # Determine effective namespace
+        ns_filter = self._store.get_namespace_filter()
+        namespace = ns_filter[0] if len(ns_filter) == 1 else ""
+
+        role = self._get_actor_role(namespace)
+        if role is None:
+            raise PermissionError(
+                f"Actor '{self._actor}' has no access to namespace '{namespace or '*'}'."
+            )
+
+        hierarchy = {"admin": 3, "writer": 2, "reader": 1}
+        required_level = hierarchy.get(required_role, 0)
+        actual_level = hierarchy.get(role, 0)
+        if actual_level < required_level:
+            raise PermissionError(
+                f"Actor '{self._actor}' has role '{role}' but '{required_role}' is required."
+            )
+
+    # --- Change feed ---
+
+    def changes(self, since: int = 0, limit: int = 1000) -> tuple[list[Claim], int]:
+        """Return claims ingested after timestamp `since`.
+
+        Returns (claims, cursor) where cursor is the max timestamp seen.
+        Use the returned cursor as `since` in the next call for
+        cursor-based pagination::
+
+            cursor = 0
+            while True:
+                claims, cursor = db.changes(since=cursor)
+                for c in claims:
+                    process(c)
+                time.sleep(5)
+
+        Args:
+            since: Nanosecond timestamp. Returns claims with timestamp > since.
+            limit: Max claims to return per call.
+
+        Returns:
+            Tuple of (claims, new_cursor). If no new claims, cursor == since.
+        """
+        import time as _time
+
+        max_ts = int(_time.time() * 1_000_000_000)
+        raw = self._store.claims_in_range(since + 1, max_ts)
+        claims = [claim_from_dict(d) for d in raw]
+        # Sort by timestamp ascending for deterministic ordering
+        claims.sort(key=lambda c: c.timestamp)
+        if limit and len(claims) > limit:
+            claims = claims[:limit]
+        new_cursor = claims[-1].timestamp if claims else since
+        return claims, new_cursor
 
     # --- Event hooks ---
 
@@ -417,10 +735,7 @@ class AttestDB:
             self._pipeline._store = self._store
             self._query_engine._store = self._store
 
-        # Copy retraction sidecar
-        sidecar = self._sidecar_path()
-        if os.path.exists(sidecar):
-            shutil.copy2(sidecar, os.path.join(dest_path, os.path.basename(sidecar)))
+        # Retraction status is now stored in the Rust engine (no sidecar needed)
 
         # Flush + copy chain log
         self._flush_chain_log()
@@ -456,9 +771,6 @@ class AttestDB:
             src_file = os.path.join(src_path, entry)
             if entry.endswith(store_ext):
                 dst = dest_path + store_ext if not dest_path.endswith(store_ext) else dest_path
-                shutil.copy2(src_file, dst)
-            elif entry.endswith(".retracted.json"):
-                dst = dest_path + ".retracted.json"
                 shutil.copy2(src_file, dst)
             elif entry.endswith(".chain.json"):
                 dst = dest_path + ".chain.json"
@@ -499,6 +811,8 @@ class AttestDB:
         payload: dict | None = None,
         timestamp: int | None = None,
         external_ids: dict | None = None,
+        namespace: str = "",
+        ttl_seconds: int = 0,
     ) -> str:
         """Ingest a single claim. Returns claim_id.
 
@@ -506,7 +820,9 @@ class AttestDB:
 
             db.ingest(claim_input)
             db.ingest(subject=(...), predicate=(...), object=(...), provenance={...})
+            db.ingest(subject=(...), ..., namespace="team_a", ttl_seconds=3600)
         """
+        self._check_permission("writer")
         if isinstance(subject, ClaimInput):
             ci = subject
         else:
@@ -520,10 +836,22 @@ class AttestDB:
                 payload=payload,
                 timestamp=timestamp,
                 external_ids=external_ids,
+                namespace=namespace,
+                ttl_seconds=ttl_seconds,
             )
-        claim_id = self._pipeline.ingest(ci)
-        self._append_chain(claim_id)
-        self._flush_chain_log()
+        with _span("attestdb.ingest", {"subject": ci.subject[0], "predicate": ci.predicate[0]}):
+            claim_id = self._pipeline.ingest(ci)
+            self._append_chain(claim_id)
+            self._flush_chain_log()
+            _set_attr("claim_id", claim_id)
+        self._audit_write(
+            "claim_ingested",
+            claim_id=claim_id,
+            namespace=ci.namespace if hasattr(ci, "namespace") else "",
+            subject=ci.subject[0],
+            predicate=ci.predicate[0],
+            object=ci.object[0],
+        )
         self._fire("claim_ingested", claim_id=claim_id, claim_input=ci)
         # Check corroboration
         content_id = compute_content_id(
@@ -543,8 +871,19 @@ class AttestDB:
         return claim_id
 
     def ingest_batch(self, claims: list[ClaimInput]) -> BatchResult:
-        result = self._pipeline.ingest_batch(claims, on_ingested=self._append_chain)
-        self._flush_chain_log()
+        self._check_permission("writer")
+        with _span("attestdb.ingest_batch", {"batch_size": len(claims)}):
+            result = self._pipeline.ingest_batch(claims, on_ingested=self._append_chain)
+            self._flush_chain_log()
+            _set_attr("ingested", result.ingested)
+            _set_attr("duplicates", result.duplicates)
+        if result.ingested > 0:
+            self._audit_write(
+                "batch_ingested",
+                count=result.ingested,
+                duplicates=result.duplicates,
+                errors=len(result.errors),
+            )
         return result
 
     # --- Querying ---
@@ -555,18 +894,21 @@ class AttestDB:
         depth: int = 2,
         min_confidence: float = 0.0,
         exclude_source_types: list[str] | None = None,
-        max_claims: int = 500,
-        max_tokens: int = 4000,
+        max_claims: int = DEFAULT_MAX_CLAIMS,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
         llm_narrative: bool = False,
         confidence_threshold: float = 0.0,
         predicate_types: list[str] | None = None,
     ) -> ContextFrame:
-        frame = self._query_engine.query(
-            focal_entity, depth, min_confidence, exclude_source_types,
-            max_claims, max_tokens,
-            confidence_threshold=confidence_threshold,
-            predicate_types=predicate_types,
-        )
+        with _span("attestdb.query", {"focal_entity": focal_entity, "depth": depth}):
+            frame = self._query_engine.query(
+                focal_entity, depth, min_confidence, exclude_source_types,
+                max_claims, max_tokens,
+                confidence_threshold=confidence_threshold,
+                predicate_types=predicate_types,
+            )
+            _set_attr("claim_count", frame.claim_count)
+            _set_attr("relationship_count", len(frame.direct_relationships))
         # Enrich with topology if computed
         if hasattr(self, "_topology") and self._topology is not None:
             frame.topic_membership = self._get_topic_membership(frame.focal_entity.id)
@@ -610,8 +952,8 @@ class AttestDB:
         depth: int = 2,
         min_confidence: float = 0.0,
         exclude_source_types: list[str] | None = None,
-        max_claims: int = 500,
-        max_tokens: int = 4000,
+        max_claims: int = DEFAULT_MAX_CLAIMS,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
         confidence_threshold: float = 0.0,
         predicate_types: list[str] | None = None,
     ) -> tuple[ContextFrame, QueryProfile]:
@@ -917,7 +1259,7 @@ class AttestDB:
         self,
         clusters: list[list[str]],
         entity_map: dict[str, "EntitySummary"],
-        max_rels: int = 400,
+        max_rels: int = DEFAULT_MAX_RELATIONSHIPS,
     ) -> str:
         """Build evidence organized by topic cluster.
 
@@ -932,7 +1274,7 @@ class AttestDB:
         for cluster in clusters:
             label = self._label_cluster(cluster, entity_map)
             # Proportional budget, floor of 60
-            budget = max(60, int(max_rels * len(cluster) / max(total_entities, 1)))
+            budget = max(ENTITY_BUDGET_FLOOR, int(max_rels * len(cluster) / max(total_entities, 1)))
             evidence = self._gather_evidence(cluster, max_rels=budget)
             if evidence.strip():
                 sections.append(f"# Topic: {label}\n{evidence}")
@@ -1074,10 +1416,10 @@ class AttestDB:
         # Step 5: Gather evidence (clustered or flat)
         if multi_topic:
             evidence = self._gather_clustered_evidence(
-                clusters, entity_map, max_rels=400,
+                clusters, entity_map, max_rels=DEFAULT_MAX_RELATIONSHIPS,
             )
         else:
-            evidence = self._gather_evidence(selected_ids, max_rels=400)
+            evidence = self._gather_evidence(selected_ids, max_rels=DEFAULT_MAX_RELATIONSHIPS)
 
         # Step 6: LLM synthesis
         base_instructions = (
@@ -1319,22 +1661,16 @@ class AttestDB:
         min_confidence: float = 0.0,
     ) -> list[Claim]:
         return [
-            self._apply_status_overrides(claim_from_dict(d))
+            claim_from_dict(d)
             for d in self._store.claims_for(entity_id, predicate_type, source_type, min_confidence)
         ]
 
     def claims_by_content_id(self, content_id: str) -> list[Claim]:
-        return [
-            self._apply_status_overrides(claim_from_dict(d))
-            for d in self._store.claims_by_content_id(content_id)
-        ]
+        return [claim_from_dict(d) for d in self._store.claims_by_content_id(content_id)]
 
     def claims_by_source_id(self, source_id: str) -> list[Claim]:
         """Return all claims with the given source_id via Rust index (O(k))."""
-        return [
-            self._apply_status_overrides(claim_from_dict(d))
-            for d in self._store.claims_by_source_id(source_id)
-        ]
+        return [claim_from_dict(d) for d in self._store.claims_by_source_id(source_id)]
 
     def corroboration_report(self, min_sources: int = 2) -> dict:
         """Report on corroboration status across the knowledge graph.
@@ -1344,19 +1680,13 @@ class AttestDB:
         """
         from attestdb.core.confidence import count_independent_sources, corroboration_boost
 
-        entities = self.list_entities()
         content_id_claims: dict[str, list] = {}
-        seen_claim_ids: set[str] = set()
 
-        for entity in entities:
-            for claim in self.claims_for(entity.id):
-                cid = claim.content_id
-                if cid not in content_id_claims:
-                    content_id_claims[cid] = []
-                # Deduplicate by claim_id (O(1) set lookup)
-                if claim.claim_id not in seen_claim_ids:
-                    seen_claim_ids.add(claim.claim_id)
-                    content_id_claims[cid].append(claim)
+        for claim in self.iter_claims():
+            cid = claim.content_id
+            if cid not in content_id_claims:
+                content_id_claims[cid] = []
+            content_id_claims[cid].append(claim)
 
         corroborated = []
         single_source = []
@@ -1400,19 +1730,161 @@ class AttestDB:
 
     def claims_for_predicate(self, predicate_id: str) -> list[Claim]:
         """Return all claims with the given predicate id via Rust index (O(k))."""
-        return [
-            self._apply_status_overrides(claim_from_dict(d))
-            for d in self._store.claims_by_predicate_id(predicate_id)
-        ]
+        return [claim_from_dict(d) for d in self._store.claims_by_predicate_id(predicate_id)]
+
+    # --- Fork / Merge ---
+
+    def fork(self, name: str, dest_dir: str | None = None) -> "AttestDB":
+        """Create a branched copy of this database for isolated experimentation.
+
+        The fork is a full independent AttestDB backed by a copy of the
+        current store file.  Ingest, query, retract — everything works.
+        When done, call ``db.merge(fork)`` to promote the fork's new
+        claims into the main database.
+
+        Args:
+            name: Branch name (used as filename suffix).
+            dest_dir: Directory for the fork file. Defaults to same dir as main DB.
+
+        Returns:
+            A new AttestDB instance pointing at the forked store.
+
+        Example::
+
+            fork = db.fork("experiment_1")
+            fork.ingest(...)
+            report = db.merge(fork)
+        """
+        if self._is_memory_db:
+            raise ValueError("Cannot fork an in-memory database.")
+
+        # Determine source file
+        store_ext = ".attest"
+        src = self._db_path if self._db_path.endswith(store_ext) else self._db_path + store_ext
+
+        # Determine destination
+        if dest_dir is None:
+            dest_dir = os.path.dirname(src) or "."
+        fork_base = os.path.join(dest_dir, f"{os.path.basename(self._db_path)}.fork.{name}")
+        fork_file = fork_base if fork_base.endswith(store_ext) else fork_base + store_ext
+
+        # Flush and copy
+        self._store.close()
+        try:
+            shutil.copy2(src, fork_file)
+        finally:
+            self._store = _make_store(self._db_path)
+            self._pipeline._store = self._store
+            self._query_engine._store = self._store
+
+        fork_db = AttestDB(fork_base, embedding_dim=self._embedding_dim, strict=self._strict)
+        self._audit_write("fork_created", fork_name=name, fork_path=fork_file)
+        return fork_db
+
+    def merge(self, fork: "AttestDB", dry_run: bool = False) -> MergeReport:
+        """Merge claims from a forked database into this one.
+
+        Only claims that exist in the fork but NOT in the main DB
+        are merged (by claim_id).  Duplicate claim_ids are skipped.
+
+        Args:
+            fork: A forked AttestDB (typically created via ``db.fork()``).
+            dry_run: If True, compute the report without actually merging.
+
+        Returns:
+            MergeReport with counts of unique, shared, and conflicting beliefs.
+        """
+        self._check_permission("admin")
+
+        # Collect content_ids and claim_ids from both sides
+        main_claims = {c.claim_id: c for c in self.iter_claims()}
+        fork_claims = {c.claim_id: c for c in fork.iter_claims()}
+
+        main_content = {}  # content_id → (max_confidence, source_count)
+        for c in main_claims.values():
+            existing = main_content.get(c.content_id)
+            if existing is None:
+                main_content[c.content_id] = (c.confidence, 1)
+            else:
+                main_content[c.content_id] = (max(existing[0], c.confidence), existing[1] + 1)
+
+        fork_content = {}
+        for c in fork_claims.values():
+            existing = fork_content.get(c.content_id)
+            if existing is None:
+                fork_content[c.content_id] = (c.confidence, 1)
+            else:
+                fork_content[c.content_id] = (max(existing[0], c.confidence), existing[1] + 1)
+
+        # Identify new claims (in fork but not in main)
+        new_claim_ids = set(fork_claims.keys()) - set(main_claims.keys())
+
+        # Identify conflicts (same content_id, different confidence)
+        shared_content = set(main_content.keys()) & set(fork_content.keys())
+        conflicts = []
+        for cid in shared_content:
+            mc, ms = main_content[cid]
+            fc, fs = fork_content[cid]
+            if abs(mc - fc) > 0.05:  # Meaningful confidence difference
+                # Find a representative claim for labels
+                rep = next((c for c in fork_claims.values() if c.content_id == cid), None)
+                if rep:
+                    conflicts.append(MergeConflict(
+                        content_id=cid,
+                        subject=rep.subject.id,
+                        predicate=rep.predicate.id,
+                        object=rep.object.id,
+                        self_confidence=mc,
+                        other_confidence=fc,
+                        self_sources=ms,
+                        other_sources=fs,
+                    ))
+
+        # Entity diff
+        main_entities = {e.id for e in self.list_entities()}
+        fork_entities = {e.id for e in fork.list_entities()}
+
+        report = MergeReport(
+            self_unique_beliefs=len(set(main_claims.keys()) - set(fork_claims.keys())),
+            other_unique_beliefs=len(new_claim_ids),
+            shared_beliefs=len(set(main_claims.keys()) & set(fork_claims.keys())),
+            conflicts=conflicts,
+            self_unique_entities=sorted(main_entities - fork_entities),
+            other_unique_entities=sorted(fork_entities - main_entities),
+            shared_entities=sorted(main_entities & fork_entities),
+            self_total_claims=len(main_claims),
+            other_total_claims=len(fork_claims),
+        )
+
+        if not dry_run and new_claim_ids:
+            # Actually merge: insert new claims from fork
+            new_claims = [fork_claims[cid] for cid in new_claim_ids]
+            for claim in new_claims:
+                self._store.insert_claim(claim)
+                self._append_chain(claim.claim_id)
+            self._flush_chain_log()
+            self._audit_write(
+                "fork_merged",
+                merged_count=len(new_claims),
+                conflicts=len(conflicts),
+                fork_path=fork._db_path,
+            )
+
+        return report
 
     # --- Retraction ---
 
     def retract(self, source_id: str, reason: str) -> RetractResult:
         """Retract all claims from a source. Tombstones active claims and creates audit trail."""
-        claims = self.claims_by_source_id(source_id)
-        claim_ids = [c.claim_id for c in claims if c.status == ClaimStatus.ACTIVE]
+        self._check_permission("admin")
+        with _span("attestdb.retract", {"source_id": source_id}):
+            claim_ids = self._store.retract_source(source_id)
+            _set_attr("retracted_count", len(claim_ids))
         if claim_ids:
-            self._update_claim_status(claim_ids, ClaimStatus.TOMBSTONED.value)
+            # Remove retracted claims from embedding index
+            if self._embedding_index is not None:
+                for cid in claim_ids:
+                    self._embedding_index.remove(cid)
             # Ingest a retraction meta-claim for audit trail
             self._pipeline.ingest(ClaimInput(
                 subject=(source_id, "document"),
@@ -1422,6 +1894,12 @@ class AttestDB:
                 payload={"schema": "", "data": {"reason": reason}},
             ))
         result = RetractResult(source_id, reason, len(claim_ids), claim_ids)
+        self._audit_write(
+            "source_retracted",
+            source_id=source_id,
+            reason=reason,
+            retracted_count=len(claim_ids),
+        )
         self._fire("source_retracted", source_id=source_id, reason=reason, claim_ids=claim_ids)
         return result
 
@@ -1430,10 +1908,26 @@ class AttestDB:
     def _build_reverse_provenance_index(self) -> dict[str, list[str]]:
         """Scan all claims, build {claim_id: [dependent_claim_ids]}."""
         reverse_index: dict[str, list[str]] = {}
-        for claim in self._all_claims():
+        for claim in self.iter_claims():
             for upstream_id in claim.provenance.chain:
                 reverse_index.setdefault(upstream_id, []).append(claim.claim_id)
         return reverse_index
+
+    def purge_expired(self) -> int:
+        """Tombstone all claims whose expires_at has passed. Returns count of purged claims."""
+        self._check_permission("admin")
+        now_ns = int(time.time() * 1_000_000_000)
+        purged = 0
+        for claim in self.iter_claims():
+            if _claim_is_expired(claim, now_ns) and claim.status == ClaimStatus.ACTIVE:
+                self._store.update_claim_status(claim.claim_id, "tombstoned")
+                purged += 1
+                self._audit_write(
+                    "claim_expired",
+                    claim_id=claim.claim_id,
+                    namespace=claim.namespace,
+                )
+        return purged
 
     def retract_cascade(self, source_id: str, reason: str) -> CascadeResult:
         """Retract all claims from a source and mark downstream dependents as degraded."""
@@ -1456,7 +1950,8 @@ class AttestDB:
                     queue.append(dependent_id)
 
         if degraded:
-            self._update_claim_status(degraded, ClaimStatus.PROVENANCE_DEGRADED.value)
+            updates = [(cid, "provenance_degraded") for cid in degraded]
+            self._store.update_claim_status_batch(updates)
 
         return CascadeResult(
             source_retract=retract_result,
@@ -1583,7 +2078,7 @@ class AttestDB:
         where entity_a < entity_b (canonical ordering).
         """
         adj: dict[tuple[str, str], dict] = {}
-        for claim in self._all_claims():
+        for claim in self.iter_claims():
             pair = (
                 min(claim.subject.id, claim.object.id),
                 max(claim.subject.id, claim.object.id),
@@ -1804,7 +2299,7 @@ class AttestDB:
         # Timestamps are in nanoseconds (see ingestion.py)
         now_ns = int(time.time() * 1_000_000_000)
         if all_timestamps and max(all_timestamps) > 0:
-            half_life_ns = 30 * 86400 * 1_000_000_000  # 30 days in nanoseconds
+            half_life_ns = FRESHNESS_HALF_LIFE_DAYS * 86400 * 1_000_000_000
             freshness_sum = 0.0
             for ts in all_timestamps:
                 age_ns = max(0, now_ns - ts)
@@ -1837,7 +2332,7 @@ class AttestDB:
         topic_id: str,
         depth: int = 2,
         min_confidence: float = 0.0,
-        max_claims: int = 500,
+        max_claims: int = DEFAULT_MAX_CLAIMS,
     ) -> list[ContextFrame]:
         """Query all entities in a topic, returning a ContextFrame per member."""
         if not hasattr(self, "_topology") or self._topology is None:
@@ -2345,7 +2840,7 @@ class AttestDB:
                 desc.entity_types.get(entity.entity_type, 0) + 1
             )
 
-        for claim in self._all_claims():
+        for claim in self.iter_claims():
             desc.total_claims += 1
 
             pred = claim.predicate.id
@@ -2417,30 +2912,29 @@ class AttestDB:
         from attestdb.core.types import BlindspotMap
         from attestdb.core.vocabulary import knowledge_sort_key
 
-        entities = self.list_entities()
-
-        # Single pass: collect claims per entity and build subject→predicate map
-        single_source = []
+        # Single pass over all claims: build per-entity source counts and
+        # subject→predicate maps for unresolved detection.
+        entity_sources: dict[str, set[str]] = {}
+        entity_evidence_count: dict[str, int] = {}
         subject_predicates: dict[str, set[str]] = {}
         subject_claims: dict[str, list] = {}
 
-        for entity in entities:
-            claims = self.claims_for(entity.id)
-
-            # Single-source detection
-            evidence_claims = [c for c in claims if c.predicate.id != "inquiry"]
-            sources = {c.provenance.source_id for c in evidence_claims}
-            if len(sources) == 1 and len(evidence_claims) >= min_claims:
-                single_source.append(entity.id)
+        for c in self.iter_claims():
+            # Track sources per entity (subject + object) for single-source detection
+            for eid in (c.subject.id, c.object.id):
+                if c.predicate.id != "inquiry":
+                    entity_sources.setdefault(eid, set()).add(c.provenance.source_id)
+                    entity_evidence_count[eid] = entity_evidence_count.get(eid, 0) + 1
 
             # Build subject→predicate map for unresolved detection
-            for c in claims:
-                subj = c.subject.id
-                if subj not in subject_predicates:
-                    subject_predicates[subj] = set()
-                    subject_claims[subj] = []
-                subject_predicates[subj].add(c.predicate.id)
-                subject_claims[subj].append(c)
+            subj = c.subject.id
+            subject_predicates.setdefault(subj, set()).add(c.predicate.id)
+            subject_claims.setdefault(subj, []).append(c)
+
+        single_source = [
+            eid for eid, sources in entity_sources.items()
+            if len(sources) == 1 and entity_evidence_count.get(eid, 0) >= min_claims
+        ]
 
         # Compute knowledge gaps from predicate constraints
         knowledge_gaps: list[dict] = []
@@ -2546,16 +3040,22 @@ class AttestDB:
         now_ns = int(time.time() * 1_000_000_000)
         min_age_ns = min_age_days * 86400 * 1_000_000_000
 
-        fragile_claims = []
-        for claim in self._all_claims():
+        # Single-pass: group source_ids by content_id, then filter
+        content_sources: dict[str, set[str]] = {}
+        content_claims: dict[str, list] = {}
+        for claim in self.iter_claims():
             if claim.status != ClaimStatus.ACTIVE:
                 continue
             if min_age_ns > 0 and (now_ns - claim.timestamp) < min_age_ns:
                 continue
-            corroborating = self.claims_by_content_id(claim.content_id)
-            unique_sources = {c.provenance.source_id for c in corroborating}
-            if len(unique_sources) <= max_sources:
-                fragile_claims.append(claim)
+            cid = claim.content_id
+            content_sources.setdefault(cid, set()).add(claim.provenance.source_id)
+            content_claims.setdefault(cid, []).append(claim)
+
+        fragile_claims = []
+        for cid, sources in content_sources.items():
+            if len(sources) <= max_sources:
+                fragile_claims.extend(content_claims[cid])
 
         return fragile_claims
 
@@ -2565,7 +3065,7 @@ class AttestDB:
 
         cutoff_ns = int(time.time() * 1_000_000_000) - (days * 86400 * 1_000_000_000)
         stale_claims = []
-        for claim in self._all_claims():
+        for claim in self.iter_claims():
             if claim.status != ClaimStatus.ACTIVE:
                 continue
             if claim.timestamp < cutoff_ns:
@@ -2577,13 +3077,7 @@ class AttestDB:
         """Build a full audit trail for a claim."""
         from attestdb.core.types import AuditTrail
 
-        # Single-pass scan to find the claim by ID
-        found = None
-        for claim in self._all_claims():
-            if claim.claim_id == claim_id:
-                found = claim
-                break
-
+        found = self.get_claim(claim_id)
         if found is None:
             return AuditTrail(claim_id=claim_id)
 
@@ -2616,47 +3110,57 @@ class AttestDB:
         now_ns = int(time.time() * 1_000_000_000)
         cutoff_ns = now_ns - (days * 86400 * 1_000_000_000)
 
-        all_claims = self._all_claims()
-        before = [c for c in all_claims if c.timestamp <= cutoff_ns]
-        after_new = [c for c in all_claims if c.timestamp > cutoff_ns]
+        # Include retracted claims so we can count tombstones
+        self._store.set_include_retracted(True)
+        try:
+            # Single-pass aggregation via iter_claims()
+            n_before = 0
+            n_after_new = 0
+            n_total = 0
+            retracted = 0
+            conf_sum_before = 0.0
+            conf_sum_total = 0.0
+            entities_before: set[str] = set()
+            entities_all: set[str] = set()
+            old_source_types: set[str] = set()
+            new_source_types: set[str] = set()
 
-        entities_before = set()
-        entities_after = set()
-        for c in before:
-            entities_before.add(c.subject.id)
-            entities_before.add(c.object.id)
-        for c in all_claims:
-            entities_after.add(c.subject.id)
-            entities_after.add(c.object.id)
+            after_source_types: set[str] = set()
+            for c in self.iter_claims():
+                n_total += 1
+                conf_sum_total += c.confidence
+                entities_all.add(c.subject.id)
+                entities_all.add(c.object.id)
+                if c.timestamp <= cutoff_ns:
+                    n_before += 1
+                    conf_sum_before += c.confidence
+                    entities_before.add(c.subject.id)
+                    entities_before.add(c.object.id)
+                    old_source_types.add(c.provenance.source_type)
+                else:
+                    n_after_new += 1
+                    after_source_types.add(c.provenance.source_type)
+                    if c.status == ClaimStatus.TOMBSTONED:
+                        retracted += 1
 
-        new_entities = entities_after - entities_before
+            new_source_types = after_source_types - old_source_types
+        finally:
+            self._store.set_include_retracted(False)
 
-        retracted = sum(
-            1 for c in all_claims
-            if c.status == ClaimStatus.TOMBSTONED
-            and c.timestamp > cutoff_ns
-        )
-
-        conf_before = sum(c.confidence for c in before) / len(before) if before else 0.0
-        conf_after = sum(c.confidence for c in all_claims) / len(all_claims) if all_claims else 0.0
-
-        new_source_types = set()
-        old_source_types = {c.provenance.source_type for c in before}
-        for c in after_new:
-            if c.provenance.source_type not in old_source_types:
-                new_source_types.add(c.provenance.source_type)
+        conf_before = conf_sum_before / n_before if n_before else 0.0
+        conf_after = conf_sum_total / n_total if n_total else 0.0
 
         return DriftReport(
             period_days=days,
-            new_claims=len(after_new),
-            new_entities=len(new_entities),
+            new_claims=n_after_new,
+            new_entities=len(entities_all - entities_before),
             retracted_claims=retracted,
             confidence_delta=conf_after - conf_before,
             new_source_types=sorted(new_source_types),
             entity_count_before=len(entities_before),
-            entity_count_after=len(entities_after),
-            claim_count_before=len(before),
-            claim_count_after=len(all_claims),
+            entity_count_after=len(entities_all),
+            claim_count_before=n_before,
+            claim_count_after=n_total,
         )
 
     def source_reliability(self, source_id: str | None = None) -> dict:
@@ -2665,12 +3169,15 @@ class AttestDB:
         If source_id is given, returns metrics for that source only.
         Otherwise, returns a dict of {source_id: metrics} for all sources.
         """
-        all_claims = self._all_claims()
-
-        # Group by source
-        by_source: dict[str, list[Claim]] = {}
-        for c in all_claims:
-            by_source.setdefault(c.provenance.source_id, []).append(c)
+        # Include retracted claims so we can compute retraction rates
+        self._store.set_include_retracted(True)
+        try:
+            # Group by source (streaming)
+            by_source: dict[str, list[Claim]] = {}
+            for c in self.iter_claims():
+                by_source.setdefault(c.provenance.source_id, []).append(c)
+        finally:
+            self._store.set_include_retracted(False)
 
         def _metrics(claims: list[Claim]) -> dict:
             total = len(claims)
@@ -2763,7 +3270,12 @@ class AttestDB:
             dt = datetime.fromisoformat(str(since))
             cutoff = int(dt.timestamp() * 1_000_000_000)
 
-        all_claims = self.claims_for(eid)
+        # Include retracted claims to track retractions in evolution
+        self._store.set_include_retracted(True)
+        try:
+            all_claims = self.claims_for(eid)
+        finally:
+            self._store.set_include_retracted(False)
         if not all_claims:
             return EvolutionReport(entity_id=eid, since_timestamp=cutoff)
 
@@ -3850,7 +4362,12 @@ class AttestDB:
         since_ns = self._parse_timestamp(since)
         until_ns = self._parse_timestamp(until) if until is not None else _time.time_ns()
 
-        all_claims = self._all_claims()
+        # Include retracted claims so we can count tombstones and detect weakened beliefs
+        self._store.set_include_retracted(True)
+        try:
+            all_claims = self._all_claims()
+        finally:
+            self._store.set_include_retracted(False)
         before_claims = [c for c in all_claims if c.timestamp < since_ns]
         period_claims = [c for c in all_claims if since_ns <= c.timestamp < until_ns]
 

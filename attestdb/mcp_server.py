@@ -28,6 +28,11 @@ mcp = FastMCP("attest", instructions="Knowledge graph database with provenance-t
 # Global DB reference — set by main() or configure()
 _db = None
 
+
+def _serialize(obj: object) -> str:
+    """Serialize a dataclass to JSON (used by most MCP tool return values)."""
+    return json.dumps(asdict(obj))
+
 # ---------------------------------------------------------------------------
 # Auto-observe session tracking
 # ---------------------------------------------------------------------------
@@ -137,11 +142,15 @@ def ingest_claim(
     source_type: str, source_id: str,
     confidence: Optional[float] = None,
     payload: Optional[dict] = None,
+    namespace: str = "",
+    ttl_seconds: int = 0,
 ) -> str:
     """Add a claim (subject-predicate-object triple) to the knowledge graph.
 
     Returns the claim_id (SHA-256 hash). Requires all fields — omitting
     source_type or source_id will raise a ProvenanceError.
+    Optional namespace for team isolation (empty = global).
+    Optional ttl_seconds for automatic expiry (0 = never expires).
     """
     _track_tool_call("ingest_claim", f"{subject_id} {predicate_id} {object_id}")
     _track_claims_ingested(1)
@@ -153,6 +162,8 @@ def ingest_claim(
         provenance={"source_type": source_type, "source_id": source_id},
         confidence=confidence,
         payload=payload,
+        namespace=namespace,
+        ttl_seconds=ttl_seconds,
     )
 
 
@@ -328,7 +339,7 @@ def quality_report() -> str:
     """Knowledge graph quality analysis."""
     db = _get_db()
     report = db.quality_report()
-    return json.dumps(asdict(report))
+    return _serialize(report)
 
 
 @mcp.tool()
@@ -336,7 +347,7 @@ def knowledge_health() -> str:
     """Quantified health metrics for the knowledge graph."""
     db = _get_db()
     health = db.knowledge_health()
-    return json.dumps(asdict(health))
+    return _serialize(health)
 
 
 @mcp.tool()
@@ -371,7 +382,7 @@ def schema() -> str:
     """Get the knowledge graph schema descriptor."""
     db = _get_db()
     s = db.schema()
-    return json.dumps(asdict(s))
+    return _serialize(s)
 
 
 @mcp.tool()
@@ -379,6 +390,66 @@ def stats() -> str:
     """Get database statistics."""
     db = _get_db()
     return json.dumps(db.stats(), default=str)
+
+
+@mcp.tool()
+def set_namespace(namespace: str = "") -> str:
+    """Filter all queries to a single namespace for team isolation.
+
+    Pass empty string to clear the filter and see all namespaces.
+    Claims, queries, and the change feed respect this filter.
+    """
+    db = _get_db()
+    db.set_namespace(namespace)
+    ns = db.get_namespaces()
+    return json.dumps({"namespace_filter": ns, "status": "active" if ns else "all"})
+
+
+@mcp.tool()
+def changes(since: int = 0, limit: int = 100) -> str:
+    """Poll for new claims since a cursor timestamp.
+
+    Returns claims ingested after `since` (nanosecond timestamp).
+    Use the returned `cursor` value as `since` in the next call
+    for reliable cursor-based pagination. Respects namespace filter.
+    """
+    db = _get_db()
+    claims, cursor = db.changes(since=since, limit=limit)
+    return json.dumps({
+        "claims": [
+            {
+                "claim_id": c.claim_id,
+                "subject": c.subject.id,
+                "predicate": c.predicate.id,
+                "object": c.object.id,
+                "confidence": c.confidence,
+                "namespace": c.namespace,
+                "timestamp": c.timestamp,
+            }
+            for c in claims
+        ],
+        "cursor": cursor,
+        "count": len(claims),
+    })
+
+
+@mcp.tool()
+def audit_log(
+    since: int = 0,
+    event_type: Optional[str] = None,
+    actor: Optional[str] = None,
+    limit: int = 100,
+) -> str:
+    """Query the mutation audit log for compliance and governance.
+
+    Returns timestamped events (claim_ingested, source_retracted,
+    batch_ingested) with actor attribution. Use `since` cursor
+    for pagination.
+    """
+    db = _get_db()
+    from dataclasses import asdict
+    events = db.audit_log(since=since, event_type=event_type, actor=actor, limit=limit)
+    return json.dumps([asdict(e) for e in events], default=str)
 
 
 _ASK_STOP_WORDS = frozenset({
@@ -479,7 +550,7 @@ def attest_impact(source_id: str) -> str:
     """Analyze the impact of a source: what claims depend on it."""
     db = _get_db()
     report = db.impact(source_id)
-    return json.dumps(asdict(report))
+    return _serialize(report)
 
 
 @mcp.tool()
@@ -487,7 +558,7 @@ def attest_blindspots(min_claims: int = 5) -> str:
     """Find single-source entities, knowledge gaps, low-confidence areas, and unresolved warnings."""
     db = _get_db()
     report = db.blindspots(min_claims=min_claims)
-    return json.dumps(asdict(report))
+    return _serialize(report)
 
 
 @mcp.tool()
@@ -495,7 +566,7 @@ def attest_consensus(topic: str) -> str:
     """Analyze consensus around an entity/topic across sources."""
     db = _get_db()
     report = db.consensus(topic)
-    return json.dumps(asdict(report))
+    return _serialize(report)
 
 
 @mcp.tool()
@@ -586,7 +657,7 @@ def attest_audit(claim_id: str) -> str:
     """Full provenance audit for a claim: corroborations, chain, dependents."""
     db = _get_db()
     trail = db.audit(claim_id)
-    return json.dumps(asdict(trail))
+    return _serialize(trail)
 
 
 @mcp.tool()
@@ -594,7 +665,7 @@ def attest_drift(days: int = 30) -> str:
     """Measure knowledge drift over a time period."""
     db = _get_db()
     report = db.drift(days=days)
-    return json.dumps(asdict(report))
+    return _serialize(report)
 
 
 @mcp.tool()
@@ -625,7 +696,7 @@ def attest_hypothetical(
         confidence=confidence,
     )
     report = db.hypothetical(claim)
-    return json.dumps(asdict(report))
+    return _serialize(report)
 
 
 # ---------------------------------------------------------------------------
@@ -1667,43 +1738,26 @@ def attest_dashboard() -> str:
             lines.append("\u2551" + f"  {stype:<16} {bar} {count}".ljust(W) + "\u2551")
         lines.append("\u2551" + " " * W + "\u2551")
 
-    # Knowledge composition — strategic vs operational
-    from attestdb.core.vocabulary import KNOWLEDGE_PRIORITY
-
-    strategic_preds = {p for p, tier in KNOWLEDGE_PRIORITY.items() if tier <= 2}
-    operational_preds = {p for p, tier in KNOWLEDGE_PRIORITY.items() if 3 <= tier <= 5}
-    n_strategic = 0
-    n_operational = 0
-    n_session = 0
+    # Predicate distribution (universal — works for any knowledge graph)
     pred_types = st.get("predicate_types", {})
-    # Count by scanning claims for predicate distribution
-    entities = db.list_entities()
-    pred_counts: dict[str, int] = {}
-    for entity in entities[:100]:
-        for claim in db.claims_for(entity.id):
-            pid = claim.predicate.id
-            pred_counts[pid] = pred_counts.get(pid, 0) + 1
-    for pid, cnt in pred_counts.items():
-        if pid in strategic_preds:
-            n_strategic += cnt
-        elif pid in operational_preds:
-            n_operational += cnt
-        elif pid in {"had_outcome", "produced_by", "has_next_steps", "has_status"}:
-            n_session += cnt
+    if pred_types:
+        lines.append("\u2551" + "  RELATIONSHIP TYPES".ljust(W) + "\u2551")
+        sorted_preds = sorted(pred_types.items(), key=lambda x: x[1], reverse=True)
+        max_pred = max(pred_types.values()) if pred_types else 1
+        for pred, count in sorted_preds[:8]:
+            bar = _bar(count, max_pred, 12)
+            lines.append("\u2551" + f"  {pred:<18} {bar} {count}".ljust(W) + "\u2551")
+        if len(pred_types) > 8:
+            lines.append("\u2551" + f"  ... and {len(pred_types) - 8} more types".ljust(W) + "\u2551")
+        lines.append("\u2551" + " " * W + "\u2551")
 
-    total_knowledge = n_strategic + n_operational + n_session or 1
-    lines.append("\u2551" + "  KNOWLEDGE COMPOSITION".ljust(W) + "\u2551")
-    s_bar = _bar(n_strategic, total_knowledge, 12)
-    o_bar = _bar(n_operational, total_knowledge, 12)
-    m_bar = _bar(n_session, total_knowledge, 12)
-    lines.append("\u2551" + f"  Strategic    {s_bar} {n_strategic:>3} (goals/arch/decisions)".ljust(W) + "\u2551")
-    lines.append("\u2551" + f"  Operational  {o_bar} {n_operational:>3} (bugs/fixes)".ljust(W) + "\u2551")
-    lines.append("\u2551" + f"  Session      {m_bar} {n_session:>3} (outcomes/status)".ljust(W) + "\u2551")
-
-    if n_strategic == 0 and health.total_claims > 10:
-        lines.append("\u2551" + "  [!!] No strategic knowledge recorded yet".ljust(W) + "\u2551")
-    elif n_strategic < n_operational * 0.3 and n_operational > 5:
-        lines.append("\u2551" + "  [~~] Mostly operational — add goals/architecture".ljust(W) + "\u2551")
+    # Namespace & RBAC status
+    ns_filter = db.get_namespaces()
+    rbac_on = getattr(db, "_rbac_enabled", False)
+    actor = getattr(db, "_actor", "")
+    ns_line = ", ".join(ns_filter) if ns_filter else "all (no filter)"
+    lines.append("\u2551" + f"  Namespace: {ns_line}".ljust(W) + "\u2551")
+    lines.append("\u2551" + f"  RBAC: {'enabled' if rbac_on else 'off':<10} Actor: {actor or '(none)'}".ljust(W) + "\u2551")
 
     lines.append("\u2551" + " " * W + "\u2551")
 
@@ -1762,10 +1816,10 @@ def attest_dashboard() -> str:
         priorities.append(f"Corroborate: {', '.join(top3)}")
     if health.source_diversity < 4:
         priorities.append("Diversify ingestion sources")
-    if n_strategic == 0 and health.total_claims > 10:
-        priorities.append("Record goals/architecture/strategy knowledge")
-    elif n_strategic < n_operational * 0.3 and n_operational > 5:
-        priorities.append("Balance: add strategic knowledge (goals, arch)")
+    if health.total_claims > 0 and health.knowledge_density < 1.5:
+        priorities.append("Add more relationships per entity")
+    if len(pred_types) < 3 and health.total_claims > 20:
+        priorities.append("Use more predicate types for richer knowledge")
 
     if priorities:
         lines.append("\u2551" + "  NEXT STEPS".ljust(W) + "\u2551")
@@ -2570,7 +2624,7 @@ def get_schema() -> str:
     """Knowledge graph schema."""
     db = _get_db()
     s = db.schema()
-    return json.dumps(asdict(s))
+    return _serialize(s)
 
 
 # ---------------------------------------------------------------------------

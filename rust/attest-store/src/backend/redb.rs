@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use attest_core::errors::AttestError;
 use attest_core::normalization::normalize_entity_id;
-use attest_core::types::{Claim, EntitySummary};
+use attest_core::types::{Claim, ClaimStatus, EntitySummary};
 use attest_core::vocabulary::ALIAS_PREDICATES;
 use redb::{Database, ReadableMultimapTable, ReadableTable, ReadableTableMetadata, TableDefinition};
 
@@ -21,7 +21,7 @@ const COMPRESSION_ZSTD: u8 = 0x01;
 /// Zstd compression level (3 = good balance of speed vs ratio).
 const ZSTD_LEVEL: i32 = 3;
 
-use crate::entity_store::{tokenize, EntityData};
+use crate::entity_store::{bm25_score, tokenize, EntityData};
 use crate::metadata::{MetadataStore, Vocabulary};
 use crate::store::StoreStats;
 use crate::union_find::UnionFind;
@@ -47,6 +47,12 @@ pub struct RedbBackend {
     metadata: MetadataStore,
     aliases_dirty: bool,
     metadata_dirty: bool,
+    /// In-memory set of tombstoned claim IDs for O(1) filtering.
+    retracted_ids: HashSet<String>,
+    /// Whether query methods should include retracted claims.
+    include_retracted: bool,
+    /// Namespace filter: empty = all namespaces visible.
+    namespace_filter: Vec<String>,
 }
 
 impl RedbBackend {
@@ -94,11 +100,13 @@ impl RedbBackend {
             txn.open_table(PRED_TYPE_COUNTS).map_err(|e| redb_err("create table", e))?;
             txn.open_table(SRC_TYPE_COUNTS).map_err(|e| redb_err("create table", e))?;
             txn.open_table(ENTITY_TYPE_COUNTS).map_err(|e| redb_err("create table", e))?;
+            txn.open_table(STATUS_OVERRIDES).map_err(|e| redb_err("create table", e))?;
+            txn.open_multimap_table(NAMESPACE_IDX).map_err(|e| redb_err("create table", e))?;
             txn.commit().map_err(|e| redb_err("commit", e))?;
         }
 
-        // Load next_seq, aliases, metadata in a single read transaction
-        let (next_seq, aliases, metadata) = {
+        // Load next_seq, aliases, metadata, and retracted IDs in a single read transaction
+        let (next_seq, aliases, metadata, retracted_ids) = {
             let txn = db.begin_read().map_err(|e| redb_err("begin_read", e))?;
 
             let next_seq = {
@@ -138,7 +146,24 @@ impl RedbBackend {
                 (aliases, metadata)
             };
 
-            (next_seq, aliases, metadata)
+            // Load retracted (tombstoned) claim IDs into in-memory set
+            let retracted_ids = {
+                let mut ids = HashSet::new();
+                if let Ok(table) = txn.open_table(STATUS_OVERRIDES) {
+                    if let Ok(iter) = table.iter() {
+                        for entry in iter.flatten() {
+                            let (k, v) = entry;
+                            // 2 = ClaimStatus::Tombstoned
+                            if v.value() == 2 {
+                                ids.insert(k.value().to_string());
+                            }
+                        }
+                    }
+                }
+                ids
+            };
+
+            (next_seq, aliases, metadata, retracted_ids)
         };
 
         Ok(Self {
@@ -149,6 +174,9 @@ impl RedbBackend {
             metadata,
             aliases_dirty: false,
             metadata_dirty: false,
+            retracted_ids,
+            include_retracted: false,
+            namespace_filter: Vec::new(),
         })
     }
 
@@ -812,6 +840,13 @@ impl RedbBackend {
             table.insert(claim.predicate.id.as_str(), seq)
                 .map_err(|e| redb_err("insert", e))?;
         }
+        // NAMESPACE_IDX
+        {
+            let mut table = txn.open_multimap_table(NAMESPACE_IDX)
+                .map_err(|e| redb_err("open table", e))?;
+            table.insert(claim.namespace.as_str(), seq)
+                .map_err(|e| redb_err("insert", e))?;
+        }
         // Stats counters
         Self::increment_counter(txn, PRED_TYPE_COUNTS, claim.predicate.predicate_type.as_str())?;
         Self::increment_counter(txn, SRC_TYPE_COUNTS, claim.provenance.source_type.as_str())?;
@@ -827,6 +862,16 @@ impl RedbBackend {
 
     pub fn claim_exists(&self, claim_id: &str) -> bool {
         self.claim_exists_internal(claim_id).unwrap_or(false)
+    }
+
+    pub fn get_claim(&self, claim_id: &str) -> Option<Claim> {
+        let txn = self.read_txn().ok()?;
+        let table = txn.open_table(CLAIM_ID_IDX).ok()?;
+        let seq = table.get(claim_id).ok()??;
+        let mut claim = self.load_claim_by_seq(&txn, seq.value())?;
+        // Always apply the status overlay so caller sees effective status
+        self.apply_status_overlay_from_table(&txn, &mut claim);
+        Some(claim)
     }
 
     /// Load a claim by seq number.
@@ -866,7 +911,7 @@ impl RedbBackend {
         }
     }
 
-    /// Look up claims via a str→u64 multimap index.
+    /// Look up claims via a str→u64 multimap index, applying retraction filter + overlay.
     fn claims_by_str_index(
         &self,
         table_def: redb::MultimapTableDefinition<&str, u64>,
@@ -877,7 +922,11 @@ impl RedbBackend {
             Err(_) => return Vec::new(),
         };
         let seqs = Self::collect_seqs_str(&txn, table_def, key);
-        self.load_claims_by_seqs(&txn, &seqs)
+        let claims = self.load_claims_by_seqs(&txn, &seqs);
+        claims.into_iter()
+            .filter(|c| self.should_include_claim(&c.claim_id) && self.should_include_namespace(&c.namespace))
+            .map(|mut c| { self.apply_status_overlay_fast(&mut c); c })
+            .collect()
     }
 
     pub fn claims_by_content_id(&self, content_id: &str) -> Vec<Claim> {
@@ -896,7 +945,8 @@ impl RedbBackend {
         if let Ok(iter) = table.iter() {
             let decoded = iter.flatten().filter_map(|(_, v)| {
                 Self::decompress_claim(v.value()).ok()
-            });
+            }).filter(|c| self.should_include_claim(&c.claim_id) && self.should_include_namespace(&c.namespace))
+            .map(|mut c| { self.apply_status_overlay_fast(&mut c); c });
             if limit == 0 {
                 decoded.skip(offset).collect()
             } else {
@@ -932,8 +982,14 @@ impl RedbBackend {
 
         let claims = self.claims_for_entities(&txn, &aliases);
 
-        // Apply filters
+        // Apply filters (including retraction + namespace filter) and status overlay
         claims.into_iter().filter(|c| {
+            if !self.should_include_claim(&c.claim_id) {
+                return false;
+            }
+            if !self.should_include_namespace(&c.namespace) {
+                return false;
+            }
             if let Some(pt) = predicate_type {
                 if c.predicate.predicate_type != pt {
                     return false;
@@ -945,7 +1001,8 @@ impl RedbBackend {
                 }
             }
             c.confidence >= min_confidence
-        }).collect()
+        }).map(|mut c| { self.apply_status_overlay_fast(&mut c); c })
+        .collect()
     }
 
     pub fn get_claim_provenance_chain(&self, claim_id: &str) -> Vec<String> {
@@ -1022,7 +1079,11 @@ impl RedbBackend {
             let claims = self.claims_for_entities(&txn, &frontier);
             let mut next_frontier = HashSet::new();
 
-            for claim in claims {
+            for mut claim in claims {
+                if !self.should_include_claim(&claim.claim_id) || !self.should_include_namespace(&claim.namespace) {
+                    continue;
+                }
+                self.apply_status_overlay_fast(&mut claim);
                 for eid in [&claim.subject.id, &claim.object.id] {
                     if !visited.contains(eid) {
                         next_frontier.insert(eid.clone());
@@ -1127,7 +1188,11 @@ impl RedbBackend {
                 }
             }
         }
-        self.load_claims_by_seqs(&txn, &seqs)
+        let claims = self.load_claims_by_seqs(&txn, &seqs);
+        claims.into_iter()
+            .filter(|c| self.should_include_claim(&c.claim_id) && self.should_include_namespace(&c.namespace))
+            .map(|mut c| { self.apply_status_overlay_fast(&mut c); c })
+            .collect()
     }
 
     pub fn most_recent_claims(&mut self, n: usize) -> Vec<Claim> {
@@ -1147,7 +1212,7 @@ impl RedbBackend {
             Err(_) => return Vec::new(),
         };
 
-        // Iterate claims in reverse seq order, take first n
+        // Iterate claims in reverse seq order, take first n (skipping retracted)
         let mut claims: Vec<Claim> = Vec::with_capacity(n);
         if let Ok(range) = table.range::<u64>(..) {
             for entry in range.rev() {
@@ -1155,8 +1220,11 @@ impl RedbBackend {
                     break;
                 }
                 if let Ok((_, v)) = entry {
-                    if let Ok(claim) = Self::decompress_claim(v.value()) {
-                        claims.push(claim);
+                    if let Ok(mut claim) = Self::decompress_claim(v.value()) {
+                        if self.should_include_claim(&claim.claim_id) && self.should_include_namespace(&claim.namespace) {
+                            self.apply_status_overlay_fast(&mut claim);
+                            claims.push(claim);
+                        }
                     }
                 }
             }
@@ -1183,19 +1251,70 @@ impl RedbBackend {
             Err(_) => return Vec::new(),
         };
 
-        // Count matching tokens per entity
-        let mut scores: HashMap<String, usize> = HashMap::new();
-        for token in &tokens {
-            if let Ok(iter) = text_idx.get(token.as_str()) {
-                for v in iter.flatten() {
-                    *scores.entry(v.value().to_string()).or_insert(0) += 1;
+        // Total number of entities (documents)
+        let n = txn.open_table(ENTITIES).ok()
+            .and_then(|t| t.len().ok())
+            .unwrap_or(0) as f64;
+        if n == 0.0 {
+            return Vec::new();
+        }
+
+        // Compute total indexed tokens across all entities for avgdl.
+        // Each (token, entity_id) pair in TEXT_IDX counts as one token for that entity.
+        let mut total_tokens: usize = 0;
+        let mut dl_cache: HashMap<String, usize> = HashMap::new();
+        if let Ok(range) = text_idx.iter() {
+            for entry in range.flatten() {
+                let (_, values) = entry;
+                for v in values.flatten() {
+                    let eid = v.value().to_string();
+                    *dl_cache.entry(eid).or_insert(0) += 1;
+                    total_tokens += 1;
                 }
             }
         }
+        let avgdl = if n > 0.0 { total_tokens as f64 / n } else { 1.0 };
 
-        // Sort by score descending, take top_k
-        let mut ranked: Vec<(String, usize)> = scores.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        // Collect per-entity term frequencies and document frequencies
+        // tf_map: entity_id -> { token_index -> count }
+        // df_map: token -> number of entities containing it
+        let mut tf_map: HashMap<String, HashMap<usize, usize>> = HashMap::new();
+        let mut df_map: Vec<usize> = Vec::with_capacity(tokens.len());
+
+        for (tok_idx, token) in tokens.iter().enumerate() {
+            let mut df = 0usize;
+            if let Ok(iter) = text_idx.get(token.as_str()) {
+                for v in iter.flatten() {
+                    let eid = v.value().to_string();
+                    *tf_map
+                        .entry(eid)
+                        .or_default()
+                        .entry(tok_idx)
+                        .or_insert(0) += 1;
+                    df += 1;
+                }
+            }
+            df_map.push(df);
+        }
+
+        // Compute BM25 score per entity
+        let mut scored: Vec<(String, f64)> = tf_map
+            .into_iter()
+            .map(|(eid, token_counts)| {
+                let dl = *dl_cache.get(&eid).unwrap_or(&1) as f64;
+                let score: f64 = token_counts
+                    .iter()
+                    .map(|(&tok_idx, &tf)| {
+                        let df = df_map[tok_idx] as f64;
+                        bm25_score(tf as f64, df, dl, avgdl, n)
+                    })
+                    .sum();
+                (eid, score)
+            })
+            .collect();
+
+        // Sort by score descending
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let entities_table = match txn.open_table(ENTITIES) {
             Ok(t) => t,
@@ -1203,7 +1322,7 @@ impl RedbBackend {
         };
         let claims_idx = txn.open_multimap_table(ENTITY_CLAIMS_IDX).ok();
 
-        ranked.into_iter().take(top_k).filter_map(|(eid, _)| {
+        scored.into_iter().take(top_k).filter_map(|(eid, _)| {
             let data_bytes = entities_table.get(eid.as_str()).ok()??;
             let entity: EntityData = bincode::deserialize(data_bytes.value()).ok()?;
             let claim_count = claims_idx.as_ref()
@@ -1261,6 +1380,132 @@ impl RedbBackend {
             }
             Err(_) => HashMap::new(),
         }
+    }
+
+    // ── Retraction / status overlay ─────────────────────────────────────
+
+    /// Whether a claim should be included in query results.
+    fn should_include_claim(&self, claim_id: &str) -> bool {
+        self.include_retracted || !self.retracted_ids.contains(claim_id)
+    }
+
+    /// Apply status overlay using the in-memory retracted_ids set.
+    /// Faster than apply_status_overlay_from_table — no redb read needed.
+    fn apply_status_overlay_fast(&self, claim: &mut Claim) {
+        if self.retracted_ids.contains(&claim.claim_id) {
+            claim.status = ClaimStatus::Tombstoned;
+        }
+    }
+
+    /// Convert ClaimStatus to its u8 representation for storage.
+    fn status_to_u8(status: &ClaimStatus) -> u8 {
+        match status {
+            ClaimStatus::Active => 0,
+            ClaimStatus::Archived => 1,
+            ClaimStatus::Tombstoned => 2,
+            ClaimStatus::ProvenanceDegraded => 3,
+        }
+    }
+
+    /// Convert u8 back to ClaimStatus.
+    fn u8_to_status(v: u8) -> ClaimStatus {
+        match v {
+            0 => ClaimStatus::Active,
+            1 => ClaimStatus::Archived,
+            2 => ClaimStatus::Tombstoned,
+            3 => ClaimStatus::ProvenanceDegraded,
+            _ => ClaimStatus::Active,
+        }
+    }
+
+    /// Apply the status overlay to a claim (reads from STATUS_OVERRIDES table).
+    fn apply_status_overlay_from_table(&self, txn: &redb::ReadTransaction, claim: &mut Claim) {
+        if let Ok(table) = txn.open_table(STATUS_OVERRIDES) {
+            if let Ok(Some(v)) = table.get(claim.claim_id.as_str()) {
+                claim.status = Self::u8_to_status(v.value());
+            }
+        }
+    }
+
+    pub fn update_claim_status(&mut self, claim_id: &str, status: ClaimStatus) -> Result<bool, AttestError> {
+        // Check claim exists
+        if !self.claim_exists(claim_id) {
+            return Ok(false);
+        }
+
+        let status_u8 = Self::status_to_u8(&status);
+        let txn = self.write_txn()?;
+        {
+            let mut table = txn.open_table(STATUS_OVERRIDES)
+                .map_err(|e| redb_err("open table", e))?;
+            table.insert(claim_id, status_u8)
+                .map_err(|e| redb_err("insert", e))?;
+        }
+        txn.commit().map_err(|e| redb_err("commit", e))?;
+
+        // Update in-memory set
+        if status == ClaimStatus::Tombstoned {
+            self.retracted_ids.insert(claim_id.to_string());
+        } else {
+            self.retracted_ids.remove(claim_id);
+        }
+
+        Ok(true)
+    }
+
+    pub fn update_claim_status_batch(&mut self, updates: &[(String, ClaimStatus)]) -> Result<usize, AttestError> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+
+        let txn = self.write_txn()?;
+        let mut count = 0usize;
+        {
+            let id_table = txn.open_table(CLAIM_ID_IDX)
+                .map_err(|e| redb_err("open table", e))?;
+            let mut status_table = txn.open_table(STATUS_OVERRIDES)
+                .map_err(|e| redb_err("open table", e))?;
+
+            for (claim_id, status) in updates {
+                // Check claim exists
+                if id_table.get(claim_id.as_str()).ok().flatten().is_none() {
+                    continue;
+                }
+                let status_u8 = Self::status_to_u8(status);
+                if status_table.insert(claim_id.as_str(), status_u8).is_ok() {
+                    count += 1;
+                }
+            }
+        }
+        txn.commit().map_err(|e| redb_err("commit", e))?;
+
+        // Update in-memory set
+        for (claim_id, status) in updates {
+            if *status == ClaimStatus::Tombstoned {
+                self.retracted_ids.insert(claim_id.clone());
+            } else {
+                self.retracted_ids.remove(claim_id);
+            }
+        }
+
+        Ok(count)
+    }
+
+    pub fn set_include_retracted(&mut self, include: bool) {
+        self.include_retracted = include;
+    }
+
+    /// Check if a claim's namespace passes the current filter.
+    fn should_include_namespace(&self, namespace: &str) -> bool {
+        self.namespace_filter.is_empty() || self.namespace_filter.iter().any(|ns| ns == namespace)
+    }
+
+    pub fn set_namespace_filter(&mut self, namespaces: Vec<String>) {
+        self.namespace_filter = namespaces;
+    }
+
+    pub fn get_namespace_filter(&self) -> &[String] {
+        &self.namespace_filter
     }
 }
 

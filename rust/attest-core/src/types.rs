@@ -130,6 +130,10 @@ pub struct Claim {
     pub timestamp: i64,
     #[serde(default)]
     pub status: ClaimStatus,
+    #[serde(default)]
+    pub namespace: String,
+    #[serde(default)]
+    pub expires_at: i64,
 }
 
 /// Input structure for ingesting a new claim.

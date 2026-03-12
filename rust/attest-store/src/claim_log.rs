@@ -411,6 +411,8 @@ mod tests {
             payload: None,
             timestamp: 1000,
             status: ClaimStatus::Active,
+            namespace: String::new(),
+            expires_at: 0,
         }
     }
 

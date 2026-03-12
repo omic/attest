@@ -45,6 +45,19 @@ class EmbeddingIndex:
         self._key_to_id[key] = claim_id
         self._index.add(key, vec)
 
+    def remove(self, claim_id: str) -> bool:
+        """Remove a claim_id from the index. Returns True if it was present."""
+        key = self._id_to_key.pop(claim_id, None)
+        if key is None:
+            return False
+        self._key_to_id.pop(key, None)
+        if hasattr(self._index, "remove"):
+            try:
+                self._index.remove(key)
+            except Exception as e:
+                logger.warning("Failed to remove key %d from usearch index: %s", key, e)
+        return True
+
     def get(self, claim_id: str) -> np.ndarray | None:
         """Retrieve the stored embedding for a claim_id. Returns None if not found."""
         key = self._id_to_key.get(claim_id)

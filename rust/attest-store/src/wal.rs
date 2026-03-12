@@ -30,9 +30,12 @@ const WAL_VERSION: u32 = 1;
 const WAL_HEADER_SIZE: usize = 16;
 
 /// A single WAL entry. Currently only claims, but extensible.
+/// IMPORTANT: Only append new variants at the end — existing WAL files depend on ordinal stability.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum WalEntry {
     InsertClaim(Claim),
+    /// Update the status of a claim: (claim_id, status as u8).
+    UpdateClaimStatus(String, u8),
 }
 
 /// Write-ahead log handle.
@@ -105,7 +108,8 @@ impl Wal {
 
     /// Append a claim to the WAL and fsync.
     pub fn append_claim(&mut self, claim: &Claim) -> Result<(), io::Error> {
-        self.append_claim_no_sync(claim)?;
+        let entry = WalEntry::InsertClaim(claim.clone());
+        self.append_entry(&entry)?;
         self.file.sync_all()?;
         Ok(())
     }
@@ -114,7 +118,20 @@ impl Wal {
     /// Caller must call `sync()` after the batch is complete.
     pub fn append_claim_no_sync(&mut self, claim: &Claim) -> Result<(), io::Error> {
         let entry = WalEntry::InsertClaim(claim.clone());
-        let data = bincode::serialize(&entry)
+        self.append_entry(&entry)
+    }
+
+    /// Append a status update to the WAL and fsync.
+    pub fn append_status_update(&mut self, claim_id: &str, status_u8: u8) -> Result<(), io::Error> {
+        let entry = WalEntry::UpdateClaimStatus(claim_id.to_string(), status_u8);
+        self.append_entry(&entry)?;
+        self.file.sync_all()?;
+        Ok(())
+    }
+
+    /// Append a raw WalEntry without fsyncing.
+    pub(crate) fn append_entry(&mut self, entry: &WalEntry) -> Result<(), io::Error> {
+        let data = bincode::serialize(entry)
             .map_err(|e| io::Error::other(e.to_string()))?;
         let crc = crc32fast::hash(&data);
 
@@ -295,6 +312,8 @@ mod tests {
             payload: None,
             timestamp: 1000,
             status: ClaimStatus::Active,
+            namespace: String::new(),
+            expires_at: 0,
         }
     }
 
@@ -317,9 +336,11 @@ mod tests {
         assert_eq!(entries.len(), 2);
         match &entries[0] {
             WalEntry::InsertClaim(c) => assert_eq!(c.claim_id, "c1"),
+            _ => panic!("unexpected WAL entry"),
         }
         match &entries[1] {
             WalEntry::InsertClaim(c) => assert_eq!(c.claim_id, "c2"),
+            _ => panic!("unexpected WAL entry"),
         }
 
         Wal::remove(&dir);
@@ -374,6 +395,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
         match &entries[0] {
             WalEntry::InsertClaim(c) => assert_eq!(c.claim_id, "c1"),
+            _ => panic!("unexpected WAL entry"),
         }
 
         Wal::remove(&dir);
@@ -429,6 +451,7 @@ mod tests {
             .iter()
             .map(|e| match e {
                 WalEntry::InsertClaim(c) => c.claim_id.as_str(),
+                _ => panic!("unexpected WAL entry"),
             })
             .collect();
         assert_eq!(ids, vec!["m1", "m2", "m3"]);
@@ -470,6 +493,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
         match &entries[0] {
             WalEntry::InsertClaim(c) => assert_eq!(c.claim_id, "good"),
+            _ => panic!("unexpected WAL entry"),
         }
 
         Wal::remove(&dir);

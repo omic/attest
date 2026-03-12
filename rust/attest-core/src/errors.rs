@@ -21,6 +21,10 @@ pub enum AttestError {
     Dimensionality(String),
     /// Entity not found in the database.
     EntityNotFound(String),
+    /// Attempted write on a read-only store.
+    ReadOnly,
+    /// Generic validation error.
+    Validation(String),
 }
 
 impl fmt::Display for AttestError {
@@ -34,6 +38,8 @@ impl fmt::Display for AttestError {
             Self::CircularProvenance(msg) => write!(f, "CircularProvenanceError: {msg}"),
             Self::Dimensionality(msg) => write!(f, "DimensionalityError: {msg}"),
             Self::EntityNotFound(msg) => write!(f, "EntityNotFoundError: {msg}"),
+            Self::ReadOnly => write!(f, "ReadOnlyError: store is read-only"),
+            Self::Validation(msg) => write!(f, "ValidationError: {msg}"),
         }
     }
 }

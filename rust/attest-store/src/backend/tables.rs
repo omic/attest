@@ -20,6 +20,9 @@ pub const SOURCE_IDX: MultimapTableDefinition<&str, u64> =
 pub const PREDICATE_IDX: MultimapTableDefinition<&str, u64> =
     MultimapTableDefinition::new("predicate_idx");
 
+pub const NAMESPACE_IDX: MultimapTableDefinition<&str, u64> =
+    MultimapTableDefinition::new("namespace_idx");
+
 // Entity storage: entity_id → bincode(EntityData)
 pub const ENTITIES: TableDefinition<&str, &[u8]> = TableDefinition::new("entities");
 pub const ENTITY_TYPE_IDX: MultimapTableDefinition<&str, &str> =
@@ -29,6 +32,9 @@ pub const TEXT_IDX: MultimapTableDefinition<&str, &str> =
 
 // In-memory state blobs (loaded on open, flushed on close/checkpoint)
 pub const META_BLOBS: TableDefinition<&str, &[u8]> = TableDefinition::new("meta_blobs");
+
+// Status overrides: claim_id → u8 status code (0=active, 1=archived, 2=tombstoned, 3=provenance_degraded)
+pub const STATUS_OVERRIDES: TableDefinition<&str, u8> = TableDefinition::new("status_overrides");
 
 // Stats counters (maintained on insert for O(1) stats)
 pub const PRED_TYPE_COUNTS: TableDefinition<&str, u64> =

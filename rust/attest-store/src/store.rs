@@ -7,11 +7,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use attest_core::errors::AttestError;
-use attest_core::types::{Claim, EntitySummary};
+use attest_core::types::{Claim, ClaimStatus, EntitySummary};
 
 use crate::backend::memory::DEFAULT_CHECKPOINT_INTERVAL;
 use crate::backend::migration;
-use crate::backend::{Backend, MemoryBackend, RedbBackend};
+use crate::backend::{Backend, MemoryBackend, RedbBackend, StorageBackend};
 use crate::metadata::Vocabulary;
 
 /// Store statistics.
@@ -145,10 +145,7 @@ impl RustStore {
     /// Persist state and close. Releases the file lock.
     /// For read-only stores, deletes the temp file.
     pub fn close(&mut self) -> Result<(), AttestError> {
-        let result = match &mut self.backend {
-            Backend::InMemory(m) => m.close(),
-            Backend::File(r) => r.close(),
-        };
+        let result = self.backend.close();
         // Clean up temp file for read-only copies
         if let Some(ref temp) = self.temp_path {
             let _ = std::fs::remove_file(temp);
@@ -159,95 +156,62 @@ impl RustStore {
 
     /// Write a full checkpoint without releasing the lock.
     pub fn checkpoint(&mut self) -> Result<(), AttestError> {
-        match &mut self.backend {
-            Backend::InMemory(m) => m.checkpoint(),
-            Backend::File(r) => r.checkpoint(),
-        }
+        self.backend.checkpoint()
     }
 
     /// Compact the database file, reclaiming free pages.
     /// Returns `true` if compaction freed any space.
     /// No-op (returns `false`) for in-memory backends.
     pub fn compact(&mut self) -> Result<bool, AttestError> {
-        match &mut self.backend {
-            Backend::InMemory(_) => Ok(false),
-            Backend::File(r) => r.compact(),
-        }
+        self.backend.compact()
     }
 
     // ── Metadata ───────────────────────────────────────────────────────
 
     pub fn register_vocabulary(&mut self, namespace: &str, vocab: Vocabulary) {
         if self.read_only { return; }
-        match &mut self.backend {
-            Backend::InMemory(m) => m.register_vocabulary(namespace, vocab),
-            Backend::File(r) => r.register_vocabulary(namespace, vocab),
-        }
+        self.backend.register_vocabulary(namespace, vocab);
     }
 
     pub fn register_predicate(&mut self, predicate_id: &str, constraints: serde_json::Value) {
         if self.read_only { return; }
-        match &mut self.backend {
-            Backend::InMemory(m) => m.register_predicate(predicate_id, constraints),
-            Backend::File(r) => r.register_predicate(predicate_id, constraints),
-        }
+        self.backend.register_predicate(predicate_id, constraints);
     }
 
     pub fn register_payload_schema(&mut self, schema_id: &str, schema: serde_json::Value) {
         if self.read_only { return; }
-        match &mut self.backend {
-            Backend::InMemory(m) => m.register_payload_schema(schema_id, schema),
-            Backend::File(r) => r.register_payload_schema(schema_id, schema),
-        }
+        self.backend.register_payload_schema(schema_id, schema);
     }
 
     pub fn get_registered_vocabularies(&self) -> &HashMap<String, Vocabulary> {
-        match &self.backend {
-            Backend::InMemory(m) => m.get_registered_vocabularies(),
-            Backend::File(r) => r.get_registered_vocabularies(),
-        }
+        self.backend.get_registered_vocabularies()
     }
 
     pub fn get_predicate_constraints(&self) -> HashMap<String, serde_json::Value> {
-        match &self.backend {
-            Backend::InMemory(m) => m.get_predicate_constraints(),
-            Backend::File(r) => r.get_predicate_constraints(),
-        }
+        self.backend.get_predicate_constraints()
     }
 
     pub fn get_payload_schemas(&self) -> HashMap<String, serde_json::Value> {
-        match &self.backend {
-            Backend::InMemory(m) => m.get_payload_schemas(),
-            Backend::File(r) => r.get_payload_schemas(),
-        }
+        self.backend.get_payload_schemas()
     }
 
     // ── Alias resolution ───────────────────────────────────────────────
 
     /// Resolve entity ID through alias chain.
     pub fn resolve(&mut self, entity_id: &str) -> String {
-        match &mut self.backend {
-            Backend::InMemory(m) => m.resolve(entity_id),
-            Backend::File(r) => r.resolve(entity_id),
-        }
+        self.backend.resolve(entity_id)
     }
 
     /// Get all entity IDs that resolve to the same canonical.
     pub fn get_alias_group(&mut self, entity_id: &str) -> HashSet<String> {
-        match &mut self.backend {
-            Backend::InMemory(m) => m.get_alias_group(entity_id),
-            Backend::File(r) => r.get_alias_group(entity_id),
-        }
+        self.backend.get_alias_group(entity_id)
     }
 
     // ── Cache management ───────────────────────────────────────────────
 
     /// No-op in Rust — everything is already in memory.
     pub fn warm_caches(&self) {
-        match &self.backend {
-            Backend::InMemory(m) => m.warm_caches(),
-            Backend::File(r) => r.warm_caches(),
-        }
+        self.backend.warm_caches();
     }
 
     // ── Entity CRUD ────────────────────────────────────────────────────
@@ -261,14 +225,7 @@ impl RustStore {
         timestamp: i64,
     ) {
         if self.read_only { return; }
-        match &mut self.backend {
-            Backend::InMemory(m) => {
-                m.upsert_entity(entity_id, entity_type, display_name, external_ids, timestamp)
-            }
-            Backend::File(r) => {
-                r.upsert_entity(entity_id, entity_type, display_name, external_ids, timestamp)
-            }
-        }
+        self.backend.upsert_entity(entity_id, entity_type, display_name, external_ids, timestamp);
     }
 
     /// Batch-upsert entities in a single transaction (redb) or loop (in-memory).
@@ -278,21 +235,11 @@ impl RustStore {
         timestamp: i64,
     ) {
         if self.read_only { return; }
-        match &mut self.backend {
-            Backend::InMemory(m) => {
-                for (id, etype, display, ext_ids) in entities {
-                    m.upsert_entity(id, etype, display, Some(ext_ids), timestamp);
-                }
-            }
-            Backend::File(r) => r.upsert_entities_batch(entities, timestamp),
-        }
+        self.backend.upsert_entities_batch(entities, timestamp);
     }
 
     pub fn get_entity(&self, entity_id: &str) -> Option<EntitySummary> {
-        match &self.backend {
-            Backend::InMemory(m) => m.get_entity(entity_id),
-            Backend::File(r) => r.get_entity(entity_id),
-        }
+        self.backend.get_entity(entity_id)
     }
 
     pub fn list_entities(
@@ -302,10 +249,7 @@ impl RustStore {
         offset: usize,
         limit: usize,
     ) -> Vec<EntitySummary> {
-        match &self.backend {
-            Backend::InMemory(m) => m.list_entities(entity_type, min_claims, offset, limit),
-            Backend::File(r) => r.list_entities(entity_type, min_claims, offset, limit),
-        }
+        self.backend.list_entities(entity_type, min_claims, offset, limit)
     }
 
     /// Count entities matching the given filter without materializing results.
@@ -314,18 +258,12 @@ impl RustStore {
         entity_type: Option<&str>,
         min_claims: usize,
     ) -> usize {
-        match &self.backend {
-            Backend::InMemory(m) => m.count_entities(entity_type, min_claims),
-            Backend::File(r) => r.count_entities(entity_type, min_claims),
-        }
+        self.backend.count_entities(entity_type, min_claims)
     }
 
     /// Count total claims without materializing.
     pub fn count_claims(&self) -> usize {
-        match &self.backend {
-            Backend::InMemory(m) => m.count_claims(),
-            Backend::File(r) => r.count_claims(),
-        }
+        self.backend.count_claims()
     }
 
     // ── Claim operations ───────────────────────────────────────────────
@@ -338,10 +276,7 @@ impl RustStore {
     pub fn insert_claim(&mut self, claim: Claim) -> bool {
         if self.read_only { return false; }
         let interval = self.checkpoint_interval;
-        match &mut self.backend {
-            Backend::InMemory(m) => m.insert_claim(claim, interval),
-            Backend::File(r) => r.insert_claim(claim, interval),
-        }
+        self.backend.insert_claim(claim, interval)
     }
 
     /// Insert a batch of claims with a single WAL sync at the end.
@@ -349,48 +284,35 @@ impl RustStore {
     pub fn insert_claims_batch(&mut self, claims: Vec<Claim>) -> usize {
         if self.read_only { return 0; }
         let interval = self.checkpoint_interval;
-        match &mut self.backend {
-            Backend::InMemory(m) => m.insert_claims_batch(claims, interval),
-            Backend::File(r) => r.insert_claims_batch(claims, interval),
-        }
+        self.backend.insert_claims_batch(claims, interval)
     }
 
     pub fn claim_exists(&self, claim_id: &str) -> bool {
-        match &self.backend {
-            Backend::InMemory(m) => m.claim_exists(claim_id),
-            Backend::File(r) => r.claim_exists(claim_id),
-        }
+        self.backend.claim_exists(claim_id)
+    }
+
+    /// Get a single claim by ID. O(1) via index lookup.
+    pub fn get_claim(&self, claim_id: &str) -> Option<Claim> {
+        self.backend.get_claim(claim_id)
     }
 
     pub fn claims_by_content_id(&self, content_id: &str) -> Vec<Claim> {
-        match &self.backend {
-            Backend::InMemory(m) => m.claims_by_content_id(content_id),
-            Backend::File(r) => r.claims_by_content_id(content_id),
-        }
+        self.backend.claims_by_content_id(content_id)
     }
 
     /// Get all claims with optional pagination.
     pub fn all_claims(&self, offset: usize, limit: usize) -> Vec<Claim> {
-        match &self.backend {
-            Backend::InMemory(m) => m.all_claims(offset, limit),
-            Backend::File(r) => r.all_claims(offset, limit),
-        }
+        self.backend.all_claims(offset, limit)
     }
 
     /// Get all claims matching a source_id.
     pub fn claims_by_source_id(&self, source_id: &str) -> Vec<Claim> {
-        match &self.backend {
-            Backend::InMemory(m) => m.claims_by_source_id(source_id),
-            Backend::File(r) => r.claims_by_source_id(source_id),
-        }
+        self.backend.claims_by_source_id(source_id)
     }
 
     /// Get all claims matching a predicate_id.
     pub fn claims_by_predicate_id(&self, predicate_id: &str) -> Vec<Claim> {
-        match &self.backend {
-            Backend::InMemory(m) => m.claims_by_predicate_id(predicate_id),
-            Backend::File(r) => r.claims_by_predicate_id(predicate_id),
-        }
+        self.backend.claims_by_predicate_id(predicate_id)
     }
 
     pub fn claims_for(
@@ -400,81 +322,118 @@ impl RustStore {
         source_type: Option<&str>,
         min_confidence: f64,
     ) -> Vec<Claim> {
-        match &mut self.backend {
-            Backend::InMemory(m) => {
-                m.claims_for(entity_id, predicate_type, source_type, min_confidence)
-            }
-            Backend::File(r) => {
-                r.claims_for(entity_id, predicate_type, source_type, min_confidence)
-            }
-        }
+        self.backend.claims_for(entity_id, predicate_type, source_type, min_confidence)
     }
 
     /// Get the provenance chain for a claim.
     pub fn get_claim_provenance_chain(&self, claim_id: &str) -> Vec<String> {
-        match &self.backend {
-            Backend::InMemory(m) => m.get_claim_provenance_chain(claim_id),
-            Backend::File(r) => r.get_claim_provenance_chain(claim_id),
-        }
+        self.backend.get_claim_provenance_chain(claim_id)
     }
 
     // ── Graph traversal ────────────────────────────────────────────────
 
     /// BFS traversal collecting claims at each hop depth.
     pub fn bfs_claims(&mut self, entity_id: &str, max_depth: usize) -> Vec<(Claim, usize)> {
-        match &mut self.backend {
-            Backend::InMemory(m) => m.bfs_claims(entity_id, max_depth),
-            Backend::File(r) => r.bfs_claims(entity_id, max_depth),
-        }
+        self.backend.bfs_claims(entity_id, max_depth)
     }
 
     /// Check if a path exists between two entities within max_depth hops.
     pub fn path_exists(&mut self, entity_a: &str, entity_b: &str, max_depth: usize) -> bool {
-        match &mut self.backend {
-            Backend::InMemory(m) => m.path_exists(entity_a, entity_b, max_depth),
-            Backend::File(r) => r.path_exists(entity_a, entity_b, max_depth),
-        }
+        self.backend.path_exists(entity_a, entity_b, max_depth)
     }
 
     /// Get the bidirectional adjacency list.
     pub fn get_adjacency_list(&self) -> HashMap<String, HashSet<String>> {
-        match &self.backend {
-            Backend::InMemory(m) => m.get_adjacency_list(),
-            Backend::File(r) => r.get_adjacency_list(),
-        }
+        self.backend.get_adjacency_list()
     }
 
     /// Get claims within a timestamp range [min_ts, max_ts] (inclusive).
     pub fn claims_in_range(&mut self, min_ts: i64, max_ts: i64) -> Vec<Claim> {
-        match &mut self.backend {
-            Backend::InMemory(m) => m.claims_in_range(min_ts, max_ts),
-            Backend::File(r) => r.claims_in_range(min_ts, max_ts),
-        }
+        self.backend.claims_in_range(min_ts, max_ts)
     }
 
     /// Get the most recent N claims by timestamp.
     pub fn most_recent_claims(&mut self, n: usize) -> Vec<Claim> {
-        match &mut self.backend {
-            Backend::InMemory(m) => m.most_recent_claims(n),
-            Backend::File(r) => r.most_recent_claims(n),
-        }
+        self.backend.most_recent_claims(n)
     }
 
     /// Search entities by text query.
     pub fn search_entities(&self, query: &str, top_k: usize) -> Vec<EntitySummary> {
-        match &self.backend {
-            Backend::InMemory(m) => m.search_entities(query, top_k),
-            Backend::File(r) => r.search_entities(query, top_k),
-        }
+        self.backend.search_entities(query, top_k)
     }
 
     // ── Stats ──────────────────────────────────────────────────────────
 
     pub fn stats(&self) -> StoreStats {
-        match &self.backend {
-            Backend::InMemory(m) => m.stats(),
-            Backend::File(r) => r.stats(),
+        self.backend.stats()
+    }
+
+    // ── Retraction / status overlay ─────────────────────────────────────
+
+    /// Retract a single claim (set status to Tombstoned).
+    /// Returns false if the claim doesn't exist.
+    pub fn retract_claim(&mut self, claim_id: &str) -> Result<bool, AttestError> {
+        if self.read_only { return Err(AttestError::ReadOnly); }
+        self.backend.update_claim_status(claim_id, ClaimStatus::Tombstoned)
+    }
+
+    /// Retract all claims from a source. Returns the list of claim IDs that were retracted.
+    pub fn retract_source(&mut self, source_id: &str) -> Result<Vec<String>, AttestError> {
+        if self.read_only { return Err(AttestError::ReadOnly); }
+        // Temporarily include retracted claims to see all source claims
+        self.backend.set_include_retracted(true);
+        let claims = self.backend.claims_by_source_id(source_id);
+        self.backend.set_include_retracted(false);
+        let ids: Vec<String> = claims.iter()
+            .filter(|c| c.status != ClaimStatus::Tombstoned)
+            .map(|c| c.claim_id.clone())
+            .collect();
+        if ids.is_empty() {
+            return Ok(ids);
         }
+        let updates: Vec<(String, ClaimStatus)> = ids.iter()
+            .map(|id| (id.clone(), ClaimStatus::Tombstoned))
+            .collect();
+        self.backend.update_claim_status_batch(&updates)?;
+        Ok(ids)
+    }
+
+    /// Update the status of a claim by string name.
+    /// Accepted values: "active", "archived", "tombstoned"/"retracted", "provenance_degraded"/"degraded".
+    pub fn update_claim_status(&mut self, claim_id: &str, status: &str) -> Result<bool, AttestError> {
+        if self.read_only { return Err(AttestError::ReadOnly); }
+        let cs = parse_status(status)?;
+        self.backend.update_claim_status(claim_id, cs)
+    }
+
+    /// Batch-update claim statuses. Returns number of claims actually updated.
+    pub fn update_claim_status_batch(&mut self, updates: &[(String, ClaimStatus)]) -> Result<usize, AttestError> {
+        if self.read_only { return Err(AttestError::ReadOnly); }
+        self.backend.update_claim_status_batch(updates)
+    }
+
+    /// Set whether query methods include retracted (Tombstoned) claims.
+    pub fn set_include_retracted(&mut self, include: bool) {
+        self.backend.set_include_retracted(include);
+    }
+
+    pub fn set_namespace_filter(&mut self, namespaces: Vec<String>) {
+        self.backend.set_namespace_filter(namespaces);
+    }
+
+    pub fn get_namespace_filter(&self) -> &[String] {
+        self.backend.get_namespace_filter()
+    }
+}
+
+/// Parse a status string into a ClaimStatus.
+fn parse_status(s: &str) -> Result<ClaimStatus, AttestError> {
+    match s.to_lowercase().as_str() {
+        "active" => Ok(ClaimStatus::Active),
+        "archived" => Ok(ClaimStatus::Archived),
+        "tombstoned" | "retracted" => Ok(ClaimStatus::Tombstoned),
+        "provenance_degraded" | "degraded" => Ok(ClaimStatus::ProvenanceDegraded),
+        _ => Err(AttestError::Validation(format!("Unknown claim status: {}", s))),
     }
 }
 
@@ -522,6 +481,8 @@ mod tests {
             payload: None,
             timestamp: 1000,
             status: ClaimStatus::Active,
+            namespace: String::new(),
+            expires_at: 0,
         }
     }
 
@@ -649,6 +610,8 @@ mod tests {
             payload: None,
             timestamp: 1000,
             status: ClaimStatus::Active,
+            namespace: String::new(),
+            expires_at: 0,
         };
         store.insert_claim(alias_claim);
 
@@ -874,6 +837,21 @@ mod tests {
         let recent = store.most_recent_claims(2);
         assert_eq!(recent.len(), 2);
         assert!(recent[0].timestamp >= recent[1].timestamp);
+    }
+
+    #[test]
+    fn test_get_claim() {
+        let mut store = RustStore::in_memory();
+        store.upsert_entity("a", "gene", "A", None, 0);
+        store.upsert_entity("b", "gene", "B", None, 0);
+        let c = make_claim("c1", "a", "interacts_with", "b", "obs");
+        store.insert_claim(c.clone());
+
+        let found = store.get_claim("c1");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().claim_id, "c1");
+
+        assert!(store.get_claim("nonexistent").is_none());
     }
 
     #[test]
@@ -1204,6 +1182,54 @@ mod tests {
     }
 
     #[test]
+    fn test_bm25_ranking() {
+        // BM25 should rank "brca1" (short doc, high term density) higher than
+        // "brca1_pathway" (longer doc, lower term density) when searching for "brca1"
+        let mut store = RustStore::in_memory();
+        // Short doc: "brca1" appears in a 2-token document (high TF density)
+        store.upsert_entity("brca1_gene", "gene", "brca1 gene", None, 0);
+        // Longer doc: "brca1" appears once among many tokens (lower TF density)
+        store.upsert_entity(
+            "brca1_related_pathway",
+            "pathway",
+            "brca1 related dna repair signaling pathway mechanism",
+            None,
+            0,
+        );
+        // Unrelated entity that should not appear
+        store.upsert_entity("tp53", "gene", "TP53 tumor protein", None, 0);
+
+        let results = store.search_entities("brca1", 10);
+        assert_eq!(results.len(), 2, "should match both brca1 entities");
+        assert_eq!(
+            results[0].id, "brca1_gene",
+            "shorter doc with higher BM25 term density should rank first"
+        );
+        assert_eq!(
+            results[1].id, "brca1_related_pathway",
+            "longer doc should rank second"
+        );
+    }
+
+    #[test]
+    fn test_bm25_idf_boost() {
+        // A rare term should boost an entity above one matching only common terms
+        let mut store = RustStore::in_memory();
+        // "alpha" is common across all 3 entities; "zyxin" is rare (only in entity_a)
+        store.upsert_entity("entity_a", "protein", "alpha zyxin binding", None, 0);
+        store.upsert_entity("entity_b", "protein", "alpha beta gamma", None, 0);
+        store.upsert_entity("entity_c", "protein", "alpha delta epsilon", None, 0);
+
+        // Searching "alpha zyxin": entity_a matches both (one rare), others match only "alpha"
+        let results = store.search_entities("alpha zyxin", 10);
+        assert!(!results.is_empty());
+        assert_eq!(
+            results[0].id, "entity_a",
+            "entity matching rare term 'zyxin' should rank first"
+        );
+    }
+
+    #[test]
     fn test_batch_dedup_within_batch() {
         // Verifies that duplicate claim_ids within a single batch are deduplicated
         let dir = std::env::temp_dir().join("attest_batch_dedup_test.attest");
@@ -1230,6 +1256,356 @@ mod tests {
 
         store.close().unwrap();
         let _ = std::fs::remove_file(&dir);
+    }
+
+    // ── Retraction tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_retract_claim() {
+        let mut store = setup_store();
+        // Before retraction
+        assert_eq!(store.all_claims(0, 0).len(), 2);
+
+        // Retract c1
+        assert!(store.retract_claim("c1").unwrap());
+
+        // get_claim should show Tombstoned status
+        let c1 = store.get_claim("c1").unwrap();
+        assert_eq!(c1.status, ClaimStatus::Tombstoned);
+
+        // all_claims should exclude c1
+        let all = store.all_claims(0, 0);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].claim_id, "c2");
+
+        // claims_for should exclude c1
+        let claims = store.claims_for("brca1", None, None, 0.0);
+        assert_eq!(claims.len(), 0);
+
+        // claims_for tp53 should only have c2
+        let claims = store.claims_for("tp53", None, None, 0.0);
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].claim_id, "c2");
+    }
+
+    #[test]
+    fn test_retract_source() {
+        let mut store = RustStore::in_memory();
+        store.upsert_entity("a", "entity", "A", None, 0);
+        store.upsert_entity("b", "entity", "B", None, 0);
+        store.upsert_entity("c", "entity", "C", None, 0);
+
+        let mut c1 = make_claim("c1", "a", "rel", "b", "obs");
+        c1.provenance.source_id = "src1".to_string();
+        let mut c2 = make_claim("c2", "b", "rel", "c", "obs");
+        c2.provenance.source_id = "src1".to_string();
+        let mut c3 = make_claim("c3", "a", "rel", "c", "exp");
+        c3.provenance.source_id = "src2".to_string();
+
+        store.insert_claim(c1);
+        store.insert_claim(c2);
+        store.insert_claim(c3);
+
+        // Retract source "src1"
+        let retracted = store.retract_source("src1").unwrap();
+        assert_eq!(retracted.len(), 2);
+        assert!(retracted.contains(&"c1".to_string()));
+        assert!(retracted.contains(&"c2".to_string()));
+
+        // Only c3 should remain
+        let all = store.all_claims(0, 0);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].claim_id, "c3");
+    }
+
+    #[test]
+    fn test_include_retracted_flag() {
+        let mut store = setup_store();
+
+        store.retract_claim("c1").unwrap();
+        assert_eq!(store.all_claims(0, 0).len(), 1);
+
+        // Enable include_retracted
+        store.set_include_retracted(true);
+        assert_eq!(store.all_claims(0, 0).len(), 2);
+
+        // Disable again
+        store.set_include_retracted(false);
+        assert_eq!(store.all_claims(0, 0).len(), 1);
+    }
+
+    #[test]
+    fn test_retract_nonexistent() {
+        let mut store = setup_store();
+        let result = store.retract_claim("nonexistent").unwrap();
+        assert!(!result, "Retracting nonexistent claim should return false");
+    }
+
+    #[test]
+    fn test_retraction_persists_memory() {
+        let dir = std::env::temp_dir().join("attest_retract_persist_mem.attest");
+        let _ = std::fs::remove_file(&dir);
+        let _ = std::fs::remove_file(dir.with_extension("attest.lock"));
+        crate::wal::Wal::remove(&dir);
+
+        // Create, insert, retract, close
+        {
+            let mut store = RustStore::new_memory_backend(dir.to_str().unwrap()).unwrap();
+            store.upsert_entity("a", "entity", "A", None, 0);
+            store.upsert_entity("b", "entity", "B", None, 0);
+            store.insert_claim(make_claim("c1", "a", "rel", "b", "obs"));
+            store.insert_claim(make_claim("c2", "a", "rel", "b", "exp"));
+            store.retract_claim("c1").unwrap();
+            store.close().unwrap();
+        }
+
+        // Reopen and verify
+        {
+            let mut store = RustStore::new_memory_backend(dir.to_str().unwrap()).unwrap();
+            let c1 = store.get_claim("c1").unwrap();
+            assert_eq!(c1.status, ClaimStatus::Tombstoned, "Retraction should persist");
+            assert_eq!(store.all_claims(0, 0).len(), 1, "Retracted claim should be filtered");
+            store.close().unwrap();
+        }
+
+        let _ = std::fs::remove_file(&dir);
+        let _ = std::fs::remove_file(dir.with_extension("attest.lock"));
+        crate::wal::Wal::remove(&dir);
+    }
+
+    #[test]
+    fn test_retraction_persists_redb() {
+        let dir = std::env::temp_dir().join("attest_retract_persist_redb.attest");
+        let _ = std::fs::remove_file(&dir);
+
+        // Create, insert, retract, close
+        {
+            let mut store = RustStore::new(dir.to_str().unwrap()).unwrap();
+            store.upsert_entity("a", "entity", "A", None, 0);
+            store.upsert_entity("b", "entity", "B", None, 0);
+            store.insert_claim(make_claim("c1", "a", "rel", "b", "obs"));
+            store.insert_claim(make_claim("c2", "a", "rel", "b", "exp"));
+            store.retract_claim("c1").unwrap();
+            store.close().unwrap();
+        }
+
+        // Reopen and verify
+        {
+            let mut store = RustStore::new(dir.to_str().unwrap()).unwrap();
+            let c1 = store.get_claim("c1").unwrap();
+            assert_eq!(c1.status, ClaimStatus::Tombstoned, "Retraction should persist in redb");
+            assert_eq!(store.all_claims(0, 0).len(), 1, "Retracted claim should be filtered after reopen");
+            store.close().unwrap();
+        }
+
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn test_update_claim_status_string() {
+        let mut store = setup_store();
+
+        // Archive a claim
+        assert!(store.update_claim_status("c1", "archived").unwrap());
+        let c1 = store.get_claim("c1").unwrap();
+        assert_eq!(c1.status, ClaimStatus::Archived);
+
+        // Archived claims should still appear in queries (only Tombstoned are filtered)
+        assert_eq!(store.all_claims(0, 0).len(), 2);
+
+        // Now tombstone it
+        assert!(store.update_claim_status("c1", "retracted").unwrap());
+        assert_eq!(store.all_claims(0, 0).len(), 1);
+
+        // Un-retract (set back to active)
+        assert!(store.update_claim_status("c1", "active").unwrap());
+        assert_eq!(store.all_claims(0, 0).len(), 2);
+        let c1 = store.get_claim("c1").unwrap();
+        assert_eq!(c1.status, ClaimStatus::Active);
+    }
+
+    #[test]
+    fn test_retraction_filters_bfs() {
+        let mut store = setup_store();
+        store.retract_claim("c1").unwrap();
+
+        // BFS from brca1 depth 2: c1 is retracted, so should not appear
+        let results = store.bfs_claims("brca1", 2);
+        assert!(results.is_empty(), "BFS should not return retracted claims");
+    }
+
+    #[test]
+    fn test_retraction_filters_temporal() {
+        let mut store = RustStore::in_memory();
+        store.upsert_entity("a", "entity", "A", None, 0);
+        store.upsert_entity("b", "entity", "B", None, 0);
+
+        let mut c1 = make_claim("c1", "a", "rel", "b", "obs");
+        c1.timestamp = 1000;
+        let mut c2 = make_claim("c2", "a", "rel", "b", "obs");
+        c2.timestamp = 2000;
+        store.insert_claim(c1);
+        store.insert_claim(c2);
+
+        store.retract_claim("c1").unwrap();
+
+        // claims_in_range should filter retracted
+        assert_eq!(store.claims_in_range(500, 2500).len(), 1);
+
+        // most_recent should filter retracted
+        let recent = store.most_recent_claims(10);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].claim_id, "c2");
+    }
+
+    // ── Namespace tests ─────────────────────────────────────────────────
+
+    fn make_ns_claim(
+        claim_id: &str,
+        subj: &str,
+        pred: &str,
+        obj: &str,
+        namespace: &str,
+    ) -> Claim {
+        let mut c = make_claim(claim_id, subj, pred, obj, "experimental");
+        c.namespace = namespace.to_string();
+        c
+    }
+
+    #[test]
+    fn test_namespace_filter_basic() {
+        let mut store = RustStore::in_memory();
+        store.upsert_entity("a", "entity", "A", None, 0);
+        store.upsert_entity("b", "entity", "B", None, 0);
+
+        store.insert_claim(make_ns_claim("c1", "a", "rel", "b", "team_alpha"));
+        store.insert_claim(make_ns_claim("c2", "a", "rel", "b", "team_beta"));
+
+        // No filter: both visible
+        assert_eq!(store.all_claims(0, 0).len(), 2);
+
+        // Filter to team_alpha
+        store.set_namespace_filter(vec!["team_alpha".to_string()]);
+        let claims = store.all_claims(0, 0);
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].claim_id, "c1");
+
+        // Filter to team_beta
+        store.set_namespace_filter(vec!["team_beta".to_string()]);
+        let claims = store.all_claims(0, 0);
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].claim_id, "c2");
+    }
+
+    #[test]
+    fn test_namespace_filter_empty_means_all() {
+        let mut store = RustStore::in_memory();
+        store.upsert_entity("a", "entity", "A", None, 0);
+        store.upsert_entity("b", "entity", "B", None, 0);
+
+        store.insert_claim(make_ns_claim("c1", "a", "rel", "b", "ns1"));
+        store.insert_claim(make_ns_claim("c2", "a", "rel", "b", "ns2"));
+
+        // Empty filter = all visible
+        store.set_namespace_filter(vec![]);
+        assert_eq!(store.all_claims(0, 0).len(), 2);
+
+        // Verify getter
+        assert!(store.get_namespace_filter().is_empty());
+    }
+
+    #[test]
+    fn test_namespace_default_empty() {
+        let mut store = RustStore::in_memory();
+        store.upsert_entity("a", "entity", "A", None, 0);
+        store.upsert_entity("b", "entity", "B", None, 0);
+
+        // Claim without explicit namespace → namespace is ""
+        store.insert_claim(make_claim("c1", "a", "rel", "b", "experimental"));
+        let claim = store.get_claim("c1").unwrap();
+        assert_eq!(claim.namespace, "");
+
+        // Filter to empty string namespace should include it
+        store.set_namespace_filter(vec!["".to_string()]);
+        assert_eq!(store.all_claims(0, 0).len(), 1);
+
+        // Filter to non-empty namespace should exclude it
+        store.set_namespace_filter(vec!["other".to_string()]);
+        assert_eq!(store.all_claims(0, 0).len(), 0);
+    }
+
+    #[test]
+    fn test_namespace_filter_multiple() {
+        let mut store = RustStore::in_memory();
+        store.upsert_entity("a", "entity", "A", None, 0);
+        store.upsert_entity("b", "entity", "B", None, 0);
+
+        store.insert_claim(make_ns_claim("c1", "a", "rel", "b", "ns1"));
+        store.insert_claim(make_ns_claim("c2", "a", "rel", "b", "ns2"));
+        store.insert_claim(make_ns_claim("c3", "a", "rel", "b", "ns3"));
+
+        // Filter to ns1 + ns3
+        store.set_namespace_filter(vec!["ns1".to_string(), "ns3".to_string()]);
+        let claims = store.all_claims(0, 0);
+        assert_eq!(claims.len(), 2);
+        let ids: Vec<&str> = claims.iter().map(|c| c.claim_id.as_str()).collect();
+        assert!(ids.contains(&"c1"));
+        assert!(ids.contains(&"c3"));
+        assert!(!ids.contains(&"c2"));
+    }
+
+    #[test]
+    fn test_namespace_filter_claims_for() {
+        let mut store = RustStore::in_memory();
+        store.upsert_entity("a", "entity", "A", None, 0);
+        store.upsert_entity("b", "entity", "B", None, 0);
+
+        store.insert_claim(make_ns_claim("c1", "a", "rel", "b", "ns1"));
+        store.insert_claim(make_ns_claim("c2", "a", "rel", "b", "ns2"));
+
+        store.set_namespace_filter(vec!["ns1".to_string()]);
+        let claims = store.claims_for("a", None, None, 0.0);
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].claim_id, "c1");
+    }
+
+    #[test]
+    fn test_namespace_filter_bfs() {
+        let mut store = RustStore::in_memory();
+        store.upsert_entity("a", "entity", "A", None, 0);
+        store.upsert_entity("b", "entity", "B", None, 0);
+
+        store.insert_claim(make_ns_claim("c1", "a", "rel", "b", "ns1"));
+        store.insert_claim(make_ns_claim("c2", "a", "rel", "b", "ns2"));
+
+        store.set_namespace_filter(vec!["ns2".to_string()]);
+        let results = store.bfs_claims("a", 1);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0.claim_id, "c2");
+    }
+
+    #[test]
+    fn test_namespace_filter_temporal() {
+        let mut store = RustStore::in_memory();
+        store.upsert_entity("a", "entity", "A", None, 0);
+        store.upsert_entity("b", "entity", "B", None, 0);
+
+        let mut c1 = make_ns_claim("c1", "a", "rel", "b", "ns1");
+        c1.timestamp = 100;
+        let mut c2 = make_ns_claim("c2", "a", "rel", "b", "ns2");
+        c2.timestamp = 200;
+
+        store.insert_claim(c1);
+        store.insert_claim(c2);
+
+        store.set_namespace_filter(vec!["ns1".to_string()]);
+        let claims = store.claims_in_range(0, 300);
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].claim_id, "c1");
+
+        let recent = store.most_recent_claims(10);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].claim_id, "c1");
     }
 }
 
@@ -1300,6 +1676,8 @@ mod redb_tests {
             payload: None,
             timestamp: 1000,
             status: ClaimStatus::Active,
+            namespace: String::new(),
+            expires_at: 0,
         }
     }
 
@@ -1329,6 +1707,17 @@ mod redb_tests {
         let store = setup_store(path.to_str().unwrap());
         assert!(store.claim_exists("c1"));
         assert!(!store.claim_exists("c99"));
+    }
+
+    #[test]
+    fn test_redb_get_claim() {
+        let (path, _guard) = temp_db();
+        let store = setup_store(path.to_str().unwrap());
+
+        let found = store.get_claim("c1");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().claim_id, "c1");
+        assert!(store.get_claim("missing").is_none());
     }
 
     #[test]
@@ -1427,6 +1816,8 @@ mod redb_tests {
             payload: None,
             timestamp: 1000,
             status: ClaimStatus::Active,
+            namespace: String::new(),
+            expires_at: 0,
         };
         store.insert_claim(alias_claim);
 
@@ -1540,6 +1931,32 @@ mod redb_tests {
         let results = store.search_entities("aspirin", 10);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "aspirin");
+    }
+
+    #[test]
+    fn test_redb_bm25_ranking() {
+        let (path, _guard) = temp_db();
+        let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
+        store.upsert_entity("brca1_gene", "gene", "brca1 gene", None, 0);
+        store.upsert_entity(
+            "brca1_related_pathway",
+            "pathway",
+            "brca1 related dna repair signaling pathway mechanism",
+            None,
+            0,
+        );
+        store.upsert_entity("tp53", "gene", "TP53 tumor protein", None, 0);
+
+        let results = store.search_entities("brca1", 10);
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].id, "brca1_gene",
+            "redb: shorter doc should rank first"
+        );
+        assert_eq!(
+            results[1].id, "brca1_related_pathway",
+            "redb: longer doc should rank second"
+        );
     }
 
     #[test]
@@ -1673,6 +2090,8 @@ mod redb_tests {
                 payload: None,
                 timestamp: 1000,
                 status: ClaimStatus::Active,
+                namespace: String::new(),
+            expires_at: 0,
             };
             store.insert_claim(alias_claim);
             store.close().unwrap();
@@ -1684,6 +2103,49 @@ mod redb_tests {
             let r1 = store.resolve("gene_a");
             let r2 = store.resolve("gene_a_alias");
             assert_eq!(r1, r2, "Alias should persist across close/reopen");
+        }
+    }
+
+    #[test]
+    fn test_namespace_persists_redb() {
+        let (path, _guard) = temp_db();
+
+        // Create store with namespaced claims, close
+        {
+            let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
+            store.upsert_entity("a", "entity", "A", None, 0);
+            store.upsert_entity("b", "entity", "B", None, 0);
+
+            let mut c1 = make_claim("c1", "a", "rel", "b", "experimental");
+            c1.namespace = "team_alpha".to_string();
+            let mut c2 = make_claim("c2", "a", "rel", "b", "experimental");
+            c2.namespace = "team_beta".to_string();
+
+            store.insert_claim(c1);
+            store.insert_claim(c2);
+            store.close().unwrap();
+        }
+
+        // Reopen, verify namespaces survived
+        {
+            let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
+
+            // Without filter: both visible
+            assert_eq!(store.all_claims(0, 0).len(), 2);
+
+            // Filter to team_alpha
+            store.set_namespace_filter(vec!["team_alpha".to_string()]);
+            let claims = store.all_claims(0, 0);
+            assert_eq!(claims.len(), 1);
+            assert_eq!(claims[0].claim_id, "c1");
+            assert_eq!(claims[0].namespace, "team_alpha");
+
+            // Verify claims_for also filters
+            let claims = store.claims_for("a", None, None, 0.0);
+            assert_eq!(claims.len(), 1);
+            assert_eq!(claims[0].claim_id, "c1");
+
+            store.close().unwrap();
         }
     }
 }
