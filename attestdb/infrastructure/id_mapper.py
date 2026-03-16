@@ -1,7 +1,8 @@
 """Gene ID mapper for cross-source entity resolution.
 
 Maps Ensembl protein IDs (ENSP) and gene symbols to Hetionet-style
-Entrez Gene IDs (Gene_XXXX). Used by DISEASES and STRING loaders.
+Entrez Gene IDs (Gene_XXXX). Used by DISEASES, STRING, and other loaders.
+Also provides reverse mapping (Entrez → gene symbol) for display name resolution.
 """
 
 from __future__ import annotations
@@ -15,6 +16,8 @@ logger = logging.getLogger(__name__)
 
 # NCBI gene2ensembl mapping file (human, ~30MB compressed)
 GENE2ENSEMBL_URL = "https://ftp.ncbi.nlm.nih.gov/gene/DATA/gene2ensembl.gz"
+# NCBI gene_info for comprehensive symbol coverage (~40MB compressed, ~65K human genes)
+GENE_INFO_URL = "https://ftp.ncbi.nlm.nih.gov/gene/DATA/GENE_INFO/Mammalia/Homo_sapiens.gene_info.gz"
 HUMAN_TAX_ID = "9606"
 
 
@@ -105,6 +108,62 @@ class GeneIDMapper:
                     if name:
                         self._symbol_to_entrez[name.upper()] = entrez_id
                         self._entrez_to_symbol[entrez_id] = name
+
+    def entrez_to_symbol(self, entrez_id: int) -> str | None:
+        """Map an Entrez Gene ID to its gene symbol.
+
+        Returns the gene symbol (e.g., 'CDK4') or None if unknown.
+        Coverage depends on data loaded: Hetionet (~20K genes) and/or
+        NCBI gene_info (~65K human genes).
+        """
+        return self._entrez_to_symbol.get(entrez_id)
+
+    def load_gene_info(self) -> None:
+        """Download NCBI gene_info for comprehensive Entrez→symbol coverage.
+
+        Extends _entrez_to_symbol and _symbol_to_entrez with ~65K human genes
+        (vs Hetionet's ~20K). Covers genes from CTD, ClinVar, HPO, etc.
+        that aren't in Hetionet.
+        """
+        import requests
+
+        dest = os.path.join(self._cache_dir, "Homo_sapiens.gene_info.gz")
+        if not os.path.exists(dest):
+            logger.info("Downloading NCBI gene_info (~40MB)...")
+            resp = requests.get(GENE_INFO_URL, timeout=120, stream=True)
+            resp.raise_for_status()
+            with open(dest, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            logger.info("Downloaded gene_info.gz (%d bytes)", os.path.getsize(dest))
+
+        # Format: tax_id(0) GeneID(1) Symbol(2) ... (15+ columns)
+        count = 0
+        with gzip.open(dest, "rt") as f:
+            for line in f:
+                if line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) < 3:
+                    continue
+                if parts[0] != HUMAN_TAX_ID:
+                    continue
+                try:
+                    entrez_id = int(parts[1])
+                except ValueError:
+                    continue
+                symbol = parts[2].strip()
+                if symbol and symbol != "-":
+                    # Don't overwrite existing mappings from Hetionet
+                    if entrez_id not in self._entrez_to_symbol:
+                        self._entrez_to_symbol[entrez_id] = symbol
+                        count += 1
+                    if symbol.upper() not in self._symbol_to_entrez:
+                        self._symbol_to_entrez[symbol.upper()] = entrez_id
+        logger.info(
+            "NCBI gene_info: %d new Entrez→symbol mappings (total: %d)",
+            count, len(self._entrez_to_symbol),
+        )
 
     def ensp_to_gene_entity_id(self, ensp: str) -> str | None:
         """Map an ENSP ID to a Hetionet Gene entity ID.

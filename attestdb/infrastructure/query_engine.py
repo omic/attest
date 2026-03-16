@@ -7,7 +7,12 @@ import time
 
 logger = logging.getLogger(__name__)
 
-from attestdb.core.confidence import count_independent_sources, tier2_confidence
+from attestdb.core.confidence import (
+    DecayConfig,
+    count_independent_sources,
+    effective_confidence,
+    tier2_confidence,
+)
 from attestdb.core.errors import EntityNotFoundError
 from attestdb.core.normalization import normalize_entity_id
 from attestdb.core.types import (
@@ -63,6 +68,11 @@ class QueryEngine:
     def __init__(self, store, claim_converter=None):
         self._store = store
         self._convert_claim = claim_converter or claim_from_dict
+        self._decay_config: DecayConfig | None = None
+
+    def set_decay_config(self, config: DecayConfig | None) -> None:
+        """Set or clear the decay configuration for query-time confidence."""
+        self._decay_config = config
 
     def query(
         self,
@@ -211,7 +221,10 @@ class QueryEngine:
                     for d in self._store.claims_by_content_id(cid)
                 ]
             corroborating = _content_cache[claim.content_id]
-            conf = tier2_confidence(claim, corroborating)
+            if self._decay_config and self._decay_config.enabled:
+                conf = effective_confidence(claim, self._decay_config, corroborating)
+            else:
+                conf = tier2_confidence(claim, corroborating)
 
             score = (
                 conf
@@ -257,10 +270,14 @@ class QueryEngine:
                 # Count independent sources via content_id grouping
                 corroborating = _content_cache.get(claim.content_id, [claim])
                 n_indep = count_independent_sources(corroborating)
+                if self._decay_config and self._decay_config.enabled:
+                    rel_conf = effective_confidence(claim, self._decay_config, corroborating)
+                else:
+                    rel_conf = tier2_confidence(claim, corroborating)
                 relationships[key] = Relationship(
                     predicate=pred_id,
                     target=other_summary,
-                    confidence=tier2_confidence(claim, corroborating),
+                    confidence=rel_conf,
                     n_independent_sources=n_indep,
                     source_types=[claim.provenance.source_type],
                     latest_claim_timestamp=claim.timestamp,
@@ -271,7 +288,10 @@ class QueryEngine:
             else:
                 rel = relationships[key]
                 corroborating = _content_cache.get(claim.content_id, [claim])
-                new_conf = tier2_confidence(claim, corroborating)
+                if self._decay_config and self._decay_config.enabled:
+                    new_conf = effective_confidence(claim, self._decay_config, corroborating)
+                else:
+                    new_conf = tier2_confidence(claim, corroborating)
                 rel.confidence = max(rel.confidence, new_conf)
                 if claim.provenance.source_type not in rel.source_types:
                     rel.source_types.append(claim.provenance.source_type)

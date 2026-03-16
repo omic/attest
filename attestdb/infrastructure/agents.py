@@ -20,6 +20,14 @@ if TYPE_CHECKING:
     from attestdb.infrastructure.attest_db import AttestDB
 
 from attestdb.core.normalization import normalize_entity_id
+
+
+def is_autodidact_source(source_id: str) -> bool:
+    """Check if a source_id belongs to the autodidact system."""
+    return (
+        source_id.startswith("autodidact:")
+        or source_id.startswith("agent:autodidact")
+    )
 from attestdb.core.types import (
     Claim,
     ClaimInput,
@@ -408,8 +416,7 @@ def generate_tasks(
             # Skip entities whose only sources are autodidact — don't chase own tail
             claims = db.claims_for(eid)
             if claims and all(
-                (c.provenance.source_id or "").startswith("autodidact:")
-                or (c.provenance.source_id or "").startswith("agent:autodidact")
+                is_autodidact_source(c.provenance.source_id or "")
                 or c.provenance.source_type == "autodidact"
                 for c in claims
             ):
@@ -467,6 +474,47 @@ def generate_tasks(
                 )
     except Exception as exc:
         logger.debug("Low confidence scan skipped: %s", exc)
+
+    # Source 4: Decayed confidence entities (needs configure_decay())
+    try:
+        decay_cfg = getattr(db, "_decay_config", None)
+        if decay_cfg and decay_cfg.enabled:
+            from attestdb.core.confidence import effective_confidence
+
+            for entity in db.list_entities():
+                eid = entity.id
+                if eid in investigating:
+                    continue
+                if entity_types_set and entity.entity_type not in entity_types_set:
+                    continue
+                claims = db.claims_for(eid)
+                if not claims:
+                    continue
+                max_stored = max(c.confidence for c in claims)
+                max_effective = max(
+                    effective_confidence(c, decay_cfg) for c in claims
+                )
+                # Flag if confidence has decayed by more than half
+                if max_stored > 0.1 and max_effective < 0.5 * max_stored:
+                    if eid in tasks:
+                        # Tag existing task as also decayed (don't overwrite)
+                        tasks[eid].description += (
+                            f" Also decayed: {max_stored:.2f}→{max_effective:.2f}."
+                        )
+                    else:
+                        tasks[eid] = ResearchTask(
+                            entity_id=eid,
+                            entity_type=entity.entity_type,
+                            gap_type="decayed",
+                            description=(
+                                f"Entity '{eid}' confidence decayed from "
+                                f"{max_stored:.2f} to {max_effective:.2f}. "
+                                f"Needs fresh evidence."
+                            ),
+                            priority=1.5,
+                        )
+    except Exception as exc:
+        logger.debug("Decayed confidence scan skipped: %s", exc)
 
     # Deprioritize entities with multiple negative results
     neg_counts: dict[str, int] = {}

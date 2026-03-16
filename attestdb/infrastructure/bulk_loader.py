@@ -1768,7 +1768,8 @@ class BulkLoader:
 
                 # Register entities
                 if gene_canonical not in entities:
-                    entities[gene_canonical] = ("gene", gene_eid, "{}")
+                    display = gene_symbol if gene_symbol else gene_eid
+                    entities[gene_canonical] = ("gene", display, "{}")
                 if go_canonical not in entities:
                     entities[go_canonical] = (go_type, go_name or go_id, "{}")
 
@@ -1911,7 +1912,9 @@ class BulkLoader:
 
                 # Register entities
                 if gene_canonical not in entities:
-                    entities[gene_canonical] = ("gene", gene_eid, "{}")
+                    display = gene_symbol if gene_symbol else gene_eid
+                    ext = json.dumps({"entrez": gene_id_str}) if gene_id_str else "{}"
+                    entities[gene_canonical] = ("gene", display, ext)
                 if chem_canonical not in entities:
                     entities[chem_canonical] = (
                         "compound", chem_name or f"Compound_{chem_mesh}",
@@ -2007,7 +2010,9 @@ class BulkLoader:
 
                 # Register entities
                 if gene_canonical not in entities:
-                    entities[gene_canonical] = ("gene", gene_eid, "{}")
+                    display = gene_symbol if gene_symbol else gene_eid
+                    ext = json.dumps({"entrez": gene_id_str}) if gene_id_str else "{}"
+                    entities[gene_canonical] = ("gene", display, ext)
                 if disease_canonical not in entities:
                     ext_ids = {}
                     if disease_id.startswith("MESH:"):
@@ -2121,6 +2126,8 @@ class BulkLoader:
 
                 gene_a_str = parts[1].strip()  # Entrez Gene Interactor A
                 gene_b_str = parts[2].strip()  # Entrez Gene Interactor B
+                symbol_a = parts[7].strip() if len(parts) > 7 else ""  # Official Symbol A
+                symbol_b = parts[8].strip() if len(parts) > 8 else ""  # Official Symbol B
                 exp_system_type = parts[12].strip().lower() if len(parts) > 12 else ""
                 throughput = parts[17].strip().lower() if len(parts) > 17 else ""
                 organism_a = parts[15].strip() if len(parts) > 15 else ""
@@ -2158,9 +2165,13 @@ class BulkLoader:
                 confidence = BIOGRID_CONFIDENCE.get(exp_system_type, 0.80)
 
                 if gene_a_canonical not in entities:
-                    entities[gene_a_canonical] = ("gene", gene_a_eid, "{}")
+                    display_a = symbol_a if symbol_a else gene_a_eid
+                    ext_a = json.dumps({"entrez": gene_a_str}) if gene_a_str else "{}"
+                    entities[gene_a_canonical] = ("gene", display_a, ext_a)
                 if gene_b_canonical not in entities:
-                    entities[gene_b_canonical] = ("gene", gene_b_eid, "{}")
+                    display_b = symbol_b if symbol_b else gene_b_eid
+                    ext_b = json.dumps({"entrez": gene_b_str}) if gene_b_str else "{}"
+                    entities[gene_b_canonical] = ("gene", display_b, ext_b)
 
                 predicate = "interacts"
                 source_id = f"biogrid:{gene_a_str}:{gene_b_str}"
@@ -2265,7 +2276,9 @@ class BulkLoader:
                     ext_ids["omim"] = disease_mim
 
                 if gene_canonical not in entities:
-                    entities[gene_canonical] = ("gene", gene_eid, "{}")
+                    display = gene_symbol if gene_symbol else gene_eid
+                    ext = json.dumps({"entrez": gene_id_str}) if gene_id_str else "{}"
+                    entities[gene_canonical] = ("gene", display, ext)
                 if disease_canonical not in entities:
                     # Use source_id_val as display name if available
                     display = source_id_val or concept_id
@@ -2753,8 +2766,9 @@ class BulkLoader:
                 seen_pairs.add(pair)
 
                 if gene_canonical not in entities:
-                    ext = json.dumps({"symbol": gene_symbol}) if gene_symbol else "{}"
-                    entities[gene_canonical] = ("gene", gene_eid, ext)
+                    display = gene_symbol if gene_symbol else gene_eid
+                    ext = json.dumps({"entrez": gene_id_str}) if gene_id_str else "{}"
+                    entities[gene_canonical] = ("gene", display, ext)
                 if phenotype_canonical not in entities:
                     entities[phenotype_canonical] = ("phenotype", hpo_name or phenotype_eid, "{}")
 
@@ -3243,6 +3257,7 @@ class BulkLoader:
 
     def load_stitch(
         self, path: str, min_score: int = 700,
+        mapper: GeneIDMapper | None = None,
     ) -> BatchResult:
         """Load STITCH chemical-protein interactions.
 
@@ -3302,8 +3317,12 @@ class BulkLoader:
                 protein_id = protein_raw
                 if protein_id.startswith("9606."):
                     protein_id = protein_id[5:]
-                # Use Gene entity directly (ENSP → Gene via existing naming)
-                gene_eid = f"Gene_{protein_id}"
+                # Map ENSP → Gene entity via mapper if available
+                gene_eid = None
+                if mapper is not None:
+                    gene_eid = mapper.ensp_to_gene_entity_id(protein_id)
+                if gene_eid is None:
+                    gene_eid = f"Gene_{protein_id}"
                 gene_canonical = normalize_entity_id(gene_eid)
 
                 if compound_canonical == gene_canonical:
@@ -3321,7 +3340,16 @@ class BulkLoader:
                         json.dumps({"pubchem_cid": str(cid)}),
                     )
                 if gene_canonical not in entities:
-                    entities[gene_canonical] = ("gene", gene_eid, "{}")
+                    # Resolve gene symbol via mapper if available
+                    display = gene_eid
+                    if mapper is not None and gene_eid.startswith("Gene_"):
+                        entrez_str = gene_eid[5:]
+                        if entrez_str.isdigit():
+                            sym = mapper.entrez_to_symbol(int(entrez_str))
+                            if sym:
+                                display = sym
+                    ext = json.dumps({"ensp": protein_id})
+                    entities[gene_canonical] = ("gene", display, ext)
 
                 predicate = "interacts"
                 source_id = f"stitch:{chem_raw}:{protein_raw}"
@@ -3667,7 +3695,16 @@ class BulkLoader:
                     continue
 
                 if gene_canonical not in entities:
-                    entities[gene_canonical] = ("gene", gene_eid, "{}")
+                    # Resolve gene symbol via mapper if available
+                    display = gene_eid
+                    if mapper is not None and gene_eid.startswith("Gene_"):
+                        entrez_str = gene_eid[5:]
+                        if entrez_str.isdigit():
+                            sym = mapper.entrez_to_symbol(int(entrez_str))
+                            if sym:
+                                display = sym
+                    ext = json.dumps({"ensembl": target_id})
+                    entities[gene_canonical] = ("gene", display, ext)
                 if disease_canonical not in entities:
                     entities[disease_canonical] = ("disease", disease_eid, "{}")
 

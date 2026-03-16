@@ -889,6 +889,64 @@ class AutodidactStatus:
 
 
 @dataclass
+class RegimeShift:
+    """A detected shift in temporal pattern."""
+
+    index: int
+    timestamp: int  # nanoseconds
+    confidence: float
+    direction: str = ""  # "up", "down", or ""
+
+
+@dataclass
+class VelocityStats:
+    """Rate-of-change statistics."""
+
+    mean_velocity: float = 0.0
+    max_velocity: float = 0.0
+    min_velocity: float = 0.0
+    std_velocity: float = 0.0
+    mean_acceleration: float = 0.0
+
+
+@dataclass
+class DetectedCycle:
+    """A detected periodic pattern."""
+
+    period: float  # in time-bucket units
+    power: float
+    is_harmonic: bool = False
+    harmonic_of: float | None = None
+
+
+@dataclass
+class TemporalResult:
+    """Result of temporal analysis on an entity's claims."""
+
+    entity_id: str
+    analysis_type: str  # "regime_shifts", "velocity", "cycles", "summary"
+    num_claims: int = 0
+    time_span_days: float = 0.0
+    bucket_size: str = ""  # "day", "week", "month"
+    num_buckets: int = 0
+
+    # Regime shifts
+    regime_shifts: list[RegimeShift] = field(default_factory=list)
+    num_shifts: int = 0
+
+    # Velocity
+    velocity: VelocityStats | None = None
+
+    # Cycles
+    cycles: list[DetectedCycle] = field(default_factory=list)
+    dominant_period: float | None = None
+
+    # Overall
+    confidence: float = 0.0
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
 class MergeConflict:
     """A belief where two databases disagree."""
     content_id: str

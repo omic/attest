@@ -57,6 +57,8 @@ class IngestionPipeline:
         self._resolver = None
         # Optional auto-embedding callback: (text) -> list[float]
         self._embed_fn: callable | None = None
+        # Optional DomainSpec for display name quality warnings
+        self._domain_spec = None
         # Vocabulary caches (invalidated via invalidate_vocab_caches)
         self._valid_entity_types: set[str] | None = None
         self._valid_pred_types: set[str] | None = None
@@ -105,6 +107,19 @@ class IngestionPipeline:
         obj_type = claim_input.object[1]
         pred_id = claim_input.predicate[0]
         pred_type = claim_input.predicate[1]
+
+        # Display name quality warning (informational, non-blocking)
+        if self._domain_spec is not None:
+            if self._domain_spec.looks_opaque(subj_canonical, subj_type):
+                logger.warning(
+                    "Opaque display name: %s (type=%s) — consider display name resolution",
+                    subj_canonical, subj_type,
+                )
+            if self._domain_spec.looks_opaque(obj_canonical, obj_type):
+                logger.warning(
+                    "Opaque display name: %s (type=%s) — consider display name resolution",
+                    obj_canonical, obj_type,
+                )
 
         # Entity resolution (optional): resolve names to existing entities
         if self._resolver is not None:

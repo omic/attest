@@ -1,0 +1,72 @@
+{
+  "name": "bio",
+  "version": "1.0.0",
+  "entity_types": [
+    {
+      "entity_type": "gene",
+      "id_pattern": "^Gene_\\d+$",
+      "display_source": "reference_file",
+      "reference_file": "ncbi://gene_info/Homo_sapiens",
+      "field_mapping": {"entrez_id": 1, "symbol": 2, "description": 8},
+      "fallback": "identity"
+    },
+    {
+      "entity_type": "protein",
+      "id_pattern": "^(ENSP\\d+|[A-Z]\\d{4,}\\d)$",
+      "display_source": "reference_file",
+      "reference_file": "uniprot://idmapping/Homo_sapiens",
+      "field_mapping": {"uniprot_ac": 0, "gene_name": 2},
+      "fallback": "identity"
+    },
+    {
+      "entity_type": "compound",
+      "id_pattern": "^Compound_(DB\\d+|CID:\\d+|MESH:[A-Z]\\d+)$",
+      "display_source": "source_field",
+      "fallback": "identity"
+    },
+    {
+      "entity_type": "disease",
+      "id_pattern": "^Disease_(MESH:[A-Z]\\d+|OMIM:\\d+|EFO:\\d+)$",
+      "display_source": "source_field",
+      "fallback": "identity"
+    },
+    {
+      "entity_type": "pathway",
+      "id_pattern": ".*",
+      "display_source": "identity"
+    },
+    {
+      "entity_type": "phenotype",
+      "id_pattern": "^Phenotype_HP:\\d+$",
+      "display_source": "source_field",
+      "fallback": "identity"
+    },
+    {
+      "entity_type": "biological_process",
+      "id_pattern": "^GO:\\d+$",
+      "display_source": "source_field",
+      "fallback": "identity"
+    },
+    {
+      "entity_type": "molecular_function",
+      "id_pattern": "^GO:\\d+$",
+      "display_source": "source_field",
+      "fallback": "identity"
+    },
+    {
+      "entity_type": "cellular_component",
+      "id_pattern": "^GO:\\d+$",
+      "display_source": "source_field",
+      "fallback": "identity"
+    }
+  ],
+  "predicate_types": [
+    "binds", "inhibits", "activates", "upregulates", "downregulates",
+    "expressed_in", "associated_with", "substrate_of", "phosphorylates",
+    "transported_by", "metabolized_by", "variant_of", "homolog_of",
+    "treats", "palliates", "resembles", "associates", "localizes",
+    "interacts", "regulates", "participates_in", "includes", "expresses",
+    "causes_side_effect", "equivalent_to", "contraindicates",
+    "causes", "prevents", "predisposes"
+  ]
+}

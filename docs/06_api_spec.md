@@ -560,6 +560,68 @@ db.snapshot("./backup.attest")
 restored = attestdb.restore("./backup.attest")
 ```
 
+## Autodidact (Self-Learning Daemon)
+
+```python
+# Start background daemon — detects gaps, searches sources, ingests evidence
+db.enable_autodidact(
+    interval=3600,                    # seconds between cycles
+    max_llm_calls_per_day=200,        # budget cap
+    max_cost_per_day=1.00,            # USD cap
+    search_fn=my_search,              # custom evidence source
+    sources="auto",                   # or "none" to register manually
+    connectors=["slack", "github"],   # search configured connectors
+    gap_types=["single_source", "low_confidence", "decayed"],
+)
+
+# Monitor
+status = db.autodidact_status()       # AutodidactStatus
+history = db.autodidact_history(10)   # list[CycleReport]
+db.autodidact_run_now()               # trigger immediate cycle
+
+# Stop
+db.disable_autodidact()
+```
+
+Each cycle: detect gaps via `generate_tasks()` → search evidence sources by priority → extract claims via `ingest_text()` → measure blindspot reduction → journal the cycle. Skips entities already researched with negative results (3+ failures).
+
+## Confidence Decay
+
+```python
+# Time-weighted confidence — older evidence loses weight at query time
+db.configure_decay(
+    half_life_days=365,
+    predicate_half_lives={"has_status": 30, "interacts_with": 730},
+)
+
+# Stored claims are never modified. Decay is computed at query time.
+# The autodidact daemon prioritizes "decayed" entities for refresh.
+```
+
+Per-predicate half-lives: operational predicates (`has_status`: 30 days) decay fast, durable scientific knowledge (`interacts_with`: 730 days) decays slowly.
+
+## Temporal Analysis
+
+```python
+# Detect when evidence patterns shifted
+result = db.temporal_analyze("brca1", "regime_shifts")
+# TemporalResult(num_shifts=2, regime_shifts=[RegimeShift(index=47, direction="up")])
+
+result = db.temporal_analyze("brca1", "velocity")
+# TemporalResult(velocity=VelocityStats(mean_velocity=0.23, max_velocity=1.4))
+
+result = db.temporal_analyze("brca1", "cycles", min_period=7)
+# TemporalResult(cycles=[DetectedCycle(period=7.0, power=0.89)])
+
+# All three at once
+result = db.temporal_summary("brca1")
+```
+
+Builds time series from entity claims (auto-bucketed by day/week/month), then runs:
+- **Regime shifts**: AR(1) divergence on sliding window
+- **Velocity**: gradient + exponential smoothing
+- **Cycles**: Welch's PSD + peak detection
+
 ## Build Observability
 
 ```python

@@ -43,6 +43,10 @@ class AttestDBSnapshot:
             db._store, timestamp,
             claim_converter=db._query_engine._convert_claim,
         )
+        # Inherit decay config from parent DB
+        decay_cfg = getattr(db, "_decay_config", None)
+        if decay_cfg:
+            self._query_engine.set_decay_config(decay_cfg)
 
     def query(self, focal_entity: str, **kwargs) -> ContextFrame:
         return self._query_engine.query(focal_entity, **kwargs)

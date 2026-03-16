@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import time
+from dataclasses import dataclass, field
 
 SOURCE_TYPE_WEIGHTS: dict[str, float] = {
     # Built-in vocabulary
@@ -40,6 +41,48 @@ DEFAULT_WEIGHT = 0.50
 # Tier 2 parameters
 HALF_LIFE_DAYS = 365
 CORROBORATION_CAP = 1.7
+
+# Default per-predicate half-lives (days). Predicates not listed use default.
+DEFAULT_PREDICATE_HALF_LIVES: dict[str, int] = {
+    # Status/operational — changes rapidly
+    "has_status": 30,
+    "has_warning": 90,
+    "has_vulnerability": 90,
+    "has_issue": 90,
+    # Durable scientific knowledge — decays slowly
+    "interacts_with": 730,
+    "binds": 730,
+    "phosphorylates": 730,
+    "inhibits": 730,
+    "activates": 730,
+    "catalyzes": 730,
+    "encodes": 1460,
+    "transcribes": 1460,
+    # General relationships — default pace
+    "associates_with": 365,
+    "relates_to": 365,
+    "causes": 365,
+    "treats": 365,
+}
+
+
+@dataclass
+class DecayConfig:
+    """Configuration for time-weighted confidence decay.
+
+    Decay is query-time only — stored claims are never modified.
+    """
+
+    default_half_life_days: int = 365
+    predicate_half_lives: dict[str, int] = field(default_factory=dict)
+    enabled: bool = True
+
+    def half_life_for(self, predicate_id: str) -> int:
+        """Resolve half-life for a predicate: specific override > default."""
+        return self.predicate_half_lives.get(
+            predicate_id,
+            DEFAULT_PREDICATE_HALF_LIVES.get(predicate_id, self.default_half_life_days),
+        )
 
 
 def tier1_confidence(source_type: str) -> float:
@@ -109,6 +152,8 @@ def recency_factor(claim_timestamp_ns: int, half_life_days: int = HALF_LIFE_DAYS
     if age_seconds <= 0:
         return 1.0
     age_days = age_seconds / 86400
+    if half_life_days <= 0:
+        return 0.0
     return 0.5 ** (age_days / half_life_days)
 
 
@@ -139,3 +184,20 @@ def tier2_confidence(
     recency = recency_factor(claim.timestamp, half_life_days)
 
     return min(base * boost * recency, 1.0)
+
+
+def effective_confidence(
+    claim,
+    decay_config: DecayConfig,
+    corroborating_claims: list | None = None,
+) -> float:
+    """Tier 2 confidence with predicate-aware decay half-life.
+
+    Resolves the correct half-life for the claim's predicate via
+    *decay_config*, then delegates to :func:`tier2_confidence`.
+    When decay is disabled, falls back to the default 365-day half-life.
+    """
+    if not decay_config.enabled:
+        return tier2_confidence(claim, corroborating_claims)
+    hl = decay_config.half_life_for(claim.predicate.id)
+    return tier2_confidence(claim, corroborating_claims, half_life_days=hl)

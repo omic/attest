@@ -159,9 +159,11 @@ class AttestDB:
         instance._rbac_path = None
         instance._rbac_enabled = False
         instance._autodidact = None
+        instance._decay_config = None
         instance._curator = None
         instance._text_extractor = None
         instance._insight_engine = None
+        instance._temporal_engine = None
         instance._researcher = None
         instance._curator_model = "heuristic"
         instance._curator_api_key = None
@@ -270,10 +272,14 @@ class AttestDB:
         # Autodidact daemon (lazy-init)
         self._autodidact: "AutodidactDaemon | None" = None
 
+        # Confidence decay config (query-time only)
+        self._decay_config: "DecayConfig | None" = None
+
         # Lazy-init intelligence components
         self._curator = None
         self._text_extractor = None
         self._insight_engine = None
+        self._temporal_engine = None
         self._researcher = None
         self._curator_model = "heuristic"
         self._curator_api_key = None
@@ -346,6 +352,46 @@ class AttestDB:
             self._pipeline._embed_fn = _openai_embed
         else:
             raise ValueError(f"Unknown embedding provider: {provider!r}. Use 'openai' or a callable.")
+
+    def configure_decay(
+        self,
+        half_life_days: int = 365,
+        predicate_half_lives: dict[str, int] | None = None,
+        enabled: bool = True,
+    ) -> None:
+        """Configure time-weighted confidence decay.
+
+        Decay is applied at query time only — stored claims are never
+        modified.  Older evidence naturally loses weight, encouraging
+        the autodidact daemon to refresh stale knowledge.
+
+        Args:
+            half_life_days: Default half-life for all predicates.
+            predicate_half_lives: Per-predicate overrides
+                (e.g. ``{"has_status": 30, "interacts_with": 730}``).
+            enabled: Set ``False`` to disable decay without clearing config.
+
+        Example::
+
+            db.configure_decay(half_life_days=365)
+            db.configure_decay(
+                half_life_days=365,
+                predicate_half_lives={"has_status": 30},
+            )
+        """
+        from attestdb.core.confidence import DecayConfig
+
+        self._decay_config = DecayConfig(
+            default_half_life_days=half_life_days,
+            predicate_half_lives=predicate_half_lives or {},
+            enabled=enabled,
+        )
+        self._query_engine.set_decay_config(self._decay_config)
+
+    @property
+    def decay_config(self):
+        """Current decay configuration, or ``None`` if not configured."""
+        return self._decay_config
 
     # --- Tamper-evident chain ---
 
@@ -3071,6 +3117,12 @@ class AttestDB:
             self._insight_engine = InsightEngineV1(self)
         return self._insight_engine
 
+    def _get_temporal_engine(self):
+        if self._temporal_engine is None:
+            from attestdb.intelligence.temporal import TemporalEngine
+            self._temporal_engine = TemporalEngine(self)
+        return self._temporal_engine
+
     def _get_researcher(self):
         if self._researcher is None:
             try:
@@ -3386,6 +3438,71 @@ class AttestDB:
     def find_confidence_alerts(self, **kwargs) -> list:
         return self._get_insight_engine().find_confidence_alerts(**kwargs)
 
+    # --- Temporal analysis ---
+
+    def temporal_analyze(
+        self,
+        entity_id: str,
+        analysis_type: str = "regime_shifts",
+        metric: str = "claim_count",
+        bucket: str | None = None,
+        **kwargs,
+    ) -> "TemporalResult":
+        """Analyze temporal patterns for an entity's claims.
+
+        Builds a time series from the entity's claims (bucketed by
+        day/week/month) and runs the specified analysis.
+
+        Args:
+            entity_id: Entity to analyze.
+            analysis_type: ``"regime_shifts"``, ``"velocity"``, or ``"cycles"``.
+            metric: ``"claim_count"`` (default) or ``"avg_confidence"``.
+            bucket: ``"day"``, ``"week"``, ``"month"``, or ``None`` (auto).
+            **kwargs: Analysis-specific params (window_size, threshold, etc.).
+
+        Returns:
+            :class:`TemporalResult` with detected patterns.
+
+        Example::
+
+            result = db.temporal_analyze("brca1", "regime_shifts")
+            print(f"Found {result.num_shifts} regime shifts")
+
+            result = db.temporal_analyze("brca1", "velocity")
+            print(f"Max velocity: {result.velocity.max_velocity}")
+        """
+        return self._get_temporal_engine().analyze(
+            entity_id, analysis_type=analysis_type,
+            metric=metric, bucket=bucket, **kwargs,
+        )
+
+    def temporal_summary(
+        self,
+        entity_id: str,
+        metric: str = "claim_count",
+        bucket: str | None = None,
+    ) -> "TemporalResult":
+        """Run all temporal analyses (shifts, velocity, cycles) at once.
+
+        Args:
+            entity_id: Entity to analyze.
+            metric: ``"claim_count"`` or ``"avg_confidence"``.
+            bucket: ``"day"``, ``"week"``, ``"month"``, or ``None`` (auto).
+
+        Returns:
+            :class:`TemporalResult` with all three analyses populated.
+
+        Example::
+
+            result = db.temporal_summary("brca1")
+            print(f"Shifts: {result.num_shifts}")
+            print(f"Velocity: {result.velocity.mean_velocity}")
+            print(f"Dominant cycle: {result.dominant_period}")
+        """
+        return self._get_temporal_engine().summary(
+            entity_id, metric=metric, bucket=bucket,
+        )
+
     # --- Autonomous research ---
 
     def investigate(
@@ -3646,16 +3763,20 @@ class AttestDB:
 
         # Single-source detection via Rust index (no claim materialization).
         # entity_source_counts returns [(source_id, count, avg_conf)] per entity.
+        from attestdb.infrastructure.agents import is_autodidact_source
+
         single_source = []
         entities = self.list_entities()
         for entity in entities:
             if entity.claim_count < min_claims:
                 continue
             src_counts = self._store.entity_source_counts(entity.id)
-            # Filter out "inquiry" predicates: entity_source_counts includes all.
-            # This is a minor approximation — previously we excluded inquiry predicates
-            # from source counting, but for blindspot detection the difference is negligible.
             if len(src_counts) == 1:
+                # Skip entities whose sole source is autodidact — these are
+                # self-generated and shouldn't be flagged as blindspots.
+                sole_source_id = src_counts[0][0] if src_counts else ""
+                if is_autodidact_source(sole_source_id):
+                    continue
                 single_source.append(entity.id)
 
         # Single pass over claims for subject→predicate map (unresolved warnings)
