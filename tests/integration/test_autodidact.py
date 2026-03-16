@@ -302,8 +302,10 @@ class TestBudget:
             interval=999999,
             max_llm_calls_per_day=9999,
             max_cost_per_day=0.001,  # tiny cost cap
-            search_fn=cheap_search,
+            sources="none",  # don't auto-register, we register manually with cost
         )
+        # Register source with non-zero cost so cost tracking works even without LLM
+        db._autodidact.register_source("paid", cheap_search, cost_per_call=0.002)
 
         db.autodidact_run_now()
         time.sleep(1.0)
