@@ -151,7 +151,7 @@ class IngestionPipeline:
         # Rule 3: Compute content_id
         content_id = compute_content_id(subj_canonical, pred_id, obj_canonical)
 
-        # Rule 4: Duplicate check
+        # Rule 4: Duplicate check (exact claim_id match)
         if self._store.claim_exists(claim_id):
             raise DuplicateClaimError(f"Claim {claim_id} already exists")
 
@@ -246,6 +246,20 @@ class IngestionPipeline:
         obj_display = claim_input.object[0]
         subj_ext = (claim_input.external_ids or {}).get("subject", {})
         obj_ext = (claim_input.external_ids or {}).get("object", {})
+
+        # Rule 4b: Content-level dedup — same fact from same source is a duplicate,
+        # not corroboration. Without this, re-submitting the same claim (e.g. via API
+        # retry or migration re-run) inflates counts and fakes corroboration.
+        # Placed after all other validation so that genuinely invalid claims still
+        # fail with the correct error (e.g. SchemaValidationError, not DuplicateClaimError).
+        existing_by_content = self._store.claims_by_content_id(content_id)
+        for existing_claim in existing_by_content:
+            prov = existing_claim.get("provenance", {})
+            ex_source_id = prov.get("source_id", "") if isinstance(prov, dict) else ""
+            if ex_source_id == source_id:
+                raise DuplicateClaimError(
+                    f"Claim with content_id {content_id} from source {source_id} already exists"
+                )
 
         # Compute expires_at from ttl_seconds
         ttl_seconds = getattr(claim_input, "ttl_seconds", 0) or 0

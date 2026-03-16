@@ -1,7 +1,7 @@
-//! RustStore — drop-in replacement for KuzuStore.
+//! RustStore — claim-native store with LMDB backend.
 //!
 //! Thin dispatcher over storage backends. All business logic
-//! lives in the backend modules (`backend::memory`, `backend::redb`).
+//! lives in the backend modules (`backend::memory`, `backend::lmdb`).
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -10,8 +10,7 @@ use attest_core::errors::AttestError;
 use attest_core::types::{Claim, ClaimStatus, EntitySummary};
 
 use crate::backend::memory::DEFAULT_CHECKPOINT_INTERVAL;
-use crate::backend::migration;
-use crate::backend::{Backend, MemoryBackend, RedbBackend, StorageBackend};
+use crate::backend::{Backend, LmdbBackend, MemoryBackend, StorageBackend};
 use crate::metadata::Vocabulary;
 
 /// Store statistics.
@@ -47,35 +46,29 @@ impl RustStore {
     pub fn new(db_path: &str) -> Result<Self, AttestError> {
         let path = std::path::Path::new(db_path);
 
-        // If file exists with old SUBSTRT\0 format → auto-migrate to redb
-        if migration::needs_migration(path) {
-            log::info!("Detected old format database, migrating to redb...");
-            let backend = migration::migrate_to_redb(db_path)?;
+        // Existing LMDB directory → open
+        if path.is_dir() && path.join("data.mdb").exists() {
+            let backend = LmdbBackend::open(db_path)?;
             return Ok(Self {
-                backend: Backend::File(Box::new(backend)),
+                backend: Backend::Lmdb(Box::new(backend)),
                 checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
                 read_only: false,
                 temp_path: None,
             });
         }
 
-        // Otherwise → use RedbBackend (handles non-existent, valid redb, and corrupted files)
-        let backend = RedbBackend::open(db_path)?;
-        Ok(Self {
-            backend: Backend::File(Box::new(backend)),
-            checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
-            read_only: false,
-            temp_path: None,
-        })
-    }
+        // Existing file (not a directory) → unsupported legacy format
+        if path.exists() && path.is_file() {
+            return Err(AttestError::Provenance(format!(
+                "Legacy database format detected at {db_path}. \
+                 Only LMDB databases are supported. Please re-create the database."
+            )));
+        }
 
-    /// Open or create a store using the legacy in-memory backend.
-    /// This is used for `:memory:` stores and for opening old SUBSTRT\0 format files.
-    #[cfg(test)]
-    pub fn new_memory_backend(db_path: &str) -> Result<Self, AttestError> {
-        let backend = MemoryBackend::open(db_path)?;
+        // New database → create LMDB
+        let backend = LmdbBackend::open(db_path)?;
         Ok(Self {
-            backend: Backend::InMemory(Box::new(backend)),
+            backend: Backend::Lmdb(Box::new(backend)),
             checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
             read_only: false,
             temp_path: None,
@@ -92,46 +85,17 @@ impl RustStore {
         }
     }
 
-    /// Open a database in read-only mode by copying it to a temp file.
+    /// Open a database in read-only mode.
     ///
-    /// This avoids acquiring the exclusive write lock on the original file,
-    /// allowing MCP hooks and other readers to inspect the database while
-    /// a writer holds the lock on the real file.
-    ///
-    /// All write operations will return an error. On `close()`, the temp
-    /// file is deleted.
+    /// Uses LMDB's MVCC: concurrent readers coexist with a single writer.
+    /// Read-only opens do NOT acquire the write lock.
     pub fn open_read_only(db_path: &str) -> Result<Self, AttestError> {
-        let src = std::path::Path::new(db_path);
-        if !src.exists() {
-            return Err(AttestError::Provenance(format!(
-                "database not found: {db_path}"
-            )));
-        }
-
-        // Copy to temp file so we don't contend for the lock
-        let temp_dir = std::env::temp_dir();
-        let temp_file = temp_dir.join(format!(
-            "attest_ro_{}_{}.attest",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        std::fs::copy(src, &temp_file).map_err(|e| {
-            AttestError::Provenance(format!("failed to copy for read-only: {e}"))
-        })?;
-
-        let temp_path_str = temp_file.to_str().ok_or_else(|| {
-            AttestError::Provenance("invalid temp path".to_string())
-        })?;
-        let backend = RedbBackend::open(temp_path_str)?;
-
+        let backend = LmdbBackend::open_read_only(db_path)?;
         Ok(Self {
-            backend: Backend::File(Box::new(backend)),
+            backend: Backend::Lmdb(Box::new(backend)),
             checkpoint_interval: 0,
             read_only: true,
-            temp_path: Some(temp_file),
+            temp_path: None,
         })
     }
 
@@ -164,6 +128,11 @@ impl RustStore {
     /// No-op (returns `false`) for in-memory backends.
     pub fn compact(&mut self) -> Result<bool, AttestError> {
         self.backend.compact()
+    }
+
+    /// Return the schema version of this database.
+    pub fn schema_version(&self) -> u32 {
+        self.backend.schema_version()
     }
 
     // ── Metadata ───────────────────────────────────────────────────────
@@ -228,18 +197,23 @@ impl RustStore {
         self.backend.upsert_entity(entity_id, entity_type, display_name, external_ids, timestamp);
     }
 
-    /// Batch-upsert entities in a single transaction (redb) or loop (in-memory).
+    /// Batch-upsert entities in a single transaction (LMDB) or loop (in-memory).
     pub fn upsert_entities_batch(
         &mut self,
         entities: &[(String, String, String, HashMap<String, String>)],
         timestamp: i64,
-    ) {
-        if self.read_only { return; }
-        self.backend.upsert_entities_batch(entities, timestamp);
+    ) -> Result<(), AttestError> {
+        if self.read_only { return Err(AttestError::ReadOnly); }
+        self.backend.upsert_entities_batch(entities, timestamp)
     }
 
     pub fn get_entity(&self, entity_id: &str) -> Option<EntitySummary> {
         self.backend.get_entity(entity_id)
+    }
+
+    /// Batch-lookup entity metadata (type, display_name) for multiple IDs.
+    pub fn get_entities_batch(&self, entity_ids: &[&str]) -> HashMap<String, (String, String)> {
+        self.backend.get_entities_batch(entity_ids)
     }
 
     pub fn list_entities(
@@ -424,6 +398,86 @@ impl RustStore {
     pub fn get_namespace_filter(&self) -> &[String] {
         self.backend.get_namespace_filter()
     }
+
+    // ── Analytics (Rust-native aggregation) ───────────────────────────
+
+    /// Count claims per predicate_id. Returns HashMap<predicate_id, count>.
+    pub fn predicate_counts(&self) -> HashMap<String, u64> {
+        self.backend.predicate_counts()
+    }
+
+    /// Backfill pred_id_counts for existing databases.
+    pub fn backfill_pred_id_counts(&mut self) -> Result<usize, AttestError> {
+        self.backend.backfill_pred_id_counts()
+    }
+
+    /// Backfill claim_summaries table for existing databases.
+    pub fn backfill_claim_summaries(&mut self) -> Result<u64, AttestError> {
+        self.backend.backfill_claim_summaries()
+    }
+
+    /// Backfill analytics counter tables for sub-second analytics.
+    pub fn backfill_analytics_counters(&mut self) -> Result<u64, AttestError> {
+        self.backend.backfill_analytics_counters()
+    }
+
+    /// Find contradictions: (subject, object) pairs under both predicates.
+    pub fn find_contradictions(
+        &self,
+        pred_a: &str,
+        pred_b: &str,
+    ) -> Vec<(String, String, u64, u64, f64, f64)> {
+        self.backend.find_contradictions(pred_a, pred_b)
+    }
+
+    /// Gap analysis: entities of a type missing expected predicates.
+    pub fn gap_analysis(
+        &self,
+        entity_type: &str,
+        expected_predicates: &[&str],
+        limit: usize,
+    ) -> Vec<(String, Vec<String>)> {
+        self.backend.gap_analysis(entity_type, expected_predicates, limit)
+    }
+
+    /// Get predicate_id → count for a single entity.
+    pub fn entity_predicate_counts(&self, entity_id: &str) -> Vec<(String, u64)> {
+        self.backend.entity_predicate_counts(entity_id)
+    }
+
+    /// Get source_id → (count, avg_confidence) for a single entity.
+    pub fn entity_source_counts(&self, entity_id: &str) -> Vec<(String, u64, f64)> {
+        self.backend.entity_source_counts(entity_id)
+    }
+
+    // ── Bulk load mode ───────────────────────────────────────────────
+
+    /// Enable or disable bulk load mode. Skips analytics counters during insert
+    /// for ~2.5× throughput. Call `rebuild_counters()` after loading is complete.
+    pub fn set_bulk_load_mode(&mut self, enabled: bool) {
+        self.backend.set_bulk_load_mode(enabled);
+    }
+
+    /// Rebuild all analytics counters from the claims table.
+    pub fn rebuild_counters(&mut self) -> Result<(), AttestError> {
+        self.backend.rebuild_counters()
+    }
+
+    /// Count claims per source_id. Returns HashMap<source_id, count>.
+    pub fn source_id_counts(&self) -> HashMap<String, u64> {
+        self.backend.source_id_counts()
+    }
+
+    /// Merge all claims and entities from another LMDB database.
+    /// Returns the number of newly merged claims.
+    pub fn merge_from(&mut self, source_path: &str) -> Result<usize, AttestError> {
+        if self.read_only {
+            return Err(AttestError::Provenance(
+                "cannot merge into a read-only store".to_string()
+            ));
+        }
+        self.backend.merge_from(source_path)
+    }
 }
 
 /// Parse a status string into a ClaimStatus.
@@ -441,6 +495,14 @@ fn parse_status(s: &str) -> Result<ClaimStatus, AttestError> {
 mod tests {
     use super::*;
     use attest_core::types::*;
+
+    /// Clean up a test database path (handles both files and LMDB directories).
+    fn cleanup_db(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(path);
+        let _ = std::fs::remove_file(path.with_extension("attest.lock"));
+        crate::wal::Wal::remove(path);
+    }
 
     fn make_claim(
         claim_id: &str,
@@ -689,7 +751,7 @@ mod tests {
     #[test]
     fn test_persistence_roundtrip() {
         let dir = std::env::temp_dir().join("attest_store_test.attest");
-        let _ = std::fs::remove_file(&dir);
+        cleanup_db(&dir);
 
         // Create and populate
         {
@@ -708,82 +770,16 @@ mod tests {
             assert_eq!(store.stats().total_claims, 1);
         }
 
-        std::fs::remove_file(&dir).unwrap();
+        cleanup_db(&dir);
     }
 
-    #[test]
-    fn test_file_locking() {
-        let dir = std::env::temp_dir().join("attest_lock_test.attest");
-        let _ = std::fs::remove_file(&dir);
-        let _ = std::fs::remove_file(dir.with_extension("attest.lock"));
-
-        // First open succeeds
-        let mut store1 = RustStore::new(dir.to_str().unwrap()).unwrap();
-
-        // Second open should fail with lock error
-        let result = RustStore::new(dir.to_str().unwrap());
-        assert!(result.is_err());
-        match result {
-            Err(e) => {
-                let err_msg = format!("{e}");
-                assert!(err_msg.contains("lock"), "Error should mention lock: {err_msg}");
-            }
-            Ok(_) => panic!("Expected lock error"),
-        }
-
-        // After close, lock is released
-        store1.close().unwrap();
-        let mut store2 = RustStore::new(dir.to_str().unwrap()).unwrap();
-        store2.close().unwrap();
-
-        let _ = std::fs::remove_file(&dir);
-        let _ = std::fs::remove_file(dir.with_extension("attest.lock"));
-    }
-
-    #[test]
-    fn test_crash_recovery_corrupted_file() {
-        let dir = std::env::temp_dir().join("attest_crash_test.attest");
-        let _ = std::fs::remove_file(&dir);
-        let _ = std::fs::remove_file(dir.with_extension("attest.lock"));
-
-        // Write a valid store
-        {
-            let mut store = RustStore::new(dir.to_str().unwrap()).unwrap();
-            store.upsert_entity("a", "entity", "A", None, 0);
-            store.insert_claim(make_claim("c1", "a", "rel", "a", "obs"));
-            store.close().unwrap();
-        }
-
-        // Corrupt the file by overwriting the magic bytes (detected by both backends)
-        {
-            let mut data = std::fs::read(&dir).unwrap();
-            // Overwrite first 16 bytes — triggers magic number check in both
-            // the old SUBSTRT\0 format and redb's file header
-            for i in 0..std::cmp::min(16, data.len()) {
-                data[i] = 0xFF;
-            }
-            std::fs::write(&dir, &data).unwrap();
-        }
-
-        // Opening should succeed (crash recovery) but start empty
-        {
-            let mut store = RustStore::new(dir.to_str().unwrap()).unwrap();
-            assert_eq!(store.stats().total_claims, 0, "Corrupted file should start empty");
-            assert_eq!(store.stats().entity_count, 0);
-            store.close().unwrap();
-        }
-
-        let _ = std::fs::remove_file(&dir);
-        let _ = std::fs::remove_file(dir.with_extension("attest.lock"));
-    }
 
     #[test]
     fn test_atomic_write_leaves_no_tmp() {
         let dir = std::env::temp_dir().join("attest_atomic_test.attest");
         let tmp = dir.with_extension("attest.tmp");
-        let _ = std::fs::remove_file(&dir);
+        cleanup_db(&dir);
         let _ = std::fs::remove_file(&tmp);
-        let _ = std::fs::remove_file(dir.with_extension("attest.lock"));
 
         let mut store = RustStore::new(dir.to_str().unwrap()).unwrap();
         store.upsert_entity("a", "entity", "A", None, 0);
@@ -794,8 +790,7 @@ mod tests {
         // Main file should exist
         assert!(dir.exists(), "Main file should exist after close");
 
-        let _ = std::fs::remove_file(&dir);
-        let _ = std::fs::remove_file(dir.with_extension("attest.lock"));
+        cleanup_db(&dir);
     }
 
     #[test]
@@ -942,9 +937,7 @@ mod tests {
     fn test_wal_crash_recovery() {
         // Simulate: write claims → crash (no close) → reopen → data recovered
         let dir = std::env::temp_dir().join("attest_wal_recovery_test.attest");
-        let _ = std::fs::remove_file(&dir);
-        let _ = std::fs::remove_file(dir.with_extension("attest.lock"));
-        crate::wal::Wal::remove(&dir);
+        cleanup_db(&dir);
 
         // Phase 1: write claims, then DROP without close (simulates crash)
         {
@@ -967,17 +960,13 @@ mod tests {
             store.close().unwrap();
         }
 
-        let _ = std::fs::remove_file(&dir);
-        let _ = std::fs::remove_file(dir.with_extension("attest.lock"));
-        crate::wal::Wal::remove(&dir);
+        cleanup_db(&dir);
     }
 
     #[test]
     fn test_checkpoint_without_close() {
         let dir = std::env::temp_dir().join("attest_checkpoint_test.attest");
-        let _ = std::fs::remove_file(&dir);
-        let _ = std::fs::remove_file(dir.with_extension("attest.lock"));
-        crate::wal::Wal::remove(&dir);
+        cleanup_db(&dir);
 
         {
             let mut store = RustStore::new(dir.to_str().unwrap()).unwrap();
@@ -1001,17 +990,13 @@ mod tests {
             store.close().unwrap();
         }
 
-        let _ = std::fs::remove_file(&dir);
-        let _ = std::fs::remove_file(dir.with_extension("attest.lock"));
-        crate::wal::Wal::remove(&dir);
+        cleanup_db(&dir);
     }
 
     #[test]
     fn test_auto_checkpoint() {
         let dir = std::env::temp_dir().join("attest_auto_cp_test.attest");
-        let _ = std::fs::remove_file(&dir);
-        let _ = std::fs::remove_file(dir.with_extension("attest.lock"));
-        crate::wal::Wal::remove(&dir);
+        cleanup_db(&dir);
 
         {
             let mut store = RustStore::new(dir.to_str().unwrap()).unwrap();
@@ -1042,9 +1027,7 @@ mod tests {
             store.close().unwrap();
         }
 
-        let _ = std::fs::remove_file(&dir);
-        let _ = std::fs::remove_file(dir.with_extension("attest.lock"));
-        crate::wal::Wal::remove(&dir);
+        cleanup_db(&dir);
     }
 
     #[test]
@@ -1233,7 +1216,7 @@ mod tests {
     fn test_batch_dedup_within_batch() {
         // Verifies that duplicate claim_ids within a single batch are deduplicated
         let dir = std::env::temp_dir().join("attest_batch_dedup_test.attest");
-        let _ = std::fs::remove_file(&dir);
+        cleanup_db(&dir);
 
         let mut store = RustStore::new(dir.to_str().unwrap()).unwrap();
         store.upsert_entity("a", "entity", "A", None, 0);
@@ -1255,7 +1238,7 @@ mod tests {
         assert_eq!(store.stats().total_claims, 3);
 
         store.close().unwrap();
-        let _ = std::fs::remove_file(&dir);
+        cleanup_db(&dir);
     }
 
     // ── Retraction tests ────────────────────────────────────────────────
@@ -1344,13 +1327,11 @@ mod tests {
     #[test]
     fn test_retraction_persists_memory() {
         let dir = std::env::temp_dir().join("attest_retract_persist_mem.attest");
-        let _ = std::fs::remove_file(&dir);
-        let _ = std::fs::remove_file(dir.with_extension("attest.lock"));
-        crate::wal::Wal::remove(&dir);
+        cleanup_db(&dir);
 
         // Create, insert, retract, close
         {
-            let mut store = RustStore::new_memory_backend(dir.to_str().unwrap()).unwrap();
+            let mut store = RustStore::new(dir.to_str().unwrap()).unwrap();
             store.upsert_entity("a", "entity", "A", None, 0);
             store.upsert_entity("b", "entity", "B", None, 0);
             store.insert_claim(make_claim("c1", "a", "rel", "b", "obs"));
@@ -1361,22 +1342,20 @@ mod tests {
 
         // Reopen and verify
         {
-            let mut store = RustStore::new_memory_backend(dir.to_str().unwrap()).unwrap();
+            let mut store = RustStore::new(dir.to_str().unwrap()).unwrap();
             let c1 = store.get_claim("c1").unwrap();
             assert_eq!(c1.status, ClaimStatus::Tombstoned, "Retraction should persist");
             assert_eq!(store.all_claims(0, 0).len(), 1, "Retracted claim should be filtered");
             store.close().unwrap();
         }
 
-        let _ = std::fs::remove_file(&dir);
-        let _ = std::fs::remove_file(dir.with_extension("attest.lock"));
-        crate::wal::Wal::remove(&dir);
+        cleanup_db(&dir);
     }
 
     #[test]
-    fn test_retraction_persists_redb() {
-        let dir = std::env::temp_dir().join("attest_retract_persist_redb.attest");
-        let _ = std::fs::remove_file(&dir);
+    fn test_retraction_persists_lmdb() {
+        let dir = std::env::temp_dir().join("attest_retract_persist_lmdb.attest");
+        cleanup_db(&dir);
 
         // Create, insert, retract, close
         {
@@ -1393,12 +1372,12 @@ mod tests {
         {
             let mut store = RustStore::new(dir.to_str().unwrap()).unwrap();
             let c1 = store.get_claim("c1").unwrap();
-            assert_eq!(c1.status, ClaimStatus::Tombstoned, "Retraction should persist in redb");
+            assert_eq!(c1.status, ClaimStatus::Tombstoned, "Retraction should persist in LMDB");
             assert_eq!(store.all_claims(0, 0).len(), 1, "Retracted claim should be filtered after reopen");
             store.close().unwrap();
         }
 
-        let _ = std::fs::remove_file(&dir);
+        cleanup_db(&dir);
     }
 
     #[test]
@@ -1607,13 +1586,25 @@ mod tests {
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].claim_id, "c1");
     }
+
+    #[test]
+    fn test_get_entities_batch_memory() {
+        let mut store = RustStore::in_memory();
+        store.upsert_entity("brca1", "gene", "BRCA1", None, 0);
+        store.upsert_entity("tp53", "gene", "TP53", None, 0);
+
+        let result = store.get_entities_batch(&["brca1", "tp53", "missing"]);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result["brca1"], ("gene".into(), "BRCA1".into()));
+        assert!(!result.contains_key("missing"));
+    }
 }
 
-// ── Redb backend tests ─────────────────────────────────────────────────
-// Mirrors the in-memory tests above but uses RustStore::new() (RedbBackend).
+// ── LMDB backend tests ────────────────────────────────────────────────
+// Mirrors the in-memory tests above but uses RustStore::new() (LmdbBackend).
 
 #[cfg(test)]
-mod redb_tests {
+mod lmdb_tests {
     use super::*;
     use attest_core::types::*;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -1624,16 +1615,19 @@ mod redb_tests {
     fn temp_db() -> (std::path::PathBuf, TempGuard) {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let tid = std::thread::current().id();
-        let path = std::env::temp_dir().join(format!("attest_redb_{tid:?}_{n}.attest"));
+        let path = std::env::temp_dir().join(format!("attest_lmdb_{tid:?}_{n}.attest"));
+        // Clean up both files and directories (LMDB creates dirs)
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&path);
         (path.clone(), TempGuard(path))
     }
 
-    /// RAII cleanup for temp files.
+    /// RAII cleanup for temp files or directories.
     struct TempGuard(std::path::PathBuf);
     impl Drop for TempGuard {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -1692,7 +1686,7 @@ mod redb_tests {
     }
 
     #[test]
-    fn test_redb_entity_upsert_and_get() {
+    fn test_lmdb_entity_upsert_and_get() {
         let (path, _guard) = temp_db();
         let store = setup_store(path.to_str().unwrap());
         let entity = store.get_entity("brca1").unwrap();
@@ -1702,7 +1696,7 @@ mod redb_tests {
     }
 
     #[test]
-    fn test_redb_claim_exists() {
+    fn test_lmdb_claim_exists() {
         let (path, _guard) = temp_db();
         let store = setup_store(path.to_str().unwrap());
         assert!(store.claim_exists("c1"));
@@ -1710,7 +1704,7 @@ mod redb_tests {
     }
 
     #[test]
-    fn test_redb_get_claim() {
+    fn test_lmdb_get_claim() {
         let (path, _guard) = temp_db();
         let store = setup_store(path.to_str().unwrap());
 
@@ -1721,7 +1715,7 @@ mod redb_tests {
     }
 
     #[test]
-    fn test_redb_claims_by_content_id() {
+    fn test_lmdb_claims_by_content_id() {
         let (path, _guard) = temp_db();
         let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
         store.upsert_entity("a", "entity", "A", None, 0);
@@ -1739,7 +1733,7 @@ mod redb_tests {
     }
 
     #[test]
-    fn test_redb_claims_for() {
+    fn test_lmdb_claims_for() {
         let (path, _guard) = temp_db();
         let mut store = setup_store(path.to_str().unwrap());
         let claims = store.claims_for("brca1", None, None, 0.0);
@@ -1751,7 +1745,7 @@ mod redb_tests {
     }
 
     #[test]
-    fn test_redb_claims_for_with_filters() {
+    fn test_lmdb_claims_for_with_filters() {
         let (path, _guard) = temp_db();
         let mut store = setup_store(path.to_str().unwrap());
         let claims = store.claims_for("tp53", None, Some("experimental"), 0.0);
@@ -1760,7 +1754,7 @@ mod redb_tests {
     }
 
     #[test]
-    fn test_redb_list_entities() {
+    fn test_lmdb_list_entities() {
         let (path, _guard) = temp_db();
         let store = setup_store(path.to_str().unwrap());
         assert_eq!(store.list_entities(Some("gene"), 0, 0, 0).len(), 2);
@@ -1769,7 +1763,7 @@ mod redb_tests {
     }
 
     #[test]
-    fn test_redb_list_entities_min_claims() {
+    fn test_lmdb_list_entities_min_claims() {
         let (path, _guard) = temp_db();
         let store = setup_store(path.to_str().unwrap());
         let high = store.list_entities(None, 2, 0, 0);
@@ -1778,7 +1772,7 @@ mod redb_tests {
     }
 
     #[test]
-    fn test_redb_alias_resolution() {
+    fn test_lmdb_alias_resolution() {
         let (path, _guard) = temp_db();
         let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
         store.upsert_entity("gene_a", "gene", "A", None, 0);
@@ -1827,7 +1821,7 @@ mod redb_tests {
     }
 
     #[test]
-    fn test_redb_bfs_claims() {
+    fn test_lmdb_bfs_claims() {
         let (path, _guard) = temp_db();
         let mut store = setup_store(path.to_str().unwrap());
         let results = store.bfs_claims("brca1", 1);
@@ -1840,7 +1834,7 @@ mod redb_tests {
     }
 
     #[test]
-    fn test_redb_path_exists() {
+    fn test_lmdb_path_exists() {
         let (path, _guard) = temp_db();
         let mut store = setup_store(path.to_str().unwrap());
         assert!(store.path_exists("brca1", "tp53", 1));
@@ -1849,7 +1843,7 @@ mod redb_tests {
     }
 
     #[test]
-    fn test_redb_adjacency_list() {
+    fn test_lmdb_adjacency_list() {
         let (path, _guard) = temp_db();
         let store = setup_store(path.to_str().unwrap());
         let adj = store.get_adjacency_list();
@@ -1859,7 +1853,7 @@ mod redb_tests {
     }
 
     #[test]
-    fn test_redb_stats() {
+    fn test_lmdb_stats() {
         let (path, _guard) = temp_db();
         let store = setup_store(path.to_str().unwrap());
         let stats = store.stats();
@@ -1870,7 +1864,7 @@ mod redb_tests {
     }
 
     #[test]
-    fn test_redb_claims_in_range() {
+    fn test_lmdb_claims_in_range() {
         let (path, _guard) = temp_db();
         let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
         store.upsert_entity("a", "entity", "A", None, 0);
@@ -1895,7 +1889,7 @@ mod redb_tests {
     }
 
     #[test]
-    fn test_redb_most_recent_claims() {
+    fn test_lmdb_most_recent_claims() {
         let (path, _guard) = temp_db();
         let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
         store.upsert_entity("a", "entity", "A", None, 0);
@@ -1913,7 +1907,7 @@ mod redb_tests {
     }
 
     #[test]
-    fn test_redb_search_entities() {
+    fn test_lmdb_search_entities() {
         let (path, _guard) = temp_db();
         let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
         store.upsert_entity("brca1", "gene", "BRCA1 DNA repair", None, 0);
@@ -1934,7 +1928,7 @@ mod redb_tests {
     }
 
     #[test]
-    fn test_redb_bm25_ranking() {
+    fn test_lmdb_bm25_ranking() {
         let (path, _guard) = temp_db();
         let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
         store.upsert_entity("brca1_gene", "gene", "brca1 gene", None, 0);
@@ -1951,16 +1945,16 @@ mod redb_tests {
         assert_eq!(results.len(), 2);
         assert_eq!(
             results[0].id, "brca1_gene",
-            "redb: shorter doc should rank first"
+            "LMDB: shorter doc should rank first"
         );
         assert_eq!(
             results[1].id, "brca1_related_pathway",
-            "redb: longer doc should rank second"
+            "LMDB: longer doc should rank second"
         );
     }
 
     #[test]
-    fn test_redb_persistence_roundtrip() {
+    fn test_lmdb_persistence_roundtrip() {
         let (path, _guard) = temp_db();
 
         // Create, populate, close
@@ -1982,7 +1976,7 @@ mod redb_tests {
     }
 
     #[test]
-    fn test_redb_batch_insert() {
+    fn test_lmdb_batch_insert() {
         let (path, _guard) = temp_db();
         let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
         store.upsert_entity("a", "entity", "A", None, 0);
@@ -1998,7 +1992,7 @@ mod redb_tests {
     }
 
     #[test]
-    fn test_redb_all_claims() {
+    fn test_lmdb_all_claims() {
         let (path, _guard) = temp_db();
         let store = setup_store(path.to_str().unwrap());
         let all = store.all_claims(0, 0);
@@ -2006,7 +2000,7 @@ mod redb_tests {
     }
 
     #[test]
-    fn test_redb_provenance_chain() {
+    fn test_lmdb_provenance_chain() {
         let (path, _guard) = temp_db();
         let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
         store.upsert_entity("a", "entity", "A", None, 0);
@@ -2022,7 +2016,7 @@ mod redb_tests {
     }
 
     #[test]
-    fn test_redb_metadata_persists() {
+    fn test_lmdb_metadata_persists() {
         let (path, _guard) = temp_db();
 
         // Create store with metadata, close
@@ -2049,7 +2043,7 @@ mod redb_tests {
     }
 
     #[test]
-    fn test_redb_alias_persists() {
+    fn test_lmdb_alias_persists() {
         let (path, _guard) = temp_db();
 
         // Create store with alias, close
@@ -2107,7 +2101,7 @@ mod redb_tests {
     }
 
     #[test]
-    fn test_namespace_persists_redb() {
+    fn test_namespace_persists_lmdb() {
         let (path, _guard) = temp_db();
 
         // Create store with namespaced claims, close
@@ -2147,5 +2141,149 @@ mod redb_tests {
 
             store.close().unwrap();
         }
+    }
+
+    #[test]
+    fn test_lmdb_read_only_mode() {
+        let (path, _guard) = temp_db();
+        let path_str = path.to_str().unwrap();
+
+        // Write some data with a normal store
+        {
+            let mut store = setup_store(path_str);
+            store.close().unwrap();
+        }
+
+        // Open read-only — should not require exclusive lock
+        let mut ro_store = RustStore::open_read_only(path_str).unwrap();
+        assert!(ro_store.is_read_only());
+
+        // Reads work
+        let e = ro_store.get_entity("brca1");
+        assert!(e.is_some());
+        assert_eq!(e.unwrap().name, "BRCA1");
+
+        let claims = ro_store.claims_for("tp53", None, None, 0.0);
+        assert_eq!(claims.len(), 2); // tp53 appears in both c1 and c2
+
+        let results = ro_store.search_entities("BRCA1", 10);
+        assert!(!results.is_empty());
+        assert_eq!(results[0].id, "brca1");
+
+        let stats = ro_store.stats();
+        assert_eq!(stats.total_claims, 2);
+        assert_eq!(stats.entity_count, 3);
+    }
+
+    #[test]
+    fn test_lmdb_read_only_multiple_readers() {
+        let (path, _guard) = temp_db();
+        let path_str = path.to_str().unwrap();
+
+        // Write some data, then close the writer
+        {
+            let mut store = setup_store(path_str);
+            store.close().unwrap();
+        }
+
+        // Open two concurrent readers (both use shared file locks)
+        let mut ro1 = RustStore::open_read_only(path_str).unwrap();
+        let mut ro2 = RustStore::open_read_only(path_str).unwrap();
+
+        // Both can read simultaneously
+        let e1 = ro1.get_entity("brca1");
+        assert!(e1.is_some());
+
+        let e2 = ro2.get_entity("tp53");
+        assert!(e2.is_some());
+
+        let claims1 = ro1.claims_for("tp53", None, None, 0.0);
+        let claims2 = ro2.claims_for("brca1", None, None, 0.0);
+        assert_eq!(claims1.len(), 2);
+        assert_eq!(claims2.len(), 1);
+    }
+
+    #[test]
+    fn test_lmdb_get_entities_batch() {
+        let (path, _guard) = temp_db();
+        let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
+
+        store.upsert_entity("brca1", "gene", "BRCA1", None, 0);
+        store.upsert_entity("tp53", "gene", "TP53", None, 0);
+        store.upsert_entity("aspirin", "compound", "Aspirin", None, 0);
+
+        // Batch lookup — should return all 3 + skip unknown
+        let ids = vec!["brca1", "tp53", "aspirin", "unknown_entity"];
+        let result = store.get_entities_batch(&ids);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result["brca1"], ("gene".into(), "BRCA1".into()));
+        assert_eq!(result["tp53"], ("gene".into(), "TP53".into()));
+        assert_eq!(result["aspirin"], ("compound".into(), "Aspirin".into()));
+        assert!(!result.contains_key("unknown_entity"));
+    }
+
+    #[test]
+    fn test_lmdb_two_phase_entity_resolution() {
+        // Simulate two-phase bulk loading:
+        // 1. Register entities via upsert_entities_batch
+        // 2. Insert claims — entity_map is empty, Rust resolves from store
+        let (path, _guard) = temp_db();
+        let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
+
+        // Phase 1: register entities
+        let entities = vec![
+            ("brca1".to_string(), "gene".to_string(), "BRCA1".to_string(), HashMap::new()),
+            ("tp53".to_string(), "gene".to_string(), "TP53".to_string(), HashMap::new()),
+        ];
+        store.upsert_entities_batch(&entities, 1000).unwrap();
+
+        // Verify entities are readable
+        let batch = store.get_entities_batch(&["brca1", "tp53"]);
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch["brca1"].1, "BRCA1");
+
+        // Phase 2: insert claims (display names come from store)
+        let claim = Claim {
+            claim_id: "test_claim".to_string(),
+            content_id: attest_core::compute_content_id("brca1", "binds_to", "tp53"),
+            subject: EntityRef {
+                id: "brca1".to_string(),
+                entity_type: "gene".to_string(),
+                display_name: "BRCA1".to_string(),
+                external_ids: Default::default(),
+            },
+            predicate: PredicateRef {
+                id: "binds_to".to_string(),
+                predicate_type: "relation".to_string(),
+            },
+            object: EntityRef {
+                id: "tp53".to_string(),
+                entity_type: "gene".to_string(),
+                display_name: "TP53".to_string(),
+                external_ids: Default::default(),
+            },
+            confidence: 0.9,
+            provenance: Provenance {
+                source_type: "database_import".to_string(),
+                source_id: "test".to_string(),
+                method: None,
+                chain: vec![],
+                model_version: None,
+                organization: None,
+            },
+            embedding: None,
+            payload: None,
+            timestamp: 1000,
+            status: ClaimStatus::Active,
+            namespace: String::new(),
+            expires_at: 0,
+        };
+        let inserted = store.insert_claims_batch(vec![claim]);
+        assert_eq!(inserted, 1);
+
+        // Verify claim has correct entity metadata
+        let retrieved = store.get_claim("test_claim").unwrap();
+        assert_eq!(retrieved.subject.display_name, "BRCA1");
+        assert_eq!(retrieved.object.display_name, "TP53");
     }
 }

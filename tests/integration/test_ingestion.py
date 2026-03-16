@@ -275,8 +275,9 @@ def test_provenance_required(pipeline):
 def test_batch_ingestion(pipeline):
     """Batch ingestion returns correct counts."""
     pipe, _ = pipeline
+    # Each claim has a distinct subject so they are genuinely different facts
     claims = [
-        _basic_claim(timestamp=(i + 1) * 1000)
+        _basic_claim(subject=(f"entity_{i}", "entity"), timestamp=(i + 1) * 1000)
         for i in range(10)
     ]
     # First batch should all succeed
@@ -285,7 +286,43 @@ def test_batch_ingestion(pipeline):
     assert result.duplicates == 0
     assert result.errors == []
 
-    # Re-ingesting should produce duplicates
+    # Re-ingesting should produce duplicates (same content_id + source_id)
     result2 = pipe.ingest_batch(claims)
     assert result2.duplicates == 10
     assert result2.ingested == 0
+
+
+def test_content_level_dedup(pipeline):
+    """Same fact from same source is rejected even with different timestamp."""
+    pipe, store = pipeline
+    # Ingest a claim
+    pipe.ingest(_basic_claim(timestamp=1000))
+
+    # Same subject+predicate+object+source_id but different timestamp
+    # should be rejected as a content-level duplicate
+    with pytest.raises(DuplicateClaimError, match="content_id"):
+        pipe.ingest(_basic_claim(timestamp=2000))
+
+
+def test_content_level_dedup_different_source_allowed(pipeline):
+    """Same fact from a DIFFERENT source is corroboration, not a duplicate."""
+    pipe, store = pipeline
+    pipe.ingest(_basic_claim(timestamp=1000))
+
+    # Same content but different source_id → allowed (corroboration)
+    cid = pipe.ingest(_basic_claim(
+        provenance={"source_type": "observation", "source_id": "independent_source"},
+        timestamp=2000,
+    ))
+    assert cid  # Successfully ingested
+
+
+def test_content_level_dedup_batch(pipeline):
+    """Batch ingestion deduplicates same content+source across batches."""
+    pipe, store = pipeline
+    pipe.ingest(_basic_claim(timestamp=1000))
+
+    # Batch with same content+source should be counted as duplicate
+    result = pipe.ingest_batch([_basic_claim(timestamp=2000)])
+    assert result.duplicates == 1
+    assert result.ingested == 0

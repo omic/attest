@@ -126,3 +126,124 @@ class EmbeddingIndex:
         idx = cls(ndim=ndim)
         idx.load(path)
         return idx
+
+
+class MultiSpaceEmbeddingIndex:
+    """Multiple named HNSW indexes for independent embedding spaces.
+
+    Wraps multiple EmbeddingIndex instances, one per named space.
+    Backward compatible: a single "default" space behaves identically
+    to the original EmbeddingIndex.
+
+    File layout:
+        {base_path}.usearch.manifest.json     # {"spaces": {"default": 768, ...}}
+        {base_path}.usearch.default            # HNSW binary
+        {base_path}.usearch.default.json       # sidecar (id_to_key)
+        {base_path}.usearch.structural
+        {base_path}.usearch.structural.json
+    """
+
+    def __init__(self, spaces: dict[str, int] | None = None):
+        """Initialize with a dict of {space_name: ndim}.
+
+        If spaces is None or empty, creates a single "default" space with 768 dims.
+        """
+        if not spaces:
+            spaces = {"default": 768}
+        self._spaces: dict[str, EmbeddingIndex] = {}
+        self._dims: dict[str, int] = dict(spaces)
+        for name, ndim in spaces.items():
+            self._spaces[name] = EmbeddingIndex(ndim=ndim)
+
+    @property
+    def space_names(self) -> list[str]:
+        return list(self._spaces.keys())
+
+    @property
+    def ndim(self) -> int:
+        """Dimension of the default space (backward compat)."""
+        return self._dims.get("default", 768)
+
+    def __len__(self) -> int:
+        """Total entries across all spaces."""
+        return sum(len(idx) for idx in self._spaces.values())
+
+    def _get_space(self, space: str) -> EmbeddingIndex:
+        if space not in self._spaces:
+            raise ValueError(f"Unknown embedding space: {space!r}. Available: {self.space_names}")
+        return self._spaces[space]
+
+    def add(self, claim_id: str, embedding, space: str = "default") -> None:
+        self._get_space(space).add(claim_id, embedding)
+
+    def remove(self, claim_id: str, space: str | None = None) -> bool:
+        """Remove from a specific space, or all spaces if space is None."""
+        if space is not None:
+            return self._get_space(space).remove(claim_id)
+        removed = False
+        for idx in self._spaces.values():
+            if idx.remove(claim_id):
+                removed = True
+        return removed
+
+    def get(self, claim_id: str, space: str = "default"):
+        return self._get_space(space).get(claim_id)
+
+    def search(self, query, top_k: int = 10, space: str = "default") -> list[tuple[str, float]]:
+        return self._get_space(space).search(query, top_k)
+
+    def space_len(self, space: str) -> int:
+        return len(self._get_space(space))
+
+    def save(self, base_path: str) -> None:
+        """Save all spaces and the manifest."""
+        manifest = {"spaces": self._dims}
+        manifest_path = base_path + ".usearch.manifest.json"
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f)
+        for name, idx in self._spaces.items():
+            if len(idx) > 0:
+                idx.save(base_path + f".usearch.{name}")
+
+    def load(self, base_path: str) -> None:
+        """Load all spaces listed in the manifest."""
+        for name, idx in self._spaces.items():
+            space_path = base_path + f".usearch.{name}"
+            if os.path.exists(space_path):
+                idx.load(space_path)
+
+    @classmethod
+    def load_from(cls, base_path: str) -> MultiSpaceEmbeddingIndex:
+        """Load from manifest, auto-migrating old single-file format."""
+        manifest_path = base_path + ".usearch.manifest.json"
+        if os.path.exists(manifest_path):
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            spaces = manifest.get("spaces", {"default": 768})
+            idx = cls(spaces=spaces)
+            idx.load(base_path)
+            return idx
+
+        # Auto-migrate: old .usearch file -> .usearch.default
+        old_path = base_path + ".usearch"
+        if os.path.exists(old_path):
+            new_path = base_path + ".usearch.default"
+            os.rename(old_path, new_path)
+            old_sidecar = old_path + ".json"
+            if os.path.exists(old_sidecar):
+                os.rename(old_sidecar, new_path + ".json")
+            # Read ndim from the migrated sidecar
+            ndim = 768
+            new_sidecar = new_path + ".json"
+            if os.path.exists(new_sidecar):
+                with open(new_sidecar) as f:
+                    data = json.load(f)
+                ndim = data.get("ndim", 768)
+            idx = cls(spaces={"default": ndim})
+            idx.load(base_path)
+            # Write manifest for future loads
+            idx.save(base_path)
+            return idx
+
+        # Nothing exists yet
+        return cls()

@@ -1,6 +1,6 @@
 [project]
 name = "attestdb"
-version = "0.1.12"
+version = "0.1.13"
 description = "The database for knowledge you can verify"
 readme = "README.md"
 license = {text = "BSL-1.1"}
@@ -35,8 +35,11 @@ dev = [
 mcp = [
     "mcp[cli]>=1.0",
 ]
+otel = [
+    "opentelemetry-api>=1.20",
+]
 all = [
-    "attestdb[mcp]",
+    "attestdb[mcp,otel]",
 ]
 
 [project.urls]

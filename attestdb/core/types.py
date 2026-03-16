@@ -102,6 +102,9 @@ class Relationship:
     latest_claim_timestamp: int = 0
     payload: dict | None = None
     is_symmetric: bool = False
+    is_inverse: bool = False
+    is_composed: bool = False
+    composition_chain: list[str] = field(default_factory=list)
 
 
 @dataclass

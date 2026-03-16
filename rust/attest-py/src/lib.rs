@@ -238,7 +238,8 @@ impl PyRustStore {
         }
     }
 
-    /// Open a database in read-only mode (copies to temp file, no lock conflict).
+    /// Open a database in native read-only mode (no WAL recovery, no write lock).
+    /// Multiple readers can coexist with a single writer.
     #[staticmethod]
     fn open_read_only(db_path: &str) -> PyResult<Self> {
         let inner = RustStore::open_read_only(db_path)
@@ -252,6 +253,11 @@ impl PyRustStore {
         self.inner
             .compact()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Return the schema version of this database.
+    fn schema_version(&self) -> u32 {
+        self.inner.schema_version()
     }
 
     /// Returns True if this store was opened in read-only mode.
@@ -645,7 +651,7 @@ impl PyRustStore {
         }
 
         // Build entity lookup for Claim construction
-        let entity_map: HashMap<String, (String, String)> = entity_vec
+        let mut entity_map: HashMap<String, (String, String)> = entity_vec
             .iter()
             .map(|(id, etype, display, _)| (id.clone(), (etype.clone(), display.clone())))
             .collect();
@@ -684,7 +690,32 @@ impl PyRustStore {
 
         // Phase 2: Insert in Rust (GIL held — mutation must be single-threaded)
         // Upsert all entities in a single transaction (batched)
-        self.inner.upsert_entities_batch(&entity_vec, timestamp);
+        if !entity_vec.is_empty() {
+            self.inner.upsert_entities_batch(&entity_vec, timestamp)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        }
+
+        // Resolve entity IDs missing from the passed dict by looking them up
+        // in the store (LMDB). This enables two-phase loading: register entities
+        // first via upsert_entities_batch, then insert claims with entities={}.
+        if !rows.is_empty() {
+            let mut missing: Vec<String> = Vec::new();
+            for row in &rows {
+                if !entity_map.contains_key(&row.subj_id) {
+                    missing.push(row.subj_id.clone());
+                }
+                if !entity_map.contains_key(&row.obj_id) {
+                    missing.push(row.obj_id.clone());
+                }
+            }
+            if !missing.is_empty() {
+                missing.sort_unstable();
+                missing.dedup();
+                let missing_refs: Vec<&str> = missing.iter().map(|s| s.as_str()).collect();
+                let resolved = self.inner.get_entities_batch(&missing_refs);
+                entity_map.extend(resolved);
+            }
+        }
 
         // Build all Claim structs
         let claims: Vec<Claim> = rows
@@ -740,6 +771,42 @@ impl PyRustStore {
         // Batch insert with single WAL sync
         let count = self.inner.insert_claims_batch(claims);
 
+        Ok(count)
+    }
+
+    // ── Entity registration (two-phase bulk loading) ──────────────
+
+    /// Register entities in the store without inserting claims.
+    ///
+    /// Used as Phase 1 of two-phase bulk loading: register entities first,
+    /// then call insert_bulk with entities={} — Rust resolves display names
+    /// from the store's own indexes.
+    ///
+    /// Accepts the same dict format as insert_bulk:
+    ///   {entity_id: (entity_type, display_name, ext_ids_json)}
+    fn upsert_entities_batch(
+        &mut self,
+        entities: &Bound<'_, PyDict>,
+        timestamp: i64,
+    ) -> PyResult<usize> {
+        let mut entity_vec: Vec<(String, String, String, HashMap<String, String>)> =
+            Vec::with_capacity(entities.len());
+        for (key, value) in entities.iter() {
+            let entity_id: String = key.extract()?;
+            let tuple: &Bound<'_, PyTuple> = value.downcast()?;
+            let entity_type: String = tuple.get_item(0)?.extract()?;
+            let display_name: String = tuple.get_item(1)?.extract()?;
+            let ext_ids_json: String = tuple.get_item(2)?.extract()?;
+            let ext_ids: HashMap<String, String> = if ext_ids_json.is_empty() || ext_ids_json == "{}" {
+                HashMap::new()
+            } else {
+                serde_json::from_str(&ext_ids_json).unwrap_or_default()
+            };
+            entity_vec.push((entity_id, entity_type, display_name, ext_ids));
+        }
+        let count = entity_vec.len();
+        self.inner.upsert_entities_batch(&entity_vec, timestamp)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         Ok(count)
     }
 
@@ -812,6 +879,158 @@ impl PyRustStore {
     ) -> PyResult<PyObject> {
         // Rust store has no raw query support — return empty list
         Ok(PyList::empty(py).into())
+    }
+
+    // ── Analytics (Rust-native aggregation) ───────────────────────────
+
+    /// Backfill pred_id_counts counter table for existing databases.
+    /// Scans PREDICATE_IDX once and persists counts. Only needed once per DB.
+    fn backfill_pred_id_counts(&mut self) -> PyResult<usize> {
+        self.inner.backfill_pred_id_counts()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Backfill claim_summaries table for existing databases.
+    /// Builds lightweight summaries (~200 bytes each) for fast analytics queries.
+    /// Auto-triggered on schema upgrade, but can be called manually.
+    fn backfill_claim_summaries(&mut self) -> PyResult<u64> {
+        self.inner.backfill_claim_summaries()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Backfill analytics counter tables for sub-second analytics on large databases.
+    /// Populates entity_pred_counts, entity_src_counts, and pred_pair_counts from claim_summaries.
+    /// Must be called after backfill_claim_summaries. Returns number of claims processed.
+    fn backfill_analytics_counters(&mut self) -> PyResult<u64> {
+        self.inner.backfill_analytics_counters()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Enable or disable bulk load mode. Skips analytics counters during insert
+    /// for ~2.5× throughput. Call rebuild_counters() after loading is complete.
+    fn set_bulk_load_mode(&mut self, enabled: bool) {
+        self.inner.set_bulk_load_mode(enabled);
+    }
+
+    /// Rebuild all analytics counters and claim_summaries from the claims table.
+    /// Call after bulk loading/merging with bulk_load_mode enabled.
+    fn rebuild_counters(&mut self) -> PyResult<()> {
+        self.inner.rebuild_counters()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Merge all claims and entities from another LMDB database into this store.
+    /// Stays entirely in Rust for maximum throughput. Returns number of merged claims.
+    fn merge_from(&mut self, source_path: &str) -> PyResult<usize> {
+        self.inner.merge_from(source_path)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Count claims per predicate_id. Returns dict {predicate_id: count}.
+    fn predicate_counts<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
+        let counts = self.inner.predicate_counts();
+        let dict = PyDict::new(py);
+        for (k, v) in counts {
+            dict.set_item(k, v)?;
+        }
+        Ok(dict.into())
+    }
+
+    /// Count claims per source_id. Returns dict {source_id: count}.
+    fn source_id_counts<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
+        let counts = self.inner.source_id_counts();
+        let dict = PyDict::new(py);
+        for (k, v) in counts {
+            dict.set_item(k, v)?;
+        }
+        Ok(dict.into())
+    }
+
+    /// Find contradictions: (subject, object) pairs under both pred_a and pred_b.
+    /// Returns list of (subject_id, object_id, count_a, count_b, avg_conf_a, avg_conf_b).
+    fn find_contradictions<'py>(
+        &self,
+        pred_a: &str,
+        pred_b: &str,
+        py: Python<'py>,
+    ) -> PyResult<PyObject> {
+        let results = self.inner.find_contradictions(pred_a, pred_b);
+        let list = PyList::empty(py);
+        for (subj, obj, ca, cb, conf_a, conf_b) in results {
+            let tup = PyTuple::new(py, &[
+                subj.into_py_any(py)?,
+                obj.into_py_any(py)?,
+                ca.into_py_any(py)?,
+                cb.into_py_any(py)?,
+                conf_a.into_py_any(py)?,
+                conf_b.into_py_any(py)?,
+            ])?;
+            list.append(tup)?;
+        }
+        Ok(list.into())
+    }
+
+    /// Gap analysis: entities of a type missing expected predicates.
+    /// Returns list of (entity_id, [missing_pred_ids]).
+    #[pyo3(signature = (entity_type, expected_predicates, limit=0))]
+    fn gap_analysis<'py>(
+        &self,
+        entity_type: &str,
+        expected_predicates: Vec<String>,
+        limit: usize,
+        py: Python<'py>,
+    ) -> PyResult<PyObject> {
+        let pred_refs: Vec<&str> = expected_predicates.iter().map(|s| s.as_str()).collect();
+        let results = self.inner.gap_analysis(entity_type, &pred_refs, limit);
+        let list = PyList::empty(py);
+        for (entity_id, missing) in results {
+            let missing_list = PyList::new(py, &missing)?;
+            let tup = PyTuple::new(py, &[
+                entity_id.into_py_any(py)?,
+                missing_list.into_py_any(py)?,
+            ])?;
+            list.append(tup)?;
+        }
+        Ok(list.into())
+    }
+
+    /// Get predicate_id → count for a single entity.
+    /// Returns list of (predicate_id, count) sorted by count desc.
+    fn entity_predicate_counts<'py>(
+        &self,
+        entity_id: &str,
+        py: Python<'py>,
+    ) -> PyResult<PyObject> {
+        let results = self.inner.entity_predicate_counts(entity_id);
+        let list = PyList::empty(py);
+        for (pred_id, count) in results {
+            let tup = PyTuple::new(py, &[
+                pred_id.into_py_any(py)?,
+                count.into_py_any(py)?,
+            ])?;
+            list.append(tup)?;
+        }
+        Ok(list.into())
+    }
+
+    /// Get source_id → (count, avg_confidence) for a single entity.
+    /// Returns list of (source_id, count, avg_confidence) sorted by count desc.
+    fn entity_source_counts<'py>(
+        &self,
+        entity_id: &str,
+        py: Python<'py>,
+    ) -> PyResult<PyObject> {
+        let results = self.inner.entity_source_counts(entity_id);
+        let list = PyList::empty(py);
+        for (src, count, avg_conf) in results {
+            let tup = PyTuple::new(py, &[
+                src.into_py_any(py)?,
+                count.into_py_any(py)?,
+                avg_conf.into_py_any(py)?,
+            ])?;
+            list.append(tup)?;
+        }
+        Ok(list.into())
     }
 }
 

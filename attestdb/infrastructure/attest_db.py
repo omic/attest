@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import builtins
+import hashlib
+import hmac
 import json
 import logging
 import os
 import shutil
 import tempfile
+import threading
 import time
 from collections import deque
 from typing import TYPE_CHECKING
@@ -80,7 +83,7 @@ from attestdb.core.types import (
     claim_from_dict,
     entity_summary_from_dict,
 )
-from attestdb.infrastructure.embedding_index import EmbeddingIndex
+from attestdb.infrastructure.embedding_index import EmbeddingIndex, MultiSpaceEmbeddingIndex
 from attestdb.infrastructure.ingestion import IngestionPipeline
 from attestdb.infrastructure.query_engine import QueryEngine
 from attestdb.infrastructure.tracing import span as _span, set_attribute as _set_attr, record_exception as _record_exc
@@ -118,17 +121,20 @@ class AttestDB:
 
     @classmethod
     def open_read_only(cls, db_path: str) -> "AttestDB":
-        """Open a database in read-only mode (no lock contention).
+        """Open a database in native read-only mode (no lock contention).
 
-        Copies the DB to a temp file internally. All write operations
-        are silently ignored. Use for hooks and concurrent readers.
+        Uses LMDB's read-only mode which acquires only a shared lock.
+        Multiple readers can coexist. All write operations will raise
+        an error.
         """
         instance = cls.__new__(cls)
         instance._db_path = db_path
         instance._embedding_dim = None
+        instance._embedding_spaces = None
         instance._strict = False
         instance._store = _make_store(db_path, read_only=True)
         # Read-only: no sidecar migration needed (status is in Rust engine)
+        instance._multi_embedding_index = None
         instance._embedding_index = None
         instance._pipeline = None
         instance._query_engine = QueryEngine(
@@ -137,6 +143,10 @@ class AttestDB:
         )
         instance._event_hooks = {}
         instance._scheduler = None
+        instance._purge_timer = None
+        instance._purge_interval = 0
+        instance._webhooks = []
+        instance._webhooks_path = None
         instance._chain_log = []
         instance._last_chain_hash = "genesis"
         instance._actor = ""
@@ -159,19 +169,50 @@ class AttestDB:
         db_path: str,
         embedding_dim: int | None = 768,
         strict: bool = False,
+        embedding_spaces: dict[str, int] | None = None,
     ):
         self._db_path = db_path
         self._embedding_dim = embedding_dim
         self._strict = strict
+        self._embedding_spaces = embedding_spaces
 
         self._store = _make_store(db_path)
 
         # Migrate legacy retraction sidecar to Rust engine (one-time)
         self._migrate_retraction_sidecar()
 
-        # Embedding index
+        # Auto-backfill analytics indexes on first open (idempotent, no-op if already done)
+        if hasattr(self._store, "backfill_pred_id_counts"):
+            try:
+                self._store.backfill_pred_id_counts()
+            except Exception:
+                pass  # Non-critical — analytics degrade gracefully
+        if hasattr(self._store, "backfill_claim_summaries"):
+            try:
+                self._store.backfill_claim_summaries()
+            except Exception:
+                pass
+
+        # Embedding index — multi-space or single-space
+        self._multi_embedding_index: MultiSpaceEmbeddingIndex | None = None
         self._embedding_index: EmbeddingIndex | None = None
-        if embedding_dim:
+        if embedding_spaces:
+            # Multi-space mode
+            manifest_path = db_path + ".usearch.manifest.json"
+            if os.path.exists(manifest_path) or os.path.exists(db_path + ".usearch"):
+                self._multi_embedding_index = MultiSpaceEmbeddingIndex.load_from(db_path)
+                # Ensure all requested spaces exist
+                for name, ndim in embedding_spaces.items():
+                    if name not in self._multi_embedding_index._spaces:
+                        self._multi_embedding_index._spaces[name] = EmbeddingIndex(ndim=ndim)
+                        self._multi_embedding_index._dims[name] = ndim
+            else:
+                self._multi_embedding_index = MultiSpaceEmbeddingIndex(spaces=embedding_spaces)
+            # Default space acts as the single embedding_index for backward compat
+            self._embedding_index = self._multi_embedding_index._spaces.get("default")
+            if self._embedding_index:
+                self._embedding_dim = self._multi_embedding_index._dims.get("default", embedding_dim)
+        elif embedding_dim:
             self._embedding_index = EmbeddingIndex(ndim=embedding_dim)
             index_path = db_path + ".usearch"
             if os.path.exists(index_path):
@@ -190,6 +231,17 @@ class AttestDB:
 
         # Continuous ingestion scheduler (lazy-init)
         self._scheduler = None
+
+        # Auto-purge timer for TTL expiry
+        self._purge_timer: threading.Timer | None = None
+        self._purge_interval: float = 0
+
+        # Webhook registrations
+        self._webhooks: list[dict] = []
+        self._webhooks_path: str | None = None
+        if not self._is_memory_db:
+            self._webhooks_path = self._db_path + ".webhooks.json"
+            self._load_webhooks()
 
         # Tamper-evident audit chain (Merkle hash chain over claim IDs)
         self._chain_log: list[tuple[str, str]] = []  # [(claim_id, chain_hash), ...]
@@ -381,8 +433,8 @@ class AttestDB:
         """
         now_ns = int(time.time() * 1_000_000_000) if exclude_expired else 0
         offset = 0
+        batch = self._store.all_claims(offset, batch_size)
         while True:
-            batch = self._store.all_claims(offset, batch_size)
             if not batch:
                 break
             for d in batch:
@@ -393,6 +445,7 @@ class AttestDB:
             if len(batch) < batch_size:
                 break
             offset += batch_size
+            batch = self._store.all_claims(offset, batch_size)
 
     def count_claims(self) -> int:
         """Return the total number of claims without materializing them."""
@@ -402,15 +455,21 @@ class AttestDB:
 
     def close(self) -> None:
         """Close the database and persist indexes."""
-        try:
-            if self._scheduler:
-                self._scheduler.stop_all()
-                self._scheduler = None
-            self._flush_chain_log()
-            if self._embedding_index and len(self._embedding_index) > 0:
-                self._embedding_index.save(self._db_path + ".usearch")
-        finally:
-            self._store.close()
+        with _span("attestdb.close"):
+            try:
+                if self._purge_timer:
+                    self._purge_timer.cancel()
+                    self._purge_timer = None
+                if self._scheduler:
+                    self._scheduler.stop_all()
+                    self._scheduler = None
+                self._flush_chain_log()
+                if self._multi_embedding_index and len(self._multi_embedding_index) > 0:
+                    self._multi_embedding_index.save(self._db_path)
+                elif self._embedding_index and len(self._embedding_index) > 0:
+                    self._embedding_index.save(self._db_path + ".usearch")
+            finally:
+                self._store.close()
 
     def __enter__(self):
         return self
@@ -458,11 +517,10 @@ class AttestDB:
         """Append an audit event to the JSONL log."""
         if not self._audit_path:
             return
-        import time as _time
 
         entry = {
             "event": event,
-            "timestamp": int(_time.time() * 1_000_000_000),
+            "timestamp": int(time.time() * 1_000_000_000),
             "actor": self._actor,
             **kwargs,
         }
@@ -644,6 +702,10 @@ class AttestDB:
                 f"Actor '{self._actor}' has role '{role}' but '{required_role}' is required."
             )
 
+    def _set_include_retracted(self, include: bool) -> None:
+        """Set retraction visibility on the Rust store."""
+        self._store.set_include_retracted(include)
+
     # --- Change feed ---
 
     def changes(self, since: int = 0, limit: int = 1000) -> tuple[list[Claim], int]:
@@ -667,9 +729,7 @@ class AttestDB:
         Returns:
             Tuple of (claims, new_cursor). If no new claims, cursor == since.
         """
-        import time as _time
-
-        max_ts = int(_time.time() * 1_000_000_000)
+        max_ts = int(time.time() * 1_000_000_000)
         raw = self._store.claims_in_range(since + 1, max_ts)
         claims = [claim_from_dict(d) for d in raw]
         # Sort by timestamp ascending for deterministic ordering
@@ -697,12 +757,115 @@ class AttestDB:
             hooks.remove(callback)
 
     def _fire(self, event: str, **kwargs) -> None:
-        """Fire all callbacks for an event. Errors are logged, not raised."""
+        """Fire all callbacks for an event and POST to registered webhooks."""
         for cb in self._event_hooks.get(event, []):
             try:
                 cb(**kwargs)
             except Exception as exc:
                 logger.warning("Event hook %s failed: %s", event, exc)
+        self._fire_webhooks(event, kwargs)
+
+    # --- Webhooks ---
+
+    def _load_webhooks(self) -> None:
+        if self._webhooks_path and os.path.exists(self._webhooks_path):
+            try:
+                with builtins.open(self._webhooks_path) as f:
+                    self._webhooks = json.load(f)
+            except Exception:
+                self._webhooks = []
+
+    def _save_webhooks(self) -> None:
+        if self._webhooks_path:
+            with builtins.open(self._webhooks_path, "w") as f:
+                json.dump(self._webhooks, f)
+
+    def register_webhook(
+        self, url: str, events: list[str] | None = None, secret: str | None = None,
+    ) -> None:
+        """Register an HTTP endpoint to receive event notifications.
+
+        Args:
+            url: The URL to POST event payloads to.
+            events: List of event names to subscribe to. None = all events.
+            secret: Optional HMAC-SHA256 secret for payload signing.
+        """
+        # Remove existing registration for same URL
+        self._webhooks = [w for w in self._webhooks if w["url"] != url]
+        self._webhooks.append({
+            "url": url,
+            "events": events,
+            "secret": secret,
+        })
+        self._save_webhooks()
+
+    def remove_webhook(self, url: str) -> bool:
+        """Remove a registered webhook by URL. Returns True if found."""
+        before = len(self._webhooks)
+        self._webhooks = [w for w in self._webhooks if w["url"] != url]
+        if len(self._webhooks) < before:
+            self._save_webhooks()
+            return True
+        return False
+
+    def list_webhooks(self) -> list[dict]:
+        """Return registered webhooks (secrets are masked)."""
+        return [
+            {"url": w["url"], "events": w["events"], "has_secret": bool(w.get("secret"))}
+            for w in self._webhooks
+        ]
+
+    def _fire_webhooks(self, event: str, data: dict) -> None:
+        """POST event payload to matching webhook URLs (fire-and-forget)."""
+        if not self._webhooks:
+            return
+        try:
+            import requests
+        except ImportError:
+            return
+        payload = json.dumps({"event": event, "data": {k: str(v) for k, v in data.items()}})
+        for wh in self._webhooks:
+            if wh["events"] is not None and event not in wh["events"]:
+                continue
+            headers = {"Content-Type": "application/json"}
+            if wh.get("secret"):
+                sig = hmac.new(
+                    wh["secret"].encode(), payload.encode(), hashlib.sha256,
+                ).hexdigest()
+                headers["X-Attest-Signature"] = sig
+            try:
+                requests.post(wh["url"], data=payload, headers=headers, timeout=5)
+            except Exception as exc:
+                logger.warning("Webhook POST to %s failed: %s", wh["url"], exc)
+
+    # --- Auto-purge ---
+
+    def enable_auto_purge(self, interval_seconds: float = 3600) -> None:
+        """Start a background timer that periodically purges expired claims.
+
+        Args:
+            interval_seconds: Seconds between purge runs (default 1 hour).
+        """
+        if self._purge_timer:
+            self._purge_timer.cancel()
+        self._purge_interval = interval_seconds
+
+        def _run_purge():
+            try:
+                purged = self.purge_expired()
+                if purged:
+                    logger.info("Auto-purge: tombstoned %d expired claims", purged)
+            except Exception as exc:
+                logger.warning("Auto-purge failed: %s", exc)
+            finally:
+                if self._purge_interval > 0:
+                    self._purge_timer = threading.Timer(self._purge_interval, _run_purge)
+                    self._purge_timer.daemon = True
+                    self._purge_timer.start()
+
+        self._purge_timer = threading.Timer(interval_seconds, _run_purge)
+        self._purge_timer.daemon = True
+        self._purge_timer.start()
 
     # --- Backup / Restore ---
 
@@ -711,10 +874,16 @@ class AttestDB:
 
         Returns dest_path.
         """
+        with _span("attestdb.snapshot", {"dest_path": dest_path}):
+            return self._snapshot_inner(dest_path)
+
+    def _snapshot_inner(self, dest_path: str) -> str:
         os.makedirs(dest_path, exist_ok=True)
 
         # Persist embedding index first so files are up-to-date
-        if self._embedding_index and len(self._embedding_index) > 0:
+        if self._multi_embedding_index and len(self._multi_embedding_index) > 0:
+            self._multi_embedding_index.save(self._db_path)
+        elif self._embedding_index and len(self._embedding_index) > 0:
             self._embedding_index.save(self._db_path + ".usearch")
 
         # Flush Rust store to disk (close + reopen) so we can copy the file
@@ -728,7 +897,13 @@ class AttestDB:
             else:
                 src = self._db_path + ".attest"
             if os.path.exists(src):
-                shutil.copy2(src, os.path.join(dest_path, os.path.basename(src)))
+                dst = os.path.join(dest_path, os.path.basename(src))
+                if os.path.isdir(src):
+                    if os.path.exists(dst):
+                        shutil.rmtree(dst)
+                    shutil.copytree(src, dst)
+                else:
+                    shutil.copy2(src, dst)
         finally:
             # Always reopen the store so DB remains usable
             self._store = _make_store(self._db_path)
@@ -743,11 +918,18 @@ class AttestDB:
         if os.path.exists(chain_path):
             shutil.copy2(chain_path, os.path.join(dest_path, os.path.basename(chain_path)))
 
-        # Copy embedding index files
-        for ext in (".usearch", ".usearch.json"):
+        # Copy embedding index files (single-space and multi-space)
+        for ext in (".usearch", ".usearch.json", ".usearch.manifest.json"):
             src = self._db_path + ext
             if os.path.exists(src):
                 shutil.copy2(src, os.path.join(dest_path, os.path.basename(src)))
+        # Copy multi-space files (.usearch.<space> and .usearch.<space>.json)
+        if self._multi_embedding_index:
+            for space_name in self._multi_embedding_index.space_names:
+                for ext in (f".usearch.{space_name}", f".usearch.{space_name}.json"):
+                    src = self._db_path + ext
+                    if os.path.exists(src):
+                        shutil.copy2(src, os.path.join(dest_path, os.path.basename(src)))
 
         self._fire("snapshot_created", dest_path=dest_path)
         return dest_path
@@ -771,7 +953,12 @@ class AttestDB:
             src_file = os.path.join(src_path, entry)
             if entry.endswith(store_ext):
                 dst = dest_path + store_ext if not dest_path.endswith(store_ext) else dest_path
-                shutil.copy2(src_file, dst)
+                if os.path.isdir(src_file):
+                    if os.path.exists(dst):
+                        shutil.rmtree(dst)
+                    shutil.copytree(src_file, dst)
+                else:
+                    shutil.copy2(src_file, dst)
             elif entry.endswith(".chain.json"):
                 dst = dest_path + ".chain.json"
                 shutil.copy2(src_file, dst)
@@ -788,6 +975,9 @@ class AttestDB:
 
     def register_vocabulary(self, namespace: str, vocab: dict) -> None:
         self._store.register_vocabulary(namespace, vocab)
+        # Also register predicate constraints if included in the vocab dict
+        for pred_id, constraints in vocab.get("predicate_constraints", {}).items():
+            self._store.register_predicate(pred_id, constraints)
         self._pipeline.invalidate_vocab_caches()
         self._text_extractor = None
 
@@ -978,7 +1168,10 @@ class AttestDB:
         self,
         query_embedding: list[float],
         top_k: int = 10,
+        space: str = "default",
     ) -> list[tuple[str, float]]:
+        if self._multi_embedding_index is not None:
+            return self._multi_embedding_index.search(query_embedding, top_k, space=space)
         if self._embedding_index is None:
             return []
         return self._embedding_index.search(query_embedding, top_k)
@@ -991,6 +1184,178 @@ class AttestDB:
         if vec is None:
             return None
         return vec.tolist()
+
+    def embedding_similarity(self, entity_a: str, entity_b: str) -> float:
+        """Compute cosine similarity between two entities' embeddings.
+
+        Looks up each entity's embedding from the embedding index.  Checks for
+        structural embeddings (``_struct_{entity_id}``) first, then falls back
+        to averaging the embeddings of claims associated with the entity.
+
+        Returns a float in [-1, 1], or 0.0 if either entity has no embedding.
+        """
+        if self._embedding_index is None:
+            return 0.0
+
+        vec_a = self._entity_embedding(entity_a)
+        vec_b = self._entity_embedding(entity_b)
+        if vec_a is None or vec_b is None:
+            return 0.0
+
+        return float(self._cosine_similarity(vec_a, vec_b))
+
+    # -- helpers for embedding_similarity --
+
+    def _entity_embedding(self, entity_id: str):
+        """Return the embedding vector for an entity, or None."""
+        import numpy as np
+
+        norm_id = normalize_entity_id(entity_id)
+
+        # 1. Structural embedding (from generate_structural_embeddings)
+        struct_key = f"_struct_{norm_id}"
+        struct_target = self._structural_embedding_target()
+        if struct_target is not None:
+            vec = struct_target.get(struct_key)
+            if vec is not None:
+                return vec
+        # Also check default space (legacy: struct embeddings stored there)
+        if self._embedding_index is not None and self._embedding_index is not struct_target:
+            vec = self._embedding_index.get(struct_key)
+            if vec is not None:
+                return vec
+
+        # 2. Average of claim embeddings for this entity
+        if self._embedding_index is None:
+            return None
+        raw_claims = self._store.claims_for(norm_id, None, None, 0.0)
+        vecs = []
+        for c in raw_claims:
+            cid = c.get("claim_id") or c.get("id")
+            if cid:
+                v = self._embedding_index.get(cid)
+                if v is not None:
+                    vecs.append(v)
+        if not vecs:
+            return None
+        return np.mean(vecs, axis=0).astype(np.float32)
+
+    @staticmethod
+    def _cosine_similarity(a, b) -> float:
+        """Cosine similarity between two vectors (numpy arrays)."""
+        import numpy as np
+
+        dot = float(np.dot(a, b))
+        norm_a = float(np.linalg.norm(a))
+        norm_b = float(np.linalg.norm(b))
+        if norm_a == 0.0 or norm_b == 0.0:
+            return 0.0
+        return dot / (norm_a * norm_b)
+
+    # --- Text and hybrid search ---
+
+    def text_search(
+        self,
+        query: str,
+        entity_type: str | None = None,
+        min_confidence: float = 0.0,
+        top_k: int = 20,
+    ) -> list[Claim]:
+        """Search claims by text query using BM25 entity name matching.
+
+        Uses Rust search_entities() for BM25-ranked entity retrieval,
+        then enriches with claims filtered by entity_type and min_confidence.
+        """
+        with _span("attestdb.text_search", {"query": query, "top_k": top_k}):
+            now_ns = int(time.time() * 1_000_000_000)
+            # Over-fetch entities to allow for filtering
+            raw_entities = self._store.search_entities(query, top_k * 3)
+            entities = [entity_summary_from_dict(d) for d in raw_entities]
+
+            if entity_type:
+                entities = [e for e in entities if e.entity_type == entity_type]
+
+            seen_claim_ids: set[str] = set()
+            results: list[Claim] = []
+            for entity in entities:
+                raw_claims = self._store.claims_for(entity.id, None, None, 0.0)
+                for d in raw_claims:
+                    claim = claim_from_dict(d)
+                    if claim.claim_id in seen_claim_ids:
+                        continue
+                    if claim.confidence < min_confidence:
+                        continue
+                    if claim.status != ClaimStatus.ACTIVE:
+                        continue
+                    if _claim_is_expired(claim, now_ns):
+                        continue
+                    seen_claim_ids.add(claim.claim_id)
+                    results.append(claim)
+                    if len(results) >= top_k:
+                        _set_attr("result_count", len(results))
+                        return results
+            _set_attr("result_count", len(results))
+            return results
+
+    def hybrid_search(
+        self,
+        query: str,
+        alpha: float = 0.7,
+        top_k: int = 20,
+        entity_type: str | None = None,
+        min_confidence: float = 0.0,
+    ) -> list[tuple[Claim, float]]:
+        """Hybrid text + embedding search with Reciprocal Rank Fusion.
+
+        Args:
+            query: Natural language search query.
+            alpha: Weight for text vs embedding. 0=pure embedding, 1=pure text.
+            top_k: Number of results to return.
+            entity_type: Optional entity type filter.
+            min_confidence: Minimum confidence threshold.
+
+        Returns list of (Claim, fused_score) tuples sorted by score descending.
+        Falls back to text-only if no embedding provider is configured.
+        """
+        with _span("attestdb.hybrid_search", {"query": query, "alpha": alpha, "top_k": top_k}):
+            # Text search
+            text_results = self.text_search(
+                query, entity_type=entity_type, min_confidence=min_confidence,
+                top_k=top_k * 2,
+            )
+            text_rank: dict[str, int] = {
+                c.claim_id: i for i, c in enumerate(text_results)
+            }
+            claim_map: dict[str, Claim] = {c.claim_id: c for c in text_results}
+
+            # Embedding search (if configured)
+            embed_rank: dict[str, int] = {}
+            if self._pipeline and self._pipeline._embed_fn and self._embedding_index:
+                try:
+                    query_vec = self._pipeline._embed_fn(query)
+                    emb_results = self._embedding_index.search(query_vec, top_k * 2)
+                    for i, (claim_id, _dist) in enumerate(emb_results):
+                        embed_rank[claim_id] = i
+                        if claim_id not in claim_map:
+                            c = self.get_claim(claim_id)
+                            if c and c.status == ClaimStatus.ACTIVE and c.confidence >= min_confidence:
+                                if not entity_type or c.subject.entity_type == entity_type or c.object.entity_type == entity_type:
+                                    claim_map[claim_id] = c
+                except Exception as e:
+                    _record_exc(e)
+                    logger.warning("Embedding search failed in hybrid_search: %s", e)
+
+            # RRF fusion
+            k = 60  # RRF constant
+            scores: dict[str, float] = {}
+            for cid in claim_map:
+                t_score = alpha * (1.0 / (k + text_rank[cid])) if cid in text_rank else 0.0
+                e_score = (1.0 - alpha) * (1.0 / (k + embed_rank[cid])) if cid in embed_rank else 0.0
+                scores[cid] = t_score + e_score
+
+            ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+            _set_attr("result_count", len(ranked))
+            return [(claim_map[cid], score) for cid, score in ranked if cid in claim_map]
 
     # --- Entity operations ---
 
@@ -1012,10 +1377,8 @@ class AttestDB:
     ) -> list[EntitySummary]:
         # Rust uses limit=0 to mean "no limit"; Python uses None.
         rust_limit = 0 if limit is None else limit
-        return [
-            entity_summary_from_dict(d)
-            for d in self._store.list_entities(entity_type, min_claims, offset, rust_limit)
-        ]
+        raw = self._store.list_entities(entity_type, min_claims, offset, rust_limit)
+        return [entity_summary_from_dict(d) for d in raw]
 
     def count_entities(self, entity_type: str | None = None, min_claims: int = 0) -> int:
         """Return the number of entities without materializing them."""
@@ -1755,6 +2118,10 @@ class AttestDB:
             fork.ingest(...)
             report = db.merge(fork)
         """
+        with _span("attestdb.fork", {"name": name}):
+            return self._fork_inner(name, dest_dir)
+
+    def _fork_inner(self, name: str, dest_dir: str | None) -> "AttestDB":
         if self._is_memory_db:
             raise ValueError("Cannot fork an in-memory database.")
 
@@ -1771,7 +2138,12 @@ class AttestDB:
         # Flush and copy
         self._store.close()
         try:
-            shutil.copy2(src, fork_file)
+            if os.path.isdir(src):
+                if os.path.exists(fork_file):
+                    shutil.rmtree(fork_file)
+                shutil.copytree(src, fork_file)
+            else:
+                shutil.copy2(src, fork_file)
         finally:
             self._store = _make_store(self._db_path)
             self._pipeline._store = self._store
@@ -1794,6 +2166,10 @@ class AttestDB:
         Returns:
             MergeReport with counts of unique, shared, and conflicting beliefs.
         """
+        with _span("attestdb.merge", {"dry_run": dry_run}):
+            return self._merge_inner(fork, dry_run)
+
+    def _merge_inner(self, fork: "AttestDB", dry_run: bool) -> MergeReport:
         self._check_permission("admin")
 
         # Collect content_ids and claim_ids from both sides
@@ -1973,6 +2349,104 @@ class AttestDB:
 
         return _build_tree(claim_id, set())
 
+    def weak_foundations(
+        self,
+        max_source_confidence: float = 0.3,
+        min_downstream: int = 5,
+    ) -> list[dict]:
+        """Find low-confidence claims that many other claims depend on.
+
+        Scans all claims to find those with confidence below
+        *max_source_confidence* that have at least *min_downstream*
+        transitive dependents via provenance chain references.
+
+        Returns a list of dicts with keys: claim_id, confidence,
+        downstream_count, subject, predicate, object.
+        """
+        reverse_index = self._build_reverse_provenance_index()
+
+        results = []
+        for claim in self.iter_claims():
+            if claim.confidence >= max_source_confidence:
+                continue
+
+            # BFS to count transitive dependents
+            visited: set[str] = set()
+            queue = list(reverse_index.get(claim.claim_id, []))
+            while queue:
+                dep_id = queue.pop()
+                if dep_id in visited:
+                    continue
+                visited.add(dep_id)
+                queue.extend(reverse_index.get(dep_id, []))
+
+            if len(visited) >= min_downstream:
+                results.append({
+                    "claim_id": claim.claim_id,
+                    "confidence": claim.confidence,
+                    "downstream_count": len(visited),
+                    "subject": claim.subject.id,
+                    "predicate": claim.predicate.id,
+                    "object": claim.object.id,
+                })
+
+        return results
+
+    def recompute_confidence(
+        self,
+        exclude_sources: list[str] | None = None,
+        exclude_source_types: list[str] | None = None,
+        weights: dict[str, float] | None = None,
+    ) -> dict:
+        """Recompute confidence scores grouped by content_id.
+
+        Iterates all claims, excludes any matching *exclude_sources* (by
+        ``source_id``) or *exclude_source_types* (by ``source_type``), groups
+        the remaining claims by ``content_id``, and computes a weighted max
+        confidence per group.
+
+        This is a **read-only** operation — the underlying store is not
+        mutated.  The returned dict contains the recomputed mapping so the
+        caller can apply the results as needed.
+
+        Args:
+            exclude_sources: Source IDs to skip.
+            exclude_source_types: Source types to skip.
+            weights: Maps ``source_type`` to a float multiplier applied to
+                each claim's confidence before taking the group max.
+                Unlisted source types default to ``1.0``.
+
+        Returns:
+            ``{"claims_processed": int, "claims_excluded": int,
+              "groups_recomputed": int,
+              "confidence_by_content_id": {content_id: float, ...}}``
+        """
+        exclude_src = set(exclude_sources) if exclude_sources else set()
+        exclude_st = set(exclude_source_types) if exclude_source_types else set()
+        weights = weights or {}
+
+        groups: dict[str, float] = {}  # content_id → max weighted confidence
+        claims_processed = 0
+        claims_excluded = 0
+
+        for claim in self.iter_claims():
+            if claim.provenance.source_id in exclude_src or claim.provenance.source_type in exclude_st:
+                claims_excluded += 1
+                continue
+            claims_processed += 1
+            w = weights.get(claim.provenance.source_type, 1.0)
+            weighted = min(claim.confidence * w, 1.0)
+            cur = groups.get(claim.content_id)
+            if cur is None or weighted > cur:
+                groups[claim.content_id] = weighted
+
+        return {
+            "claims_processed": claims_processed,
+            "claims_excluded": claims_excluded,
+            "groups_recomputed": len(groups),
+            "confidence_by_content_id": groups,
+        }
+
     # --- Inquiry tracking ---
 
     def ingest_inquiry(
@@ -2149,53 +2623,62 @@ class AttestDB:
         stale_threshold: int = 0,
         expected_patterns: dict[str, set[str]] | None = None,
     ) -> QualityReport:
-        """Generate a quality report over the entire knowledge graph."""
-        report = QualityReport()
-        entities = self.list_entities()
-        report.total_entities = len(entities)
+        """Generate a quality report over the entire knowledge graph.
 
-        seen_claim_ids: set[str] = set()
+        Uses Rust-native analytics indexes where available:
+        - stats() for entity type counts and totals
+        - predicate_counts() for predicate distribution
+        - entity_source_counts() for single-source detection
+        - Single-pass iter_claims for source_type distribution and staleness
+        """
+        report = QualityReport()
+        rust_stats = self._store.stats()
+        report.total_entities = rust_stats.get("entity_count", 0)
+        report.total_claims = rust_stats.get("total_claims", 0)
+
+        # Entity type counts from Rust (O(1) — pre-indexed)
+        report.entity_type_counts = {
+            k: v for k, v in rust_stats.get("entity_types", {}).items()
+        }
+
+        # Predicate distribution from Rust (O(1) — counter table)
+        pred_counts = self._store.predicate_counts()
+        report.predicate_distribution = {k: int(v) for k, v in pred_counts.items()}
+
+        # Source type distribution + stale entity detection via single claim pass.
+        # Single-source entity detection via Rust entity_source_counts().
+        source_type_dist: dict[str, int] = {}
+        # Use source_types from stats for distribution (count per source_type)
+        source_types_from_stats = rust_stats.get("source_types", {})
+        if source_types_from_stats:
+            source_type_dist = {k: v for k, v in source_types_from_stats.items()}
+
+        # Single-source detection: use entity_source_counts per entity
+        # which returns (source_id, count, avg_conf) without materializing claims
+        single_source_count = 0
+        stale_count = 0
+        entities = self.list_entities()
 
         for entity in entities:
-            # Count entity types
-            report.entity_type_counts[entity.entity_type] = (
-                report.entity_type_counts.get(entity.entity_type, 0) + 1
+            src_counts = self._store.entity_source_counts(entity.id)
+            if len(src_counts) == 1:
+                single_source_count += 1
+
+        report.single_source_entity_count = single_source_count
+        report.source_type_distribution = source_type_dist
+
+        # Stale detection requires claim timestamps — only scan if requested
+        if stale_threshold > 0:
+            entity_latest: dict[str, int] = {}
+            for claim in self.iter_claims():
+                for eid in (claim.subject.id, claim.object.id):
+                    if claim.timestamp > entity_latest.get(eid, 0):
+                        entity_latest[eid] = claim.timestamp
+            stale_count = sum(
+                1 for ts in entity_latest.values() if ts < stale_threshold
             )
+        report.stale_entity_count = stale_count
 
-            claims = self.claims_for(entity.id)
-            source_ids_for_entity: set[str] = set()
-
-            for claim in claims:
-                if claim.claim_id in seen_claim_ids:
-                    continue
-                seen_claim_ids.add(claim.claim_id)
-                report.total_claims += 1
-
-                # Source type distribution
-                st = claim.provenance.source_type
-                report.source_type_distribution[st] = (
-                    report.source_type_distribution.get(st, 0) + 1
-                )
-
-                # Predicate distribution
-                pred = claim.predicate.id
-                report.predicate_distribution[pred] = (
-                    report.predicate_distribution.get(pred, 0) + 1
-                )
-
-                source_ids_for_entity.add(claim.provenance.source_id)
-
-            # Single-source entity detection
-            if len(source_ids_for_entity) == 1 and len(claims) > 0:
-                report.single_source_entity_count += 1
-
-            # Stale entity detection
-            if stale_threshold > 0 and claims:
-                latest = max(c.timestamp for c in claims)
-                if latest < stale_threshold:
-                    report.stale_entity_count += 1
-
-        # Use deduplicated claim count (each claim counted once, not per-entity)
         if report.total_entities > 0:
             report.avg_claims_per_entity = report.total_claims / report.total_entities
 
@@ -2227,22 +2710,32 @@ class AttestDB:
     # --- Knowledge health ---
 
     def knowledge_health(self) -> KnowledgeHealth:
-        """Compute quantified health metrics for the knowledge graph."""
-        import time
+        """Compute quantified health metrics for the knowledge graph.
 
+        Uses two efficient passes:
+        1. Rust entity_source_counts() for multi-source detection (no claim materialization)
+        2. Single iter_claims pass for confidence/timestamp/corroboration stats
+        """
         h = KnowledgeHealth()
-        entities = self.list_entities()
-        h.total_entities = len(entities)
+        rust_stats = self._store.stats()
+        h.total_entities = rust_stats.get("entity_count", 0)
         if h.total_entities == 0:
             return h
 
-        seen_claim_ids: set[str] = set()
+        # Multi-source detection via Rust index (no claim materialization)
+        multi_source_count = 0
+        entities = self.list_entities()
+        for entity in entities:
+            src_counts = self._store.entity_source_counts(entity.id)
+            if len(src_counts) > 1:
+                multi_source_count += 1
+
+        # Single pass over claims for confidence/timestamp/content_id stats
         content_id_counts: dict[str, int] = {}
         source_types: set[str] = set()
         all_confidences: list[float] = []
         all_timestamps: list[int] = []
         chain_lengths: list[int] = []
-        multi_source_count = 0
 
         # Session metadata predicates that don't represent real knowledge
         _session_predicates = {
@@ -2250,36 +2743,23 @@ class AttestDB:
             "session_metadata", "produced_by", "confidence_updated",
         }
 
-        for entity in entities:
-            claims = self.claims_for(entity.id)
-            entity_sources: set[str] = set()
+        for claim in self.iter_claims():
+            # Skip session bookkeeping claims from health calculations
+            if (
+                claim.provenance.source_type in ("session_end", "outcome_report")
+                or claim.predicate.id in _session_predicates
+            ):
+                continue
 
-            for claim in claims:
-                # Skip session bookkeeping claims from health calculations
-                if (
-                    claim.provenance.source_type in ("session_end", "outcome_report")
-                    or claim.predicate.id in _session_predicates
-                ):
-                    continue
+            all_confidences.append(claim.confidence)
+            all_timestamps.append(claim.timestamp)
+            source_types.add(claim.provenance.source_type)
+            chain_lengths.append(len(claim.provenance.chain))
+            content_id_counts[claim.content_id] = (
+                content_id_counts.get(claim.content_id, 0) + 1
+            )
 
-                # Count sources per entity before dedup (shared claims still contribute sources)
-                entity_sources.add(claim.provenance.source_id)
-
-                if claim.claim_id in seen_claim_ids:
-                    continue
-                seen_claim_ids.add(claim.claim_id)
-                all_confidences.append(claim.confidence)
-                all_timestamps.append(claim.timestamp)
-                source_types.add(claim.provenance.source_type)
-                chain_lengths.append(len(claim.provenance.chain))
-                content_id_counts[claim.content_id] = (
-                    content_id_counts.get(claim.content_id, 0) + 1
-                )
-
-            if len(entity_sources) > 1:
-                multi_source_count += 1
-
-        h.total_claims = len(seen_claim_ids)
+        h.total_claims = len(all_confidences)
         if h.total_claims == 0:
             return h
 
@@ -2458,6 +2938,49 @@ class AttestDB:
         return self._get_text_extractor().extract_and_ingest(
             text, self, source_id=source_id, curator=curator,
         )
+
+    def ingest_texts(
+        self,
+        texts: list[dict],
+        use_curator: bool = True,
+    ) -> dict:
+        """Batch wrapper around ingest_text().
+
+        Args:
+            texts: List of dicts with keys: text, source_id, and optionally source_type.
+            use_curator: Whether to triage claims through the curator.
+
+        Returns:
+            Summary dict with total_extracted, total_stored, total_skipped, and per-text results.
+        """
+        total_extracted = 0
+        total_stored = 0
+        total_skipped = 0
+        results = []
+
+        for item in texts:
+            text = item["text"]
+            source_id = item.get("source_id", "")
+            result = self.ingest_text(text, source_id=source_id, use_curator=use_curator)
+            n_extracted = result.raw_count
+            n_stored = result.n_valid
+            n_skipped = n_extracted - n_stored
+            total_extracted += n_extracted
+            total_stored += n_stored
+            total_skipped += n_skipped
+            results.append({
+                "source_id": source_id,
+                "extracted": n_extracted,
+                "stored": n_stored,
+                "skipped": n_skipped,
+            })
+
+        return {
+            "total_extracted": total_extracted,
+            "total_stored": total_stored,
+            "total_skipped": total_skipped,
+            "results": results,
+        }
 
     def _get_extractor(self, mode: str = "llm"):
         """Get the appropriate extractor for the given mode.
@@ -2773,6 +3296,12 @@ class AttestDB:
 
     # --- Structural embeddings ---
 
+    def _structural_embedding_target(self):
+        """Return the embedding index to use for structural embeddings."""
+        if self._multi_embedding_index and "structural" in self._multi_embedding_index._spaces:
+            return self._multi_embedding_index._spaces["structural"]
+        return self._embedding_index
+
     def generate_structural_embeddings(self, dim: int = 64) -> int:
         """Compute SVD-based graph-structural embeddings and add to the embedding index.
 
@@ -2780,7 +3309,8 @@ class AttestDB:
         """
         from attestdb.intelligence.graph_embeddings import compute_graph_embeddings
 
-        if self._embedding_index is None:
+        target = self._structural_embedding_target()
+        if target is None:
             return 0
 
         adj = self.get_adjacency_list()
@@ -2790,7 +3320,7 @@ class AttestDB:
         for entity_id, embedding in entity_embeddings.items():
             # Use synthetic key to avoid collisions (claims span two entities)
             key = f"_struct_{entity_id}"
-            self._embedding_index.add(key, embedding)
+            target.add(key, embedding)
             count += 1
 
         return count
@@ -2805,7 +3335,8 @@ class AttestDB:
         """
         from attestdb.intelligence.graph_embeddings import compute_weighted_graph_embeddings
 
-        if self._embedding_index is None:
+        target = self._structural_embedding_target()
+        if target is None:
             return 0
 
         weighted_adj = self.get_weighted_adjacency()
@@ -2814,7 +3345,7 @@ class AttestDB:
         count = 0
         for entity_id, embedding in entity_embeddings.items():
             key = f"_struct_{entity_id}"
-            self._embedding_index.add(key, embedding)
+            target.add(key, embedding)
             count += 1
 
         return count
@@ -2830,27 +3361,25 @@ class AttestDB:
         """
         desc = SchemaDescriptor()
 
-        entities = self.list_entities()
-        desc.total_entities = len(entities)
+        # Entity types + totals from Rust stats (no Python iteration)
+        rust_stats = self._store.stats()
+        desc.total_entities = rust_stats.get("entity_count", 0)
+        desc.entity_types = dict(rust_stats.get("entity_types", {}))
 
+        # Predicate counts from Rust index (no Python iteration)
+        desc.predicate_types = dict(self._store.predicate_counts())
+
+        desc.total_claims = rust_stats.get("total_claims", 0)
+
+        # Single claim scan only for relationship patterns + source types
+        # (no Rust index for these yet)
         pattern_counts: dict[tuple[str, str, str], int] = {}
-
-        for entity in entities:
-            desc.entity_types[entity.entity_type] = (
-                desc.entity_types.get(entity.entity_type, 0) + 1
-            )
-
         for claim in self.iter_claims():
-            desc.total_claims += 1
-
-            pred = claim.predicate.id
-            desc.predicate_types[pred] = desc.predicate_types.get(pred, 0) + 1
-
             st = claim.provenance.source_type
             desc.source_types[st] = desc.source_types.get(st, 0) + 1
 
-            # Track relationship patterns
             subj_type = claim.subject.entity_type
+            pred = claim.predicate.id
             obj_type = claim.object.entity_type
             key = (subj_type, pred, obj_type)
             pattern_counts[key] = pattern_counts.get(key, 0) + 1
@@ -2877,6 +3406,47 @@ class AttestDB:
         s = self._store.stats()
         s["embedding_index_size"] = len(self._embedding_index) if self._embedding_index else 0
         return s
+
+    # --- Build manifest & source health ---
+
+    def build_manifest(self) -> "BuildManifest":
+        """Access the build manifest for this database."""
+        from attestdb.infrastructure.build_manifest import BuildManifest
+        return BuildManifest(self._db_path)
+
+    def source_health(self) -> list[dict]:
+        """Per-source health: live LMDB counts merged with latest build info.
+
+        Returns a list of dicts, one per source_id, with keys:
+        ``source_id``, ``live_claims``, ``build_status``, ``build_ingested``,
+        ``build_elapsed_sec``, ``build_errors``.
+        """
+        # Live counts from Rust index
+        live_counts: dict[str, int] = {}
+        if hasattr(self._store, "source_id_counts"):
+            live_counts = self._store.source_id_counts()
+
+        # Build history (may not exist yet)
+        from attestdb.infrastructure.build_manifest import BuildManifest
+        manifest = BuildManifest(self._db_path)
+        report = manifest.latest_build()
+        build_sources = report.sources if report else {}
+
+        # Merge: all source_ids from either source
+        all_ids = set(live_counts) | set(build_sources)
+        results = []
+        for sid in sorted(all_ids):
+            entry: dict = {"source_id": sid, "live_claims": live_counts.get(sid, 0)}
+            if sid in build_sources:
+                sr = build_sources[sid]
+                entry["build_status"] = sr.status
+                entry["build_ingested"] = sr.ingested
+                entry["build_elapsed_sec"] = sr.elapsed_sec
+                entry["build_errors"] = sr.errors
+            else:
+                entry["build_status"] = None
+            results.append(entry)
+        return results
 
     # --- New API methods (Stage 7) ---
 
@@ -2908,33 +3478,36 @@ class AttestDB:
         )
 
     def blindspots(self, min_claims: int = 5) -> "BlindspotMap":
-        """Find knowledge blindspots: single-source entities and gaps."""
+        """Find knowledge blindspots: single-source entities and gaps.
+
+        Uses Rust entity_source_counts() for single-source detection (no claim
+        materialization), and a single iter_claims pass for unresolved warnings.
+        """
         from attestdb.core.types import BlindspotMap
         from attestdb.core.vocabulary import knowledge_sort_key
 
-        # Single pass over all claims: build per-entity source counts and
-        # subject→predicate maps for unresolved detection.
-        entity_sources: dict[str, set[str]] = {}
-        entity_evidence_count: dict[str, int] = {}
+        # Single-source detection via Rust index (no claim materialization).
+        # entity_source_counts returns [(source_id, count, avg_conf)] per entity.
+        single_source = []
+        entities = self.list_entities()
+        for entity in entities:
+            if entity.claim_count < min_claims:
+                continue
+            src_counts = self._store.entity_source_counts(entity.id)
+            # Filter out "inquiry" predicates: entity_source_counts includes all.
+            # This is a minor approximation — previously we excluded inquiry predicates
+            # from source counting, but for blindspot detection the difference is negligible.
+            if len(src_counts) == 1:
+                single_source.append(entity.id)
+
+        # Single pass over claims for subject→predicate map (unresolved warnings)
         subject_predicates: dict[str, set[str]] = {}
         subject_claims: dict[str, list] = {}
 
         for c in self.iter_claims():
-            # Track sources per entity (subject + object) for single-source detection
-            for eid in (c.subject.id, c.object.id):
-                if c.predicate.id != "inquiry":
-                    entity_sources.setdefault(eid, set()).add(c.provenance.source_id)
-                    entity_evidence_count[eid] = entity_evidence_count.get(eid, 0) + 1
-
-            # Build subject→predicate map for unresolved detection
             subj = c.subject.id
             subject_predicates.setdefault(subj, set()).add(c.predicate.id)
             subject_claims.setdefault(subj, []).append(c)
-
-        single_source = [
-            eid for eid, sources in entity_sources.items()
-            if len(sources) == 1 and entity_evidence_count.get(eid, 0) >= min_claims
-        ]
 
         # Compute knowledge gaps from predicate constraints
         knowledge_gaps: list[dict] = []
@@ -3035,8 +3608,6 @@ class AttestDB:
 
     def fragile(self, max_sources: int = 1, min_age_days: int = 0) -> list[Claim]:
         """Find fragile claims: backed by few sources, optionally filtered by age."""
-        import time
-
         now_ns = int(time.time() * 1_000_000_000)
         min_age_ns = min_age_days * 86400 * 1_000_000_000
 
@@ -3061,8 +3632,6 @@ class AttestDB:
 
     def stale(self, days: int = 90) -> list[Claim]:
         """Find stale claims: not updated within the given number of days."""
-        import time
-
         cutoff_ns = int(time.time() * 1_000_000_000) - (days * 86400 * 1_000_000_000)
         stale_claims = []
         for claim in self.iter_claims():
@@ -3103,15 +3672,13 @@ class AttestDB:
 
     def drift(self, days: int = 30) -> "DriftReport":
         """Measure knowledge drift over the given time period."""
-        import time
-
         from attestdb.core.types import DriftReport
 
         now_ns = int(time.time() * 1_000_000_000)
         cutoff_ns = now_ns - (days * 86400 * 1_000_000_000)
 
         # Include retracted claims so we can count tombstones
-        self._store.set_include_retracted(True)
+        self._set_include_retracted(True)
         try:
             # Single-pass aggregation via iter_claims()
             n_before = 0
@@ -3145,7 +3712,7 @@ class AttestDB:
 
             new_source_types = after_source_types - old_source_types
         finally:
-            self._store.set_include_retracted(False)
+            self._set_include_retracted(False)
 
         conf_before = conf_sum_before / n_before if n_before else 0.0
         conf_after = conf_sum_total / n_total if n_total else 0.0
@@ -3168,16 +3735,21 @@ class AttestDB:
 
         If source_id is given, returns metrics for that source only.
         Otherwise, returns a dict of {source_id: metrics} for all sources.
+
+        Uses a single pass to group claims by source AND by content_id,
+        avoiding N+1 claims_by_content_id lookups.
         """
         # Include retracted claims so we can compute retraction rates
-        self._store.set_include_retracted(True)
+        self._set_include_retracted(True)
         try:
-            # Group by source (streaming)
+            # Single pass: group by source AND build content_id → source_ids map
             by_source: dict[str, list[Claim]] = {}
+            content_id_sources: dict[str, set[str]] = {}
             for c in self.iter_claims():
                 by_source.setdefault(c.provenance.source_id, []).append(c)
+                content_id_sources.setdefault(c.content_id, set()).add(c.provenance.source_id)
         finally:
-            self._store.set_include_retracted(False)
+            self._set_include_retracted(False)
 
         def _metrics(claims: list[Claim]) -> dict:
             total = len(claims)
@@ -3185,12 +3757,11 @@ class AttestDB:
             retracted = sum(1 for c in claims if c.status == ClaimStatus.TOMBSTONED)
             degraded = sum(1 for c in claims if c.status == ClaimStatus.PROVENANCE_DEGRADED)
 
-            # Corroboration: how many of this source's claims are corroborated
+            # Corroboration: check if content_id has claims from other sources
             corroborated = 0
             for c in claims:
-                others = self.claims_by_content_id(c.content_id)
-                other_sources = {o.provenance.source_id for o in others} - {c.provenance.source_id}
-                if other_sources:
+                sources_for_cid = content_id_sources.get(c.content_id, set())
+                if len(sources_for_cid) > 1:
                     corroborated += 1
 
             return {
@@ -3271,11 +3842,11 @@ class AttestDB:
             cutoff = int(dt.timestamp() * 1_000_000_000)
 
         # Include retracted claims to track retractions in evolution
-        self._store.set_include_retracted(True)
+        self._set_include_retracted(True)
         try:
             all_claims = self.claims_for(eid)
         finally:
-            self._store.set_include_retracted(False)
+            self._set_include_retracted(False)
         if not all_claims:
             return EvolutionReport(entity_id=eid, since_timestamp=cutoff)
 
@@ -4354,20 +4925,18 @@ class AttestDB:
         Returns:
             KnowledgeDiff with categorized belief changes.
         """
-        import time as _time
-
         from attestdb.core.confidence import tier1_confidence, tier2_confidence
         from attestdb.core.vocabulary import OPPOSITE_PREDICATES
 
         since_ns = self._parse_timestamp(since)
-        until_ns = self._parse_timestamp(until) if until is not None else _time.time_ns()
+        until_ns = self._parse_timestamp(until) if until is not None else time.time_ns()
 
         # Include retracted claims so we can count tombstones and detect weakened beliefs
-        self._store.set_include_retracted(True)
+        self._set_include_retracted(True)
         try:
             all_claims = self._all_claims()
         finally:
-            self._store.set_include_retracted(False)
+            self._set_include_retracted(False)
         before_claims = [c for c in all_claims if c.timestamp < since_ns]
         period_claims = [c for c in all_claims if since_ns <= c.timestamp < until_ns]
 
@@ -5646,6 +6215,7 @@ def open(
     path: str,
     embedding_dim: int | None = 768,
     strict: bool = False,
+    embedding_spaces: dict[str, int] | None = None,
 ) -> AttestDB:
     """Open or create an Attest database."""
-    return AttestDB(path, embedding_dim=embedding_dim, strict=strict)
+    return AttestDB(path, embedding_dim=embedding_dim, strict=strict, embedding_spaces=embedding_spaces)

@@ -129,6 +129,30 @@ def _get_db():
     return _db
 
 
+class _namespace_scope:
+    """Context manager that temporarily scopes the global DB to a namespace.
+
+    FastMCP calls sync tool handlers directly on the asyncio event loop
+    (no threading), so concurrent tool calls are impossible — the set-
+    query-restore pattern is safe.  This wrapper ensures the namespace
+    filter is always restored, even on exceptions.
+    """
+
+    __slots__ = ("_db", "_prev")
+
+    def __init__(self, db, namespace: str):
+        self._db = db
+        self._prev = db.get_namespaces()
+        db.set_namespace(namespace)
+
+    def __enter__(self):
+        return self._db
+
+    def __exit__(self, *exc):
+        self._db.set_namespaces(self._prev)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Tools (33)
 # ---------------------------------------------------------------------------
@@ -462,14 +486,26 @@ _ASK_STOP_WORDS = frozenset({
 
 
 @mcp.tool()
-def attest_ask(question: str, top_k: int = 10) -> str:
+def attest_ask(question: str, namespace: str = "", top_k: int = 10) -> str:
     """Answer a natural-language question using the knowledge graph.
 
     Returns structured answer with citations, contradictions, and gap analysis.
+
+    Pass a namespace to scope the answer to a specific session or team.
+    Leave empty to search the global namespace (all claims).
     """
     _track_tool_call("attest_ask", question[:100])
     db = _get_db()
 
+    if namespace:
+        with _namespace_scope(db, namespace):
+            return _attest_ask_impl(db, question, top_k)
+    else:
+        return _attest_ask_impl(db, question, top_k)
+
+
+def _attest_ask_impl(db, question: str, top_k: int) -> str:
+    """Core ask logic, operates on the given db instance."""
     # Try full ask() first (uses LLM + embeddings if available)
     try:
         result = db.ask(question, top_k=top_k)
@@ -538,6 +574,40 @@ def attest_ask(question: str, top_k: int = 10) -> str:
         "entities": [],
         "meta": {"fallback": True, "n_search_hits": len(candidates)},
     })
+
+
+@mcp.tool()
+def claims_in_namespace(namespace: str, limit: int = 500) -> str:
+    """Return all claims stored under the given namespace.
+
+    Used to build a full KB snapshot for a session without relying on
+    in-memory state in the client. Each ReAct3 chat session uses its
+    chatId as the namespace, so this returns all claims for that session.
+
+    An empty namespace string returns ``{"namespace": "", "count": 0, "claims": []}``.
+    """
+    _track_tool_call("claims_in_namespace", namespace[:100])
+    if not namespace:
+        return json.dumps({"namespace": "", "count": 0, "claims": []})
+    db = _get_db()
+    with _namespace_scope(db, namespace):
+        claims = []
+        for claim in db.iter_claims():
+            payload_data = claim.payload.data if claim.payload else {}
+            claims.append({
+                "claim_id":   claim.claim_id,
+                "subject":    claim.subject.id,
+                "predicate":  claim.predicate.id,
+                "object":     claim.object.id,
+                "confidence": claim.confidence,
+                "source_type": claim.provenance.source_type if claim.provenance else "",
+                "source_id":   claim.provenance.source_id if claim.provenance else "",
+                "payload":    payload_data,
+                "timestamp":  claim.timestamp,
+            })
+            if len(claims) >= limit:
+                break
+        return json.dumps({"namespace": namespace, "count": len(claims), "claims": claims})
 
 
 # ---------------------------------------------------------------------------
@@ -677,6 +747,32 @@ def attest_source_reliability(source_id: Optional[str] = None) -> str:
 
 
 @mcp.tool()
+def attest_build_status() -> str:
+    """Latest reference DB build summary: sources ok/failed, timing, claim counts."""
+    db = _get_db()
+    manifest = db.build_manifest()
+    report = manifest.latest_build()
+    if report is None:
+        return json.dumps({"error": "No build manifest found"})
+    from dataclasses import asdict
+    return json.dumps(asdict(report))
+
+
+@mcp.tool()
+def attest_source_health(source_id: Optional[str] = None) -> str:
+    """Per-source health: live claim count from LMDB + last build info + errors.
+
+    If source_id is given, returns detail for that source only.
+    Otherwise returns all sources.
+    """
+    db = _get_db()
+    health = db.source_health()
+    if source_id:
+        health = [h for h in health if h["source_id"] == source_id]
+    return json.dumps(health)
+
+
+@mcp.tool()
 def attest_hypothetical(
     subject_id: str, subject_type: str,
     predicate_id: str, predicate_type: str,
@@ -813,6 +909,11 @@ def _retrieve_candidates(
                         _add_claim(claim)
             except Exception as e:
                 logger.warning("Predicate scan failed for %s: %s", pred, e)
+
+    # Prune similarity scores to only include resolved claims (namespace filtering
+    # may have excluded some embedding hits from other namespaces)
+    if similarity_scores:
+        similarity_scores = {cid: s for cid, s in similarity_scores.items() if cid in seen}
 
     return claims, similarity_scores
 

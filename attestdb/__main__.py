@@ -127,6 +127,183 @@ def cmd_serve(args):
     mcp_main()
 
 
+# ---- Cloud commands ----
+
+
+def _cloud_config_path():
+    from pathlib import Path
+    return Path.home() / ".attest" / "cloud.json"
+
+
+def _load_cloud_config():
+    import json
+    from pathlib import Path
+    path = _cloud_config_path()
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def _save_cloud_config(config: dict):
+    import json
+    path = _cloud_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config, indent=2) + "\n")
+
+
+def cmd_cloud_login(args):
+    """Store API key + endpoint for cloud access."""
+    try:
+        import requests
+    except ImportError:
+        print("Error: requests package required. pip install requests", file=sys.stderr)
+        sys.exit(1)
+
+    endpoint = args.endpoint.rstrip("/")
+    api_key = args.api_key
+
+    # Validate by hitting /health
+    try:
+        r = requests.get(f"{endpoint}/health", timeout=10)
+        r.raise_for_status()
+        health = r.json()
+        print(f"Connected to {endpoint} — status: {health.get('status', 'ok')}")
+    except Exception as e:
+        print(f"Error: Cannot reach {endpoint}/health — {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Validate API key by hitting /api/v1/account/keys
+    try:
+        r = requests.get(
+            f"{endpoint}/api/v1/account/keys",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=10,
+        )
+        if r.status_code == 401:
+            print("Error: Invalid API key.", file=sys.stderr)
+            sys.exit(1)
+        r.raise_for_status()
+        print(f"Authenticated successfully.")
+    except requests.exceptions.HTTPError as e:
+        if r.status_code != 401:
+            print(f"Warning: Could not validate API key — {e}")
+
+    _save_cloud_config({"endpoint": endpoint, "api_key": api_key})
+    print(f"Saved to {_cloud_config_path()}")
+
+
+def cmd_cloud_push(args):
+    """Upload a local .attest database to the cloud."""
+    from pathlib import Path
+    try:
+        import requests
+    except ImportError:
+        print("Error: requests package required. pip install requests", file=sys.stderr)
+        sys.exit(1)
+
+    config = _load_cloud_config()
+    if not config:
+        print("Error: Not logged in. Run: attest login --api-key <key>", file=sys.stderr)
+        sys.exit(1)
+
+    db_path = Path(args.db)
+    if not db_path.exists():
+        print(f"Error: File not found: {db_path}", file=sys.stderr)
+        sys.exit(1)
+
+    size_mb = db_path.stat().st_size / (1024 * 1024)
+    print(f"Uploading {db_path} ({size_mb:.1f} MB) to {config['endpoint']}...")
+
+    with open(db_path, "rb") as f:
+        r = requests.post(
+            f"{config['endpoint']}/api/v1/account/databases/upload",
+            headers={"Authorization": f"Bearer {config['api_key']}"},
+            files={"file": (db_path.name, f, "application/octet-stream")},
+            timeout=300,
+        )
+
+    if r.status_code != 200:
+        print(f"Error: Upload failed — {r.status_code} {r.text}", file=sys.stderr)
+        sys.exit(1)
+
+    result = r.json()
+    entities = result.get('entity_count', result.get('total_entities', 0))
+    print(f"Uploaded: {result.get('total_claims', 0)} claims, {entities} entities")
+
+
+def cmd_cloud_pull(args):
+    """Download the cloud database to a local file."""
+    from pathlib import Path
+    try:
+        import requests
+    except ImportError:
+        print("Error: requests package required. pip install requests", file=sys.stderr)
+        sys.exit(1)
+
+    config = _load_cloud_config()
+    if not config:
+        print("Error: Not logged in. Run: attest login --api-key <key>", file=sys.stderr)
+        sys.exit(1)
+
+    db_path = Path(args.db)
+    print(f"Downloading from {config['endpoint']} to {db_path}...")
+
+    r = requests.get(
+        f"{config['endpoint']}/api/v1/account/databases/download",
+        headers={"Authorization": f"Bearer {config['api_key']}"},
+        stream=True,
+        timeout=300,
+    )
+
+    if r.status_code != 200:
+        print(f"Error: Download failed — {r.status_code} {r.text}", file=sys.stderr)
+        sys.exit(1)
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(db_path, "wb") as f:
+        for chunk in r.iter_content(chunk_size=64 * 1024):
+            f.write(chunk)
+
+    size_mb = db_path.stat().st_size / (1024 * 1024)
+    print(f"Downloaded {size_mb:.1f} MB to {db_path}")
+
+
+def cmd_cloud_status(args):
+    """Show cloud connection info and DB stats."""
+    try:
+        import requests
+    except ImportError:
+        print("Error: requests package required. pip install requests", file=sys.stderr)
+        sys.exit(1)
+
+    config = _load_cloud_config()
+    if not config:
+        print("Not connected. Run: attest login --api-key <key>")
+        return
+
+    print(f"Endpoint: {config['endpoint']}")
+    print(f"API Key:  {config['api_key'][:12]}...{config['api_key'][-4:]}")
+
+    # Fetch stats
+    try:
+        r = requests.get(
+            f"{config['endpoint']}/api/v1/stats",
+            headers={"Authorization": f"Bearer {config['api_key']}"},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            stats = r.json()
+            print(f"Claims:   {stats.get('total_claims', 0)}")
+            print(f"Entities: {stats.get('entity_count', stats.get('total_entities', 0))}")
+        else:
+            print(f"Stats:    (unavailable — {r.status_code})")
+    except Exception as e:
+        print(f"Stats:    (unreachable — {e})")
+
+
 def cmd_query(args):
     """Query knowledge around an entity."""
     from attestdb.infrastructure.attest_db import AttestDB
@@ -230,6 +407,28 @@ def main():
     p_serve.add_argument("--port", type=int, default=8892, help="Bind port (default: 8892)")
     p_serve.add_argument("--db", default="attest.db", help="Database path (default: attest.db)")
 
+    # --- login ---
+    p_login = sub.add_parser("login", help="Connect to AttestDB Cloud")
+    p_login.add_argument("--endpoint", default="https://api.attestdb.com", help="API endpoint URL")
+    p_login.add_argument("--api-key", required=True, help="API key (attest_xxx...)")
+
+    # --- push ---
+    p_push = sub.add_parser("push", help="Upload local DB to cloud")
+    p_push.add_argument(
+        "--db", default=str(__import__("pathlib").Path.home() / ".attest" / "memory.attest"),
+        help="Local DB path (default: ~/.attest/memory.attest)",
+    )
+
+    # --- pull ---
+    p_pull = sub.add_parser("pull", help="Download cloud DB to local")
+    p_pull.add_argument(
+        "--db", default=str(__import__("pathlib").Path.home() / ".attest" / "memory.attest"),
+        help="Local path to save (default: ~/.attest/memory.attest)",
+    )
+
+    # --- status ---
+    sub.add_parser("status", help="Show cloud connection info and DB stats")
+
     args = parser.parse_args()
     if args.command is None:
         parser.print_help()
@@ -248,6 +447,14 @@ def main():
         install(tools=args.tools, scope=args.scope)
     elif args.command == "serve":
         cmd_serve(args)
+    elif args.command == "login":
+        cmd_cloud_login(args)
+    elif args.command == "push":
+        cmd_cloud_push(args)
+    elif args.command == "pull":
+        cmd_cloud_pull(args)
+    elif args.command == "status":
+        cmd_cloud_status(args)
 
 
 if __name__ == "__main__":

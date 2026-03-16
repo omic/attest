@@ -1,7 +1,7 @@
 //! In-memory storage backend with optional file persistence.
 //!
 //! This is the original RustStore implementation extracted into a backend.
-//! Used for `:memory:` databases and file-backed stores (pending redb migration).
+//! Used for `:memory:` databases.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -310,11 +310,6 @@ impl MemoryBackend {
         self.aliases.get_group(&canonical)
     }
 
-    /// Get raw entity data (used by migration to preserve created_at timestamps).
-    pub(crate) fn get_entity_data(&self, entity_id: &str) -> Option<&crate::entity_store::EntityData> {
-        self.entities.get(entity_id)
-    }
-
     // ── Cache management ───────────────────────────────────────────────
 
     /// No-op in memory backend — everything is already in memory.
@@ -337,6 +332,17 @@ impl MemoryBackend {
     pub fn get_entity(&self, entity_id: &str) -> Option<EntitySummary> {
         let claim_count = self.claims.count_for_entity(entity_id);
         self.entities.get_summary(entity_id, claim_count)
+    }
+
+    /// Batch-lookup entity metadata (type, display_name) for multiple IDs.
+    pub fn get_entities_batch(&self, entity_ids: &[&str]) -> HashMap<String, (String, String)> {
+        let mut result = HashMap::with_capacity(entity_ids.len());
+        for id in entity_ids {
+            if let Some(es) = self.get_entity(id) {
+                result.insert(es.id.clone(), (es.entity_type.clone(), es.name.clone()));
+            }
+        }
+        result
     }
 
     pub fn list_entities(
@@ -815,6 +821,131 @@ impl MemoryBackend {
             predicate_types: self.claims.count_by_predicate_type(),
             source_types: self.claims.count_by_source_type(),
         }
+    }
+
+    // ── Analytics (Rust-native aggregation) ───────────────────────────
+
+    pub fn predicate_counts(&self) -> HashMap<String, u64> {
+        let mut counts: HashMap<String, u64> = HashMap::new();
+        for claim in self.claims.all_claims() {
+            if !self.should_include_claim(&claim.claim_id) || !self.should_include_namespace(&claim.namespace) {
+                continue;
+            }
+            *counts.entry(claim.predicate.id.clone()).or_insert(0) += 1;
+        }
+        counts
+    }
+
+    pub fn find_contradictions(
+        &self,
+        pred_a: &str,
+        pred_b: &str,
+    ) -> Vec<(String, String, u64, u64, f64, f64)> {
+        let claims_a = self.claims_by_predicate_id(pred_a);
+        let mut pairs_a: HashMap<(String, String), (u64, f64)> = HashMap::new();
+        for c in &claims_a {
+            let key = (c.subject.id.clone(), c.object.id.clone());
+            let entry = pairs_a.entry(key).or_insert((0, 0.0));
+            entry.0 += 1;
+            entry.1 += c.confidence;
+        }
+
+        let claims_b = self.claims_by_predicate_id(pred_b);
+        let mut results = Vec::new();
+        let mut pairs_b: HashMap<(String, String), (u64, f64)> = HashMap::new();
+        for c in &claims_b {
+            let key = (c.subject.id.clone(), c.object.id.clone());
+            if pairs_a.contains_key(&key) {
+                let entry = pairs_b.entry(key).or_insert((0, 0.0));
+                entry.0 += 1;
+                entry.1 += c.confidence;
+            }
+        }
+        for (pair, (count_b, sum_conf_b)) in &pairs_b {
+            if let Some((count_a, sum_conf_a)) = pairs_a.get(pair) {
+                results.push((
+                    pair.0.clone(),
+                    pair.1.clone(),
+                    *count_a,
+                    *count_b,
+                    sum_conf_a / *count_a as f64,
+                    sum_conf_b / *count_b as f64,
+                ));
+            }
+        }
+        results.sort_by(|a, b| (b.2 + b.3).cmp(&(a.2 + a.3)));
+        results
+    }
+
+    pub fn gap_analysis(
+        &self,
+        entity_type: &str,
+        expected_predicates: &[&str],
+        limit: usize,
+    ) -> Vec<(String, Vec<String>)> {
+        let mut entity_preds: HashMap<String, HashSet<String>> = HashMap::new();
+        for pred_id in expected_predicates {
+            for claim in self.claims_by_predicate_id(pred_id) {
+                if claim.subject.entity_type == entity_type {
+                    entity_preds.entry(claim.subject.id.clone())
+                        .or_default()
+                        .insert(pred_id.to_string());
+                }
+                if claim.object.entity_type == entity_type {
+                    entity_preds.entry(claim.object.id.clone())
+                        .or_default()
+                        .insert(pred_id.to_string());
+                }
+            }
+        }
+        let expected_set: HashSet<&str> = expected_predicates.iter().copied().collect();
+        let mut gaps: Vec<(String, Vec<String>)> = Vec::new();
+        for (entity_id, preds) in &entity_preds {
+            let missing: Vec<String> = expected_set.iter()
+                .filter(|p| !preds.contains(**p))
+                .map(|p| p.to_string())
+                .collect();
+            if !missing.is_empty() {
+                gaps.push((entity_id.clone(), missing));
+            }
+        }
+        gaps.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+        if limit > 0 && gaps.len() > limit {
+            gaps.truncate(limit);
+        }
+        gaps
+    }
+
+    pub fn entity_predicate_counts(&self, entity_id: &str) -> Vec<(String, u64)> {
+        let mut counts: HashMap<String, u64> = HashMap::new();
+        for claim in self.claims.all_claims() {
+            if (claim.subject.id == entity_id || claim.object.id == entity_id)
+                && self.should_include_claim(&claim.claim_id)
+                && self.should_include_namespace(&claim.namespace) {
+                *counts.entry(claim.predicate.id.clone()).or_insert(0) += 1;
+            }
+        }
+        let mut result: Vec<_> = counts.into_iter().collect();
+        result.sort_by(|a, b| b.1.cmp(&a.1));
+        result
+    }
+
+    pub fn entity_source_counts(&self, entity_id: &str) -> Vec<(String, u64, f64)> {
+        let mut sources: HashMap<String, (u64, f64)> = HashMap::new();
+        for claim in self.claims.all_claims() {
+            if (claim.subject.id == entity_id || claim.object.id == entity_id)
+                && self.should_include_claim(&claim.claim_id)
+                && self.should_include_namespace(&claim.namespace) {
+                let entry = sources.entry(claim.provenance.source_id.clone()).or_insert((0, 0.0));
+                entry.0 += 1;
+                entry.1 += claim.confidence;
+            }
+        }
+        let mut result: Vec<_> = sources.into_iter()
+            .map(|(src, (cnt, sum_conf))| (src, cnt, sum_conf / cnt as f64))
+            .collect();
+        result.sort_by(|a, b| b.1.cmp(&a.1));
+        result
     }
 }
 

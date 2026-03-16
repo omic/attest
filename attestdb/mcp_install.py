@@ -1,7 +1,7 @@
 """Universal MCP installer for coding tools.
 
 Configures the Attest MCP server for Claude Code, Cursor, Windsurf,
-Codex, and other MCP-compatible coding tools.
+Codex, Gemini CLI, and other MCP-compatible coding tools.
 
 Usage:
     attest-mcp install                      # Auto-detect tools, project scope
@@ -72,6 +72,14 @@ TOOLS = {
             "project": lambda: Path(".mcp.json"),  # Codex reads .mcp.json
         },
     },
+    "gemini": {
+        "name": "Gemini CLI",
+        "detect": lambda: shutil.which("gemini") is not None,
+        "config_paths": {
+            "project": lambda: Path(".gemini") / "settings.json",
+            "user": lambda: Path.home() / ".gemini" / "settings.json",
+        },
+    },
 }
 
 
@@ -92,8 +100,36 @@ def _find_attest_mcp() -> str:
     return found or ""
 
 
+def _load_cloud_config() -> dict | None:
+    """Load cloud config from ~/.attest/cloud.json if it exists."""
+    cloud_path = DEFAULT_MEMORY_DIR / "cloud.json"
+    if not cloud_path.exists():
+        return None
+    try:
+        return json.loads(cloud_path.read_text())
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
 def _mcp_server_entry() -> dict:
-    """Build the MCP server config entry."""
+    """Build the MCP server config entry.
+
+    If ~/.attest/cloud.json exists, returns a remote MCP config pointing
+    to the cloud endpoint.  Otherwise returns a local stdio config.
+    """
+    cloud = _load_cloud_config()
+    if cloud and cloud.get("endpoint") and cloud.get("api_key"):
+        # Cloud mode — point MCP client at the cloud endpoint
+        endpoint = cloud["endpoint"].rstrip("/")
+        return {
+            "type": "url",
+            "url": f"{endpoint}/mcp",
+            "headers": {
+                "Authorization": f"Bearer {cloud['api_key']}",
+            },
+        }
+
+    # Local mode — launch attest-mcp as a subprocess
     attest_mcp = _find_attest_mcp()
     if not attest_mcp:
         # Fall back to module invocation

@@ -1,8 +1,8 @@
 //! attest-store: Storage engine for Attest.
 //!
 //! Provides a claim store with pluggable backends:
-//! - In-memory backend with file persistence (original implementation)
-//! - redb B+ tree backend for disk-efficient storage (Phase 2)
+//! - In-memory backend (`:memory:` databases)
+//! - LMDB backend via heed (default for file-backed databases)
 //!
 //! # Architecture
 //!
@@ -11,16 +11,12 @@
 //! - [`UnionFind`] — Alias resolution via union-find with path compression
 //! - [`MetadataStore`] — Vocabulary, predicate constraint, and schema registry
 //! - [`RustStore`] — Top-level API with backend dispatch
-//!
-//! # Persistence
-//!
-//! Store state is serialized to a single file with a verified header
-//! (magic bytes, version, CRC32 checksum). See [`file_format`].
 
 pub mod backend;
 pub mod claim_log;
 pub mod entity_store;
 pub mod file_format;
+pub mod journal;
 pub mod metadata;
 pub mod store;
 pub mod union_find;

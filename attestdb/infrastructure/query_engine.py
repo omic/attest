@@ -26,8 +26,10 @@ from attestdb.core.types import (
 )
 from attestdb.core.vocabulary import (
     OPPOSITE_PREDICATES,
+    PREDICATE_COMPOSITION,
     QUANTITATIVE_SCHEMAS,
     SYMMETRIC_PREDICATES,
+    compose_predicates,
 )
 
 # Recency bonus: 7-day half-life
@@ -102,6 +104,32 @@ class QueryEngine:
         allowed_predicates = set(predicate_types) if predicate_types else None
         now_ns = time.time_ns()
 
+        # Build inverse pairs and transitive set from predicate constraints.
+        # inverse_of: bidirectional map — inverse_of["causes"] = "caused_by"
+        # and inverse_of["caused_by"] = "causes".
+        # Used to flip predicates when the focal entity is in the object position.
+        inverse_of: dict[str, str] = {}
+        transitive_preds: set[str] = set()
+        try:
+            constraints = self._store.get_predicate_constraints()
+            for pred_id, meta in constraints.items():
+                if isinstance(meta, dict):
+                    inv = meta.get("inverse")
+                    if inv:
+                        inverse_of[pred_id] = inv
+                    if meta.get("transitive"):
+                        transitive_preds.add(pred_id)
+        except Exception:
+            pass
+
+        # Expand allowed_predicates to include inverses
+        if allowed_predicates and inverse_of:
+            expanded = set(allowed_predicates)
+            for pred in list(allowed_predicates):
+                if pred in inverse_of:
+                    expanded.add(inverse_of[pred])
+            allowed_predicates = expanded
+
         # STEP 1: Resolve focal entity
         canonical = self._store.resolve(normalize_entity_id(focal_entity))
         raw_entity = self._store.get_entity(canonical)
@@ -118,6 +146,11 @@ class QueryEngine:
         visited_entities.update(aliases)
         frontier: set[str] = set(aliases)
         seen_claim_ids: set[str] = set()
+        # Track path predicates for transitive synthesis:
+        # entity_id -> list of (predicate_id, confidence, claim_id) chains from focal
+        path_chains: dict[str, list[list[tuple[str, float, str]]]] = {}
+        for a in aliases:
+            path_chains[a] = []
 
         for hop in range(1, depth + 1):
             if not frontier:
@@ -149,6 +182,19 @@ class QueryEngine:
                     if other not in visited_entities:
                         next_frontier.add(other)
                         visited_entities.add(other)
+                    # Track path chains for transitive synthesis
+                    if transitive_preds and other not in aliases:
+                        pred_id = claim.predicate.id
+                        # Resolve to canonical direction if this is an inverse
+                        if pred_id in inverse_of and (claim.object.id == eid or claim.object.id in visited_entities):
+                            pred_id = inverse_of[pred_id]
+                        step = (pred_id, claim.confidence, claim.claim_id)
+                        parent_chains = path_chains.get(eid, [])
+                        if parent_chains:
+                            for chain in parent_chains:
+                                path_chains.setdefault(other, []).append(chain + [step])
+                        else:
+                            path_chains.setdefault(other, []).append([step])
             frontier = next_frontier
 
         # STEP 3: Score and rank (using Tier 2 confidence with corroboration)
@@ -179,10 +225,18 @@ class QueryEngine:
         scored.sort(key=lambda x: x[2], reverse=True)
         scored = scored[:max_claims]
 
-        # STEP 4: Group by relationship
+        # STEP 4: Group by relationship (with inverse flipping)
         relationships: dict[tuple[str, str, str], Relationship] = {}
         for claim, hop, score, from_eid in scored:
-            key = (claim.subject.id, claim.predicate.id, claim.object.id)
+            pred_id = claim.predicate.id
+            is_inv = False
+            # Flip inverse predicates when the focal entity is in the object position.
+            # E.g. claim "disease caused_by gene" when querying gene → show "gene causes disease"
+            if pred_id in inverse_of and (claim.object.id == from_eid or claim.object.id in aliases):
+                pred_id = inverse_of[pred_id]
+                is_inv = True
+
+            key = (claim.subject.id, pred_id, claim.object.id)
             # Determine which entity is the "other" (not the one we traversed from)
             if claim.subject.id == from_eid or claim.subject.id in aliases:
                 other_summary = EntitySummary(
@@ -204,14 +258,15 @@ class QueryEngine:
                 corroborating = _content_cache.get(claim.content_id, [claim])
                 n_indep = count_independent_sources(corroborating)
                 relationships[key] = Relationship(
-                    predicate=claim.predicate.id,
+                    predicate=pred_id,
                     target=other_summary,
                     confidence=tier2_confidence(claim, corroborating),
                     n_independent_sources=n_indep,
                     source_types=[claim.provenance.source_type],
                     latest_claim_timestamp=claim.timestamp,
                     payload=claim.payload.data if claim.payload else None,
-                    is_symmetric=claim.predicate.id in SYMMETRIC_PREDICATES,
+                    is_symmetric=pred_id in SYMMETRIC_PREDICATES,
+                    is_inverse=is_inv,
                 )
             else:
                 rel = relationships[key]
@@ -229,6 +284,12 @@ class QueryEngine:
                 )
                 if claim.payload and not rel.payload:
                     rel.payload = claim.payload.data
+
+        # STEP 4b: Synthesize transitive relationships
+        if transitive_preds and depth >= 2:
+            self._synthesize_transitive(
+                relationships, path_chains, transitive_preds, aliases, canonical,
+            )
 
         # STEP 5: Extract quantitative data
         quantitative: list[QuantitativeClaim] = []
@@ -343,6 +404,57 @@ class QueryEngine:
                 pass  # narrative generation requires attestdb-intelligence
 
         return frame
+
+    @staticmethod
+    def _synthesize_transitive(
+        relationships: dict[tuple[str, str, str], Relationship],
+        path_chains: dict[str, list[list[tuple[str, float, str]]]],
+        transitive_preds: set[str],
+        aliases: set[str],
+        canonical: str,
+    ) -> None:
+        """Add synthetic transitive relationships for multi-hop chains."""
+        for entity_id, chains in path_chains.items():
+            if entity_id in aliases:
+                continue
+            for chain in chains:
+                if len(chain) < 2:
+                    continue
+                # Check all hops use transitive predicates
+                preds = [pred for pred, _, _ in chain]
+                if not all(p in transitive_preds for p in preds):
+                    continue
+                # Compose the chain predicate
+                composed = preds[0]
+                for p in preds[1:]:
+                    composed = compose_predicates(composed, p)
+                # Confidence = product × 0.9^(hops-1) dampening
+                conf = 1.0
+                for _, c, _ in chain:
+                    conf *= c
+                conf *= 0.9 ** (len(chain) - 1)
+                claim_ids = [cid for _, _, cid in chain]
+                # Only add if no direct relationship already exists
+                key = (canonical, composed, entity_id)
+                if key in relationships:
+                    continue
+                # Need entity info — look up from store via existing relationships
+                target_summary = None
+                for (_, _, oid), rel in relationships.items():
+                    if rel.target.id == entity_id:
+                        target_summary = rel.target
+                        break
+                if target_summary is None:
+                    continue
+                relationships[key] = Relationship(
+                    predicate=composed,
+                    target=target_summary,
+                    confidence=conf,
+                    n_independent_sources=1,
+                    source_types=["transitive_inference"],
+                    is_composed=True,
+                    composition_chain=claim_ids,
+                )
 
     def explain(
         self,
