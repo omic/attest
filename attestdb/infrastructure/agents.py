@@ -373,16 +373,38 @@ def generate_tasks(
         pass  # claims_for_predicate may not exist for all predicates
 
     # Source 1: Blindspots (single-source entities)
+    entity_types_set = set(entity_types) if entity_types else None
     try:
-        blindspots = db.blindspots(min_claims=1)
-        for entity in blindspots.single_source_entities:
-            eid = (
-                entity
-                if isinstance(entity, str)
-                else getattr(entity, "id", str(entity))
-            )
+        if entity_types_set:
+            # Optimized path for large DBs: scan only entities of the requested types
+            # instead of calling blindspots() which scans ALL entities.
+            candidates = []
+            for et in entity_types_set:
+                candidates.extend(db.list_entities(entity_type=et, min_claims=1))
+        else:
+            # Full blindspots scan (fine for small/medium DBs)
+            blindspots = db.blindspots(min_claims=1)
+            candidates = []
+            for entity in blindspots.single_source_entities:
+                eid = (
+                    entity
+                    if isinstance(entity, str)
+                    else getattr(entity, "id", str(entity))
+                )
+                e = db.get_entity(eid)
+                if e:
+                    candidates.append(e)
+
+        for entity in candidates:
+            eid = entity.id if hasattr(entity, "id") else str(entity)
+            etype = entity.entity_type if hasattr(entity, "entity_type") else "unknown"
             if eid in investigating or eid in tasks:
                 continue
+            # For the optimized path, check single-source inline
+            if entity_types_set:
+                src_counts = db._store.entity_source_counts(eid)
+                if len(src_counts) != 1:
+                    continue  # not single-source
             # Skip entities whose only sources are autodidact — don't chase own tail
             claims = db.claims_for(eid)
             if claims and all(
@@ -392,9 +414,6 @@ def generate_tasks(
                 for c in claims
             ):
                 continue
-            # Get entity info
-            e = db.get_entity(eid)
-            etype = e.entity_type if e else "unknown"
             tasks[eid] = ResearchTask(
                 entity_id=eid,
                 entity_type=etype,
@@ -431,6 +450,8 @@ def generate_tasks(
         for entity in entities:
             eid = entity.id
             if eid in investigating or eid in tasks:
+                continue
+            if entity_types_set and entity.entity_type not in entity_types_set:
                 continue
             claims = db.claims_for(eid)
             if not claims:

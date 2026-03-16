@@ -352,6 +352,41 @@ def search_semantic_scholar(query: str, max_results: int = 5) -> str:
 # ---------------------------------------------------------------------------
 
 
+def register_connector_sources(
+    daemon: "AutodidactDaemon",
+    connectors: list,
+    priority: int = 5,
+) -> list[str]:
+    """Register searchable connectors as autodidact evidence sources.
+
+    Connectors with ``supports_search == True`` are wrapped and registered
+    on the daemon. They're tried after web sources (priority 5 by default)
+    since internal data is complementary to public evidence.
+
+    Args:
+        daemon: The AutodidactDaemon to register on.
+        connectors: List of Connector instances.
+        priority: Base priority (lower = tried first). Each connector
+            gets priority + index to maintain stable ordering.
+
+    Returns:
+        List of registered connector names.
+    """
+    registered = []
+    for i, conn in enumerate(connectors):
+        if not getattr(conn, "supports_search", False):
+            continue
+        daemon.register_source(
+            f"connector:{conn.name}",
+            conn.search,
+            cost_per_call=0.0,  # internal data, no API cost
+            priority=priority + i,
+        )
+        registered.append(conn.name)
+        logger.info("Registered connector '%s' as autodidact evidence source", conn.name)
+    return registered
+
+
 def _load_env(path: str) -> None:
     """Load key=value pairs from a .env file into os.environ."""
     try:

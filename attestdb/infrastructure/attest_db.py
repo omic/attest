@@ -888,6 +888,7 @@ class AttestDB:
         max_cost_per_day: float = 1.00,
         search_fn=None,
         sources: str = "auto",
+        connectors: list[str] | None = None,
         gap_types: list[str] | None = None,
         entity_types: list[str] | None = None,
         use_curator: bool = True,
@@ -912,6 +913,10 @@ class AttestDB:
             sources: Source registration mode. "auto" registers PubMed,
                 Semantic Scholar, and paid sources if API keys available.
                 "none" disables auto-registration (gap detection only).
+            connectors: Optional list of connector names (e.g. ["slack", "github"])
+                to register as evidence sources. These connectors must have saved
+                credentials or be pre-configured. Only connectors with search
+                support are registered.
             gap_types: Filter task types (single_source, low_confidence, etc).
             entity_types: Filter by entity type.
             use_curator: Triage extracted claims through curator.
@@ -953,8 +958,28 @@ class AttestDB:
             env_path = os.path.join(os.getcwd(), ".env") if not self._is_memory_db else None
             register_default_sources(self._autodidact, env_path=env_path)
 
+        # Register connector-based evidence sources
+        if connectors:
+            self._register_connector_sources(connectors)
+
         self._autodidact.start()
         return self._autodidact.status
+
+    def _register_connector_sources(self, connector_names: list[str]) -> None:
+        """Instantiate named connectors and register searchable ones as evidence sources."""
+        from attestdb.infrastructure.evidence_sources import register_connector_sources
+
+        instances = []
+        for name in connector_names:
+            try:
+                conn = self.connect(name)
+                instances.append(conn)
+            except Exception as exc:
+                logger.warning("Could not instantiate connector '%s' for autodidact: %s", name, exc)
+        if instances:
+            registered = register_connector_sources(self._autodidact, instances)
+            if registered:
+                logger.info("Autodidact connector sources: %s", registered)
 
     def disable_autodidact(self) -> None:
         """Stop the autodidact daemon."""
