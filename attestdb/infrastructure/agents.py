@@ -374,7 +374,7 @@ def generate_tasks(
 
     # Source 1: Blindspots (single-source entities)
     try:
-        blindspots = db.blindspots(min_claims=3)
+        blindspots = db.blindspots(min_claims=1)
         for entity in blindspots.single_source_entities:
             eid = (
                 entity
@@ -382,6 +382,15 @@ def generate_tasks(
                 else getattr(entity, "id", str(entity))
             )
             if eid in investigating or eid in tasks:
+                continue
+            # Skip entities whose only sources are autodidact — don't chase own tail
+            claims = db.claims_for(eid)
+            if claims and all(
+                (c.provenance.source_id or "").startswith("autodidact:")
+                or (c.provenance.source_id or "").startswith("agent:autodidact")
+                or c.provenance.source_type == "autodidact"
+                for c in claims
+            ):
                 continue
             # Get entity info
             e = db.get_entity(eid)

@@ -19,14 +19,18 @@ if TYPE_CHECKING:
     from attestdb.connectors.base import Connector
     from attestdb.core.types import (
         AuditTrail,
+        AutodidactConfig,
+        AutodidactStatus,
         BlindspotMap,
         ConsensusReport,
+        CycleReport,
         DriftReport,
         HypotheticalReport,
         ImpactReport,
         InvestigationReport,
         ResearchResult,
     )
+    from attestdb.infrastructure.autodidact import AutodidactDaemon
 
 from attestdb.core.hashing import compute_chain_hash, compute_content_id
 from attestdb.core.normalization import normalize_entity_id
@@ -154,6 +158,7 @@ class AttestDB:
         instance._rbac = {}
         instance._rbac_path = None
         instance._rbac_enabled = False
+        instance._autodidact = None
         instance._curator = None
         instance._text_extractor = None
         instance._insight_engine = None
@@ -261,6 +266,9 @@ class AttestDB:
         if not self._is_memory_db:
             self._rbac_path = self._db_path + ".rbac.json"
             self._load_rbac()
+
+        # Autodidact daemon (lazy-init)
+        self._autodidact: "AutodidactDaemon | None" = None
 
         # Lazy-init intelligence components
         self._curator = None
@@ -457,6 +465,9 @@ class AttestDB:
         """Close the database and persist indexes."""
         with _span("attestdb.close"):
             try:
+                if self._autodidact:
+                    self._autodidact.stop()
+                    self._autodidact = None
                 if self._purge_timer:
                     self._purge_timer.cancel()
                     self._purge_timer = None
@@ -866,6 +877,128 @@ class AttestDB:
         self._purge_timer = threading.Timer(interval_seconds, _run_purge)
         self._purge_timer.daemon = True
         self._purge_timer.start()
+
+    # --- Autodidact self-learning ---
+
+    def enable_autodidact(
+        self,
+        interval: float = 3600,
+        max_llm_calls_per_day: int = 100,
+        max_questions_per_cycle: int = 5,
+        max_cost_per_day: float = 1.00,
+        search_fn=None,
+        sources: str = "auto",
+        gap_types: list[str] | None = None,
+        entity_types: list[str] | None = None,
+        use_curator: bool = True,
+        jitter: float = 0.1,
+        negative_result_limit: int = 3,
+        enabled_triggers: list[str] | None = None,
+        trigger_cooldown: float = 60.0,
+    ) -> "AutodidactStatus":
+        """Start the autodidact self-learning daemon.
+
+        The daemon runs in a background thread, continuously detecting
+        knowledge gaps and researching them via registered evidence sources
+        or the enterprise Researcher.
+
+        Args:
+            interval: Seconds between cycles (default 1 hour).
+            max_llm_calls_per_day: Daily LLM call budget (resets at midnight).
+            max_questions_per_cycle: Max tasks per cycle.
+            max_cost_per_day: Estimated dollar cap per day (default $1.00).
+            search_fn: Optional callable(str) -> str for evidence retrieval.
+                Overrides auto-registration of built-in sources.
+            sources: Source registration mode. "auto" registers PubMed,
+                Semantic Scholar, and paid sources if API keys available.
+                "none" disables auto-registration (gap detection only).
+            gap_types: Filter task types (single_source, low_confidence, etc).
+            entity_types: Filter by entity type.
+            use_curator: Triage extracted claims through curator.
+            jitter: Random jitter fraction on sleep interval.
+            negative_result_limit: Skip entities with >= N negative results.
+            enabled_triggers: Event triggers (default: timer, retraction, inquiry).
+            trigger_cooldown: Seconds between event-triggered cycles (default 60).
+
+        Returns:
+            AutodidactStatus after starting.
+        """
+        from attestdb.core.types import AutodidactConfig
+        from attestdb.infrastructure.autodidact import AutodidactDaemon
+
+        if self._autodidact:
+            self._autodidact.stop()
+
+        config = AutodidactConfig(
+            interval_seconds=interval,
+            max_llm_calls_per_day=max_llm_calls_per_day,
+            max_questions_per_cycle=max_questions_per_cycle,
+            max_cost_per_day=max_cost_per_day,
+            gap_types=gap_types,
+            entity_types=entity_types,
+            use_curator=use_curator,
+            jitter=jitter,
+            negative_result_limit=negative_result_limit,
+            enabled_triggers=enabled_triggers or ["timer", "retraction", "inquiry"],
+            trigger_cooldown=trigger_cooldown,
+        )
+        self._autodidact = AutodidactDaemon(self, config)
+
+        if search_fn is not None:
+            self._autodidact.register_source("default", search_fn)
+        elif sources == "auto":
+            # Auto-register built-in sources based on available API keys
+            from attestdb.infrastructure.evidence_sources import register_default_sources
+
+            env_path = os.path.join(os.getcwd(), ".env") if not self._is_memory_db else None
+            register_default_sources(self._autodidact, env_path=env_path)
+
+        self._autodidact.start()
+        return self._autodidact.status
+
+    def disable_autodidact(self) -> None:
+        """Stop the autodidact daemon."""
+        if self._autodidact:
+            self._autodidact.stop()
+            self._autodidact = None
+
+    def autodidact_status(self) -> "AutodidactStatus":
+        """Return current autodidact daemon status."""
+        from attestdb.core.types import AutodidactStatus
+
+        if not self._autodidact:
+            return AutodidactStatus()
+        return self._autodidact.status
+
+    def autodidact_run_now(self) -> None:
+        """Trigger an immediate autodidact cycle."""
+        if self._autodidact:
+            self._autodidact.run_now()
+
+    def autodidact_cost_estimate(self, cycles: int = 24) -> dict:
+        """Estimate cost for N autodidact cycles without running them.
+
+        Args:
+            cycles: Number of cycles to estimate (default 24 = 1 day at 1hr interval).
+
+        Returns:
+            Dict with per_cycle, daily, monthly estimates and breakdown.
+            Returns empty dict if autodidact is not enabled.
+        """
+        if not self._autodidact:
+            return {}
+        return self._autodidact.cost_estimate(cycles)
+
+    def autodidact_history(self, limit: int = 10) -> list["CycleReport"]:
+        """Return recent autodidact cycle reports.
+
+        Args:
+            limit: Max number of reports to return (most recent first).
+        """
+        if not self._autodidact:
+            return []
+        history = self._autodidact.history
+        return list(reversed(history[-limit:]))
 
     # --- Backup / Restore ---
 

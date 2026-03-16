@@ -828,6 +828,67 @@ class Forecast:
 
 
 @dataclass
+class AutodidactConfig:
+    """Configuration for the autodidact self-learning daemon."""
+
+    interval_seconds: float = 3600
+    max_questions_per_cycle: int = 5
+    max_llm_calls_per_day: int = 100
+    max_cost_per_day: float = 1.00     # USD hard cap — stops when reached
+    gap_types: list[str] | None = None
+    entity_types: list[str] | None = None
+    use_curator: bool = True
+    jitter: float = 0.1
+    negative_result_limit: int = 3
+    enabled_triggers: list[str] = field(
+        default_factory=lambda: ["timer", "retraction", "inquiry"]
+    )
+    # Per-operation cost estimates (USD). Override if your LLM provider differs.
+    cost_search_paid: float = 0.002       # Perplexity/Serper per call
+    cost_ingest_text: float = 0.005       # LLM extraction call
+    cost_curator_per_claim: float = 0.001  # Curator triage per claim
+    trigger_cooldown: float = 60.0        # Seconds between event-triggered cycles
+    max_history: int = 100                # Max cycle reports kept in memory
+
+
+@dataclass
+class CycleReport:
+    """Report from a single autodidact cycle."""
+
+    cycle_number: int
+    started_at: float
+    finished_at: float
+    tasks_generated: int = 0
+    tasks_researched: int = 0
+    claims_ingested: int = 0
+    claims_rejected: int = 0
+    negative_results: int = 0
+    llm_calls: int = 0
+    estimated_cost: float = 0.0        # USD estimated for this cycle
+    blindspot_before: int = 0
+    blindspot_after: int = 0
+    trigger: str = "timer"
+    errors: list[str] = field(default_factory=list)
+
+
+@dataclass
+class AutodidactStatus:
+    """Status of the autodidact daemon."""
+
+    enabled: bool = False
+    running: bool = False
+    paused: bool = False
+    cycle_count: int = 0
+    total_claims_ingested: int = 0
+    total_llm_calls_today: int = 0
+    estimated_cost_today: float = 0.0  # USD estimated spend today
+    max_cost_per_day: float = 1.00     # USD cap
+    budget_exhausted: bool = False
+    last_cycle: CycleReport | None = None
+    next_cycle_at: float = 0.0
+
+
+@dataclass
 class MergeConflict:
     """A belief where two databases disagree."""
     content_id: str
