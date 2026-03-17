@@ -441,6 +441,22 @@ impl PyRustStore {
         Ok(())
     }
 
+    /// Batch insert multiple claims in a single LMDB transaction.
+    /// Accepts a list of Python Claim objects (same format as insert_claim).
+    /// Returns the number of claims inserted.
+    fn insert_claims_batch(
+        &mut self,
+        claims: &Bound<'_, PyList>,
+        py: Python<'_>,
+    ) -> PyResult<usize> {
+        let mut rust_claims: Vec<Claim> = Vec::with_capacity(claims.len());
+        for item in claims.iter() {
+            rust_claims.push(claim_from_py(py, &item)?);
+        }
+        let count = self.inner.insert_claims_batch(rust_claims);
+        Ok(count)
+    }
+
     fn claim_exists(&self, claim_id: &str) -> bool {
         self.inner.claim_exists(claim_id)
     }

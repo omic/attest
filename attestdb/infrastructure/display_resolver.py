@@ -7,7 +7,6 @@ No LLM calls, no per-claim cost.
 from __future__ import annotations
 
 import logging
-import re
 from pathlib import Path
 
 from attestdb.core.domain_spec import DomainSpec, EntityTypeSpec
@@ -72,7 +71,7 @@ class DisplayNameResolver:
         mapper.load_gene_info()
 
         lookup = {}
-        for entrez_id, symbol in mapper._entrez_to_symbol.items():
+        for entrez_id, symbol in mapper._entrez_to_symbol.items():  # noqa: SLF001
             lookup[f"Gene_{entrez_id}"] = symbol
         self._lookups[et_spec.entity_type] = lookup
         logger.info(

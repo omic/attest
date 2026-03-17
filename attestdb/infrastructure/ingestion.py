@@ -371,24 +371,70 @@ class IngestionPipeline:
     ) -> BatchResult:
         """Batch ingestion — validates and persists without per-claim corroboration tracking.
 
-        Warms the store's entity/claim caches so existence checks are in-memory.
-        Corroboration (Rule 5) is skipped since it's a logging concern, not a
-        validation gate.
+        Batches entity upserts into a single Rust/LMDB transaction when
+        ``upsert_entities_batch`` is available, reducing transaction count
+        from 3N to N+1 for N claims.
 
         Args:
             on_ingested: Optional callback invoked with each claim_id on successful persist.
         """
         self._store.warm_caches()
         result = BatchResult()
+
+        # Phase 1: Validate all claims
+        validated: list[tuple[Claim, list[float] | None]] = []
         for ci in claims:
             try:
                 claim, embedding = self._validate_and_build(ci)
-                self._persist(claim, embedding)
-                result.ingested += 1
-                if on_ingested is not None:
-                    on_ingested(claim.claim_id)
+                validated.append((claim, embedding))
             except DuplicateClaimError:
                 result.duplicates += 1
             except Exception as e:
                 result.errors.append(str(e))
+
+        if not validated:
+            return result
+
+        # Phase 2: Batch persist — entities + claims in 2 LMDB transactions
+        use_batch = hasattr(self._store, "insert_claims_batch")
+        if use_batch:
+            import json as _json
+            # 2a. Batch entity upserts (1 transaction)
+            entities: dict[str, tuple[str, str, str]] = {}
+            max_ts = 0
+            for claim, _ in validated:
+                subj, obj = claim.subject, claim.object
+                if subj.id not in entities:
+                    ext = _json.dumps(subj.external_ids) if subj.external_ids else "{}"
+                    entities[subj.id] = (subj.entity_type, subj.display_name, ext)
+                if obj.id not in entities:
+                    ext = _json.dumps(obj.external_ids) if obj.external_ids else "{}"
+                    entities[obj.id] = (obj.entity_type, obj.display_name, ext)
+                if claim.timestamp > max_ts:
+                    max_ts = claim.timestamp
+            self._store.upsert_entities_batch(entities, max_ts)
+
+            # 2b. Batch claim inserts (1 transaction per 100K chunk)
+            claim_objects = [claim for claim, _ in validated]
+            result.ingested = self._store.insert_claims_batch(claim_objects)
+
+            # 2c. Embeddings, callbacks, resolver (Python-side)
+            for claim, embedding in validated:
+                if embedding is not None and self._embedding_index is not None:
+                    self._embedding_index.add(claim.claim_id, embedding)
+                if on_ingested is not None:
+                    on_ingested(claim.claim_id)
+                if self._resolver is not None:
+                    for ns, eid in (claim.subject.external_ids or {}).items():
+                        self._resolver.register_external_id(claim.subject.id, ns, eid)
+                    for ns, eid in (claim.object.external_ids or {}).items():
+                        self._resolver.register_external_id(claim.object.id, ns, eid)
+        else:
+            # Fallback: per-claim persist (old wheel without insert_claims_batch)
+            for claim, embedding in validated:
+                self._persist(claim, embedding)
+                result.ingested += 1
+                if on_ingested is not None:
+                    on_ingested(claim.claim_id)
+
         return result
