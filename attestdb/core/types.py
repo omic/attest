@@ -966,6 +966,7 @@ class ProviderResponse:
     latency_ms: float = 0.0
     error: str = ""
     round_number: int = 1
+    cost_usd: float = 0.0
 
 
 @dataclass

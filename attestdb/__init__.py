@@ -68,6 +68,13 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "Forecast": ("attestdb.core.types", "Forecast"),
     "MergeConflict": ("attestdb.core.types", "MergeConflict"),
     "MergeReport": ("attestdb.core.types", "MergeReport"),
+    # Consensus types
+    "JudgeVote": ("attestdb.core.types", "JudgeVote"),
+    "ProviderResponse": ("attestdb.core.types", "ProviderResponse"),
+    "AgentConsensusResult": ("attestdb.core.types", "AgentConsensusResult"),
+    # Consensus engine + chat
+    "ConsensusEngine": ("attestdb.core.consensus", "ConsensusEngine"),
+    "MultiChat": ("attestdb.core.chat", "MultiChat"),
 }
 
 # Backward-compat alias

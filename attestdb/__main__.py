@@ -1,14 +1,16 @@
 """CLI entry point for Attest — python -m attestdb <command>.
 
 Commands:
-    ingest <path>   Ingest claims from chat logs (.zip, .json, .txt, .md)
-    stats <db>      Show database statistics
-    query <db> <e>  Query knowledge around an entity
+    chat              Interactive multi-LLM chat with round-robin consensus
+    ingest <path>     Ingest claims from chat logs (.zip, .json, .txt, .md)
+    stats <db>        Show database statistics
+    query <db> <e>    Query knowledge around an entity
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 
@@ -304,6 +306,26 @@ def cmd_cloud_status(args):
         print(f"Stats:    (unreachable — {e})")
 
 
+def cmd_chat(args):
+    """Launch interactive multi-LLM chat."""
+    from attestdb.infrastructure.attest_db import AttestDB
+    from attestdb.core.chat import MultiChat
+
+    db = AttestDB(args.db, embedding_dim=None)
+    providers = [p.strip() for p in args.providers.split(",")] if args.providers else None
+
+    chat = MultiChat(
+        db=db,
+        providers=providers,
+        primary=args.primary,
+        cwd=os.getcwd(),
+    )
+    try:
+        chat.run()
+    finally:
+        db.close()
+
+
 def cmd_query(args):
     """Query knowledge around an entity."""
     from attestdb.infrastructure.attest_db import AttestDB
@@ -334,6 +356,21 @@ def main():
         description="Attest — the database for knowledge you can verify",
     )
     sub = parser.add_subparsers(dest="command", help="Available commands")
+
+    # --- chat ---
+    p_chat = sub.add_parser("chat", help="Interactive multi-LLM chat with consensus")
+    p_chat.add_argument(
+        "--providers", default=None,
+        help="Comma-separated providers (default: auto-detect all with API keys)",
+    )
+    p_chat.add_argument(
+        "--primary", default=None,
+        help="Primary provider for summarization/synthesis (default: first available)",
+    )
+    p_chat.add_argument(
+        "--db", default="attest.db",
+        help="Database path (default: attest.db)",
+    )
 
     # --- ingest ---
     p_ingest = sub.add_parser("ingest", help="Ingest claims from chat logs")
@@ -434,7 +471,9 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    if args.command == "ingest":
+    if args.command == "chat":
+        cmd_chat(args)
+    elif args.command == "ingest":
         cmd_ingest(args)
     elif args.command == "stats":
         cmd_stats(args)

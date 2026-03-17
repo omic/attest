@@ -899,8 +899,19 @@ def _record_to_claim(record: dict) -> Claim:
     )
 
 
-def export_claims_since(db: "AttestDB", since_ns: int, stream: IO[str]) -> int:
+def export_claims_since(
+    db: "AttestDB",
+    since_ns: int,
+    stream: IO[str],
+    namespace: str | None = None,
+) -> int:
     """Export claims newer than since_ns (nanosecond timestamp) as NDJSON.
+
+    Args:
+        db: AttestDB instance.
+        since_ns: Nanosecond timestamp — export claims newer than this.
+        stream: Writable text stream for NDJSON output.
+        namespace: If set, only export claims from this namespace.
 
     Returns the count of claims exported.
     """
@@ -908,6 +919,8 @@ def export_claims_since(db: "AttestDB", since_ns: int, stream: IO[str]) -> int:
     all_claims = db._all_claims()
     for claim in all_claims:
         if claim.timestamp >= since_ns:
+            if namespace and getattr(claim, "namespace", "") != namespace:
+                continue
             record = _claim_to_record(claim)
             stream.write(
                 json.dumps(record, separators=(",", ":"), default=str) + "\n"
@@ -916,10 +929,24 @@ def export_claims_since(db: "AttestDB", since_ns: int, stream: IO[str]) -> int:
     return count
 
 
-def import_claims_from_stream(db: "AttestDB", stream: IO[str]) -> SyncStats:
+def import_claims_from_stream(
+    db: "AttestDB",
+    stream: IO[str],
+    conflict_policy: str = "keep_both",
+) -> SyncStats:
     """Import claims from an NDJSON stream, skipping duplicates.
 
     Entities are upserted before their claims are inserted.
+    Exact claim_id duplicates are always skipped.
+
+    Args:
+        db: AttestDB instance.
+        stream: Readable text stream of NDJSON records.
+        conflict_policy: How to handle same content_id with different confidence.
+            - "keep_both" (default): import regardless of existing content_id matches.
+            - "keep_higher_confidence": skip if existing claim has higher confidence.
+            - "keep_newer": skip if existing claim has newer timestamp.
+
     Returns sync stats.
     """
     stats = SyncStats()
@@ -937,11 +964,37 @@ def import_claims_from_stream(db: "AttestDB", stream: IO[str]) -> SyncStats:
         if record.get("type") != "claim":
             continue
 
-        # Check if claim already exists
+        # Check if exact claim already exists (by claim_id)
         claim_id = record.get("claim_id", "")
         if db._store.claim_exists(claim_id):
             stats.skipped_duplicate += 1
             continue
+
+        # Apply conflict policy when same content_id exists
+        if conflict_policy != "keep_both":
+            content_id = record.get("content_id", "")
+            if content_id:
+                try:
+                    existing = db._store.claims_by_content_id(content_id)
+                    if existing:
+                        if conflict_policy == "keep_higher_confidence":
+                            max_existing = max(
+                                (c.get("confidence", 0) if isinstance(c, dict) else getattr(c, "confidence", 0))
+                                for c in existing
+                            )
+                            if record.get("confidence", 0) <= max_existing:
+                                stats.skipped_duplicate += 1
+                                continue
+                        elif conflict_policy == "keep_newer":
+                            max_ts = max(
+                                (c.get("timestamp", 0) if isinstance(c, dict) else getattr(c, "timestamp", 0))
+                                for c in existing
+                            )
+                            if record.get("timestamp", 0) <= max_ts:
+                                stats.skipped_duplicate += 1
+                                continue
+                except Exception:
+                    pass  # claims_by_content_id may not exist; fall through to import
 
         try:
             # Upsert entities
@@ -971,17 +1024,165 @@ def import_claims_from_stream(db: "AttestDB", stream: IO[str]) -> SyncStats:
     return stats
 
 
+@dataclass
+class FederationStatus:
+    """Status of the continuous federation daemon."""
+
+    enabled: bool = False
+    remote_url: str = ""
+    cursor: int = 0
+    last_sync_time: float = 0.0
+    total_syncs: int = 0
+    total_imported: int = 0
+    total_exported: int = 0
+    last_error: str = ""
+
+
+class FederationDaemon:
+    """Background thread that continuously syncs with a remote AttestDB instance.
+
+    Same daemon pattern as AutodidactDaemon: background thread with stop event.
+    """
+
+    def __init__(
+        self,
+        db: "AttestDB",
+        remote_url: str,
+        api_key: str,
+        interval: float = 300,
+        conflict_policy: str = "keep_higher_confidence",
+        namespace: str | None = None,
+    ):
+        self.db = db
+        self.remote_url = remote_url
+        self.api_key = api_key
+        self.interval = interval
+        self.conflict_policy = conflict_policy
+        self.namespace = namespace
+        self._stop_event = None
+        self._thread = None
+        self._cursor: int = 0
+        self._total_syncs = 0
+        self._total_imported = 0
+        self._total_exported = 0
+        self._last_sync_time: float = 0.0
+        self._last_error = ""
+
+        # Load cursor from sidecar
+        self._sidecar_path = self._resolve_sidecar()
+        self._load_cursor()
+
+    def _resolve_sidecar(self) -> str | None:
+        db_path = getattr(self.db, "_db_path", None)
+        if db_path and db_path != ":memory:":
+            return db_path + ".federation.json"
+        return None
+
+    def _load_cursor(self) -> None:
+        if not self._sidecar_path:
+            return
+        try:
+            with open(self._sidecar_path) as f:
+                data = json.load(f)
+            self._cursor = data.get("cursor", 0)
+            self._total_syncs = data.get("total_syncs", 0)
+            self._total_imported = data.get("total_imported", 0)
+            self._total_exported = data.get("total_exported", 0)
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+
+    def _save_cursor(self) -> None:
+        if not self._sidecar_path:
+            return
+        try:
+            with open(self._sidecar_path, "w") as f:
+                json.dump({
+                    "cursor": self._cursor,
+                    "remote_url": self.remote_url,
+                    "total_syncs": self._total_syncs,
+                    "total_imported": self._total_imported,
+                    "total_exported": self._total_exported,
+                    "last_sync_time": self._last_sync_time,
+                }, f)
+        except Exception as exc:
+            logger.warning("Failed to save federation cursor: %s", exc)
+
+    def start(self) -> None:
+        import threading
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._stop_event:
+            self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+            self._thread = None
+
+    def _run_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                result = sync_with_remote(
+                    self.db,
+                    self.remote_url,
+                    self.api_key,
+                    since_ns=self._cursor,
+                    conflict_policy=self.conflict_policy,
+                    namespace=self.namespace,
+                )
+                pull = result.get("pull", {})
+                push = result.get("push", {})
+                self._total_imported += pull.get("imported", 0)
+                self._total_exported += push.get("exported", 0)
+                self._total_syncs += 1
+                self._last_sync_time = time.time()
+                self._last_error = ""
+
+                # Advance cursor to now
+                self._cursor = time.time_ns()
+                self._save_cursor()
+            except Exception as exc:
+                self._last_error = str(exc)
+                logger.warning("Federation sync error: %s", exc)
+
+            self._stop_event.wait(self.interval)
+
+    @property
+    def status(self) -> FederationStatus:
+        return FederationStatus(
+            enabled=self._thread is not None and self._thread.is_alive(),
+            remote_url=self.remote_url,
+            cursor=self._cursor,
+            last_sync_time=self._last_sync_time,
+            total_syncs=self._total_syncs,
+            total_imported=self._total_imported,
+            total_exported=self._total_exported,
+            last_error=self._last_error,
+        )
+
+
 def sync_with_remote(
     db: "AttestDB",
     remote_url: str,
     api_key: str,
     since_ns: int = 0,
+    conflict_policy: str = "keep_higher_confidence",
+    namespace: str | None = None,
 ) -> dict:
     """Bidirectional sync with a remote AttestDB instance.
 
     1. Pull: GET remote/api/v1/federation/export?since=<since_ns>
-    2. Import pulled claims
+    2. Import pulled claims (with conflict policy)
     3. Push: POST local claims since since_ns to remote/api/v1/federation/import
+
+    Args:
+        db: AttestDB instance.
+        remote_url: Base URL of the remote AttestDB API.
+        api_key: Bearer token for authentication.
+        since_ns: Nanosecond timestamp — sync claims newer than this.
+        conflict_policy: How to handle content_id conflicts on import.
+        namespace: If set, only export claims from this namespace.
 
     Returns {"pull": SyncStats, "push": {"exported": int, "status_code": int}}.
     """
@@ -993,10 +1194,14 @@ def sync_with_remote(
     pull_stats = SyncStats()
     try:
         pull_url = f"{remote_url.rstrip('/')}/api/v1/federation/export?since={since_ns}"
+        if namespace:
+            pull_url += f"&namespace={namespace}"
         req = urllib.request.Request(pull_url, headers=headers)
         with urllib.request.urlopen(req, timeout=60) as resp:
             text = resp.read().decode("utf-8")
-            pull_stats = import_claims_from_stream(db, io.StringIO(text))
+            pull_stats = import_claims_from_stream(
+                db, io.StringIO(text), conflict_policy=conflict_policy,
+            )
     except Exception as exc:
         logger.error("Pull from %s failed: %s", remote_url, exc)
         pull_stats.errors += 1
@@ -1006,7 +1211,7 @@ def sync_with_remote(
     push_status = 0
     try:
         buf = io.StringIO()
-        push_exported = export_claims_since(db, since_ns, buf)
+        push_exported = export_claims_since(db, since_ns, buf, namespace=namespace)
         if push_exported > 0:
             push_url = f"{remote_url.rstrip('/')}/api/v1/federation/import"
             data = buf.getvalue().encode("utf-8")

@@ -32,6 +32,9 @@ dev = [
     "ruff>=0.4",
     "mypy>=1.8",
 ]
+llm = [
+    "openai>=1.0",
+]
 mcp = [
     "mcp[cli]>=1.0",
 ]
@@ -39,7 +42,7 @@ otel = [
     "opentelemetry-api>=1.20",
 ]
 all = [
-    "attestdb[mcp,otel]",
+    "attestdb[llm,mcp,otel]",
 ]
 
 [project.urls]

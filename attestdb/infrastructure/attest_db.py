@@ -161,6 +161,7 @@ class AttestDB:
         instance._rbac_path = None
         instance._rbac_enabled = False
         instance._autodidact = None
+        instance._federation = None
         instance._decay_config = None
         instance._curator = None
         instance._text_extractor = None
@@ -274,6 +275,9 @@ class AttestDB:
 
         # Autodidact daemon (lazy-init)
         self._autodidact: "AutodidactDaemon | None" = None
+
+        # Federation daemon (lazy-init)
+        self._federation = None
 
         # Confidence decay config (query-time only)
         self._decay_config: "DecayConfig | None" = None
@@ -517,6 +521,9 @@ class AttestDB:
                 if self._autodidact:
                     self._autodidact.stop()
                     self._autodidact = None
+                if self._federation:
+                    self._federation.stop()
+                    self._federation = None
                 if self._purge_timer:
                     self._purge_timer.cancel()
                     self._purge_timer = None
@@ -1082,6 +1089,61 @@ class AttestDB:
             return []
         history = self._autodidact.history
         return list(reversed(history[-limit:]))
+
+    # --- Federation ---
+
+    def enable_federation(
+        self,
+        remote_url: str,
+        api_key: str,
+        interval: float = 300,
+        conflict_policy: str = "keep_higher_confidence",
+        namespace: str | None = None,
+    ) -> "FederationStatus":
+        """Start continuous federation with a remote AttestDB instance.
+
+        Runs a background thread that periodically syncs claims bidirectionally.
+        Cursor is persisted in a `.federation.json` sidecar for resume across restarts.
+
+        Args:
+            remote_url: Base URL of the remote API (e.g. "https://api.attestdb.com").
+            api_key: Bearer token for authentication.
+            interval: Seconds between sync cycles (default 5 min).
+            conflict_policy: "keep_higher_confidence" | "keep_newer" | "keep_both".
+            namespace: If set, only sync claims in this namespace.
+
+        Returns:
+            FederationStatus after starting.
+        """
+        from attestdb.infrastructure.agents import FederationDaemon
+
+        if self._federation:
+            self._federation.stop()
+
+        self._federation = FederationDaemon(
+            self,
+            remote_url=remote_url,
+            api_key=api_key,
+            interval=interval,
+            conflict_policy=conflict_policy,
+            namespace=namespace,
+        )
+        self._federation.start()
+        return self._federation.status
+
+    def disable_federation(self) -> None:
+        """Stop the federation daemon."""
+        if self._federation:
+            self._federation.stop()
+            self._federation = None
+
+    def federation_status(self) -> "FederationStatus":
+        """Return current federation daemon status."""
+        from attestdb.infrastructure.agents import FederationStatus
+
+        if not self._federation:
+            return FederationStatus()
+        return self._federation.status
 
     # --- Backup / Restore ---
 
@@ -6521,7 +6583,7 @@ class AttestDB:
         Returns:
             AgentConsensusResult with synthesized answer and provenance.
         """
-        from attestdb.intelligence.consensus import ConsensusEngine
+        from attestdb.core.consensus import ConsensusEngine
 
         engine = ConsensusEngine(
             providers=providers,

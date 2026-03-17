@@ -2871,6 +2871,7 @@ def agent_consensus(
         "providers_used": result.providers_used,
         "dissents": result.dissents,
         "total_tokens": result.total_tokens,
+        "total_cost": result.total_cost,
         "responses": [
             {
                 "provider": r.provider,
