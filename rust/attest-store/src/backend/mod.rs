@@ -138,6 +138,13 @@ impl StorageBackend for Backend {
         }
     }
 
+    fn update_display_name(&mut self, entity_id: &str, new_display: &str) -> bool {
+        match self {
+            Backend::InMemory(m) => m.update_display_name(entity_id, new_display),
+            Backend::Lmdb(l) => l.update_display_name(entity_id, new_display),
+        }
+    }
+
     fn upsert_entities_batch(
         &mut self,
         entities: &[(String, String, String, HashMap<String, String>)],

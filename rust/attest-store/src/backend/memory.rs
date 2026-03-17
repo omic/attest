@@ -329,6 +329,10 @@ impl MemoryBackend {
             .upsert(entity_id, entity_type, display_name, external_ids, timestamp);
     }
 
+    pub fn update_display_name(&mut self, entity_id: &str, new_display: &str) -> bool {
+        self.entities.update_display_name(entity_id, new_display)
+    }
+
     pub fn get_entity(&self, entity_id: &str) -> Option<EntitySummary> {
         let claim_count = self.claims.count_for_entity(entity_id);
         self.entities.get_summary(entity_id, claim_count)

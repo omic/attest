@@ -395,6 +395,11 @@ impl PyRustStore {
             .upsert_entity(entity_id, entity_type, display_name, external_ids.as_ref(), timestamp);
     }
 
+    /// Update display_name for an existing entity. Returns true if updated.
+    fn update_display_name(&mut self, entity_id: &str, new_display: &str) -> bool {
+        self.inner.update_display_name(entity_id, new_display)
+    }
+
     fn get_entity<'py>(&self, entity_id: &str, py: Python<'py>) -> PyResult<PyObject> {
         match self.inner.get_entity(entity_id) {
             Some(es) => entity_summary_to_dict(py, &es),

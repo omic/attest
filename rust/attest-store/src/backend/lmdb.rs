@@ -1077,6 +1077,43 @@ impl LmdbBackend {
         let _ = wtxn.commit();
     }
 
+    /// Update display_name for an existing entity. Returns true if updated.
+    pub fn update_display_name(&mut self, entity_id: &str, new_display: &str) -> bool {
+        let mut wtxn = match self.env().write_txn() {
+            Ok(t) => t,
+            Err(e) => { log::warn!("update_display_name: {e}"); return false; }
+        };
+
+        let existing: Option<EntityData> = self.dbs.entities.get(&wtxn, entity_id).ok().flatten()
+            .and_then(|data| bincode::deserialize(data).ok());
+
+        if let Some(mut entity) = existing {
+            entity.display_name = new_display.to_string();
+            if let Ok(bytes) = bincode::serialize(&entity) {
+                let _ = self.dbs.entities.put(&mut wtxn, entity_id, &bytes);
+            }
+
+            // Add new display name tokens to TEXT_IDX
+            let mut seen = HashSet::new();
+            for token in tokenize(new_display) {
+                let key = if token.len() > LMDB_MAX_KEY_SIZE {
+                    &token[..LMDB_MAX_KEY_SIZE]
+                } else {
+                    token.as_str()
+                };
+                if seen.insert(key.to_string()) {
+                    let _ = self.dbs.text_idx.put(&mut wtxn, key, entity_id);
+                }
+            }
+
+            let _ = wtxn.commit();
+            true
+        } else {
+            let _ = wtxn.commit();
+            false
+        }
+    }
+
     pub fn upsert_entities_batch(
         &mut self,
         entities: &[(String, String, String, HashMap<String, String>)],

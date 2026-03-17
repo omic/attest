@@ -129,6 +129,27 @@ impl EntityStore {
         self.entities.insert(entity_id.to_string(), data);
     }
 
+    /// Update display_name for an existing entity. Returns true if updated.
+    pub fn update_display_name(&mut self, entity_id: &str, new_display: &str) -> bool {
+        if let Some(entity) = self.entities.get_mut(entity_id) {
+            entity.display_name = new_display.to_string();
+
+            // Update text index: add new tokens
+            let mut seen: HashSet<String> = HashSet::new();
+            for token in tokenize(new_display) {
+                if seen.insert(token.clone()) {
+                    self.text_index
+                        .entry(token)
+                        .or_default()
+                        .push(entity_id.to_string());
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     /// Check if an entity exists.
     pub fn contains(&self, entity_id: &str) -> bool {
         self.entities.contains_key(entity_id)

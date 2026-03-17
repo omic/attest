@@ -90,6 +90,9 @@ pub trait StorageBackend {
         Ok(())
     }
 
+    /// Update display_name for an existing entity. Returns true if updated.
+    fn update_display_name(&mut self, entity_id: &str, new_display: &str) -> bool;
+
     fn get_entity(&self, entity_id: &str) -> Option<EntitySummary>;
 
     /// Batch-lookup entity metadata (type, display_name) for multiple IDs.

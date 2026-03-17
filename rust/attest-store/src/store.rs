@@ -197,6 +197,12 @@ impl RustStore {
         self.backend.upsert_entity(entity_id, entity_type, display_name, external_ids, timestamp);
     }
 
+    /// Update display_name for an existing entity. Returns true if updated.
+    pub fn update_display_name(&mut self, entity_id: &str, new_display: &str) -> bool {
+        if self.read_only { return false; }
+        self.backend.update_display_name(entity_id, new_display)
+    }
+
     /// Batch-upsert entities in a single transaction (LMDB) or loop (in-memory).
     pub fn upsert_entities_batch(
         &mut self,
