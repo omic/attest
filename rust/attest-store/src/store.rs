@@ -1604,6 +1604,111 @@ mod tests {
         assert_eq!(result["brca1"], ("gene".into(), "BRCA1".into()));
         assert!(!result.contains_key("missing"));
     }
+
+    #[test]
+    fn test_insert_claims_batch_memory() {
+        let mut store = RustStore::in_memory();
+        store.upsert_entity("a", "entity", "A", None, 0);
+        store.upsert_entity("b", "entity", "B", None, 0);
+
+        let c1 = make_claim("c1", "a", "rel", "b", "obs");
+        let c2 = make_claim("c2", "a", "inhibits", "b", "exp");
+        let c3 = make_claim("c3", "b", "activates", "a", "lit");
+
+        let inserted = store.insert_claims_batch(vec![c1, c2, c3]);
+        assert_eq!(inserted, 3);
+        assert_eq!(store.stats().total_claims, 3);
+
+        // All claims retrievable
+        assert!(store.claim_exists("c1"));
+        assert!(store.claim_exists("c2"));
+        assert!(store.claim_exists("c3"));
+
+        // Adjacency updated
+        let claims = store.claims_for("a", None, None, 0.0);
+        assert_eq!(claims.len(), 3);
+    }
+
+    #[test]
+    fn test_insert_claims_batch_dedup_memory() {
+        let mut store = RustStore::in_memory();
+        store.upsert_entity("a", "entity", "A", None, 0);
+        store.upsert_entity("b", "entity", "B", None, 0);
+
+        let c1 = make_claim("dup", "a", "rel", "b", "obs");
+        let c1_copy = make_claim("dup", "a", "rel", "b", "obs");
+        let c2 = make_claim("unique", "a", "rel", "b", "exp");
+
+        let inserted = store.insert_claims_batch(vec![c1, c1_copy, c2]);
+        assert_eq!(inserted, 2, "Duplicate claim_id should be skipped");
+        assert_eq!(store.stats().total_claims, 2);
+    }
+
+    #[test]
+    fn test_insert_claims_batch_skips_existing_memory() {
+        let mut store = RustStore::in_memory();
+        store.upsert_entity("a", "entity", "A", None, 0);
+        store.upsert_entity("b", "entity", "B", None, 0);
+
+        // Insert one claim normally
+        store.insert_claim(make_claim("existing", "a", "rel", "b", "obs"));
+        assert_eq!(store.stats().total_claims, 1);
+
+        // Batch includes the existing claim + a new one
+        let batch = vec![
+            make_claim("existing", "a", "rel", "b", "obs"),
+            make_claim("new_one", "a", "inhibits", "b", "exp"),
+        ];
+        let inserted = store.insert_claims_batch(batch);
+        assert_eq!(inserted, 1, "Only new claim should be inserted");
+        assert_eq!(store.stats().total_claims, 2);
+    }
+
+    #[test]
+    fn test_update_display_name_memory() {
+        let mut store = RustStore::in_memory();
+        store.upsert_entity("gene_1956", "gene", "Gene_1956", None, 0);
+
+        // Verify original name
+        let entity = store.get_entity("gene_1956").unwrap();
+        assert_eq!(entity.name, "Gene_1956");
+
+        // Update display name
+        let updated = store.update_display_name("gene_1956", "EGFR");
+        assert!(updated);
+
+        // Verify new name
+        let entity = store.get_entity("gene_1956").unwrap();
+        assert_eq!(entity.name, "EGFR");
+    }
+
+    #[test]
+    fn test_update_display_name_nonexistent_memory() {
+        let mut store = RustStore::in_memory();
+
+        // Updating a nonexistent entity returns false
+        let updated = store.update_display_name("missing", "NewName");
+        assert!(!updated);
+    }
+
+    #[test]
+    fn test_update_display_name_search_reindex_memory() {
+        let mut store = RustStore::in_memory();
+        store.upsert_entity("gene_1956", "gene", "Gene_1956", None, 0);
+
+        // Should be searchable by old name
+        let results = store.search_entities("Gene_1956", 10);
+        assert_eq!(results.len(), 1);
+
+        // Update
+        store.update_display_name("gene_1956", "EGFR epidermal growth factor receptor");
+
+        // Should be searchable by new name
+        let results = store.search_entities("EGFR", 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "gene_1956");
+        assert_eq!(results[0].name, "EGFR epidermal growth factor receptor");
+    }
 }
 
 // ── LMDB backend tests ────────────────────────────────────────────────
@@ -2291,5 +2396,158 @@ mod lmdb_tests {
         let retrieved = store.get_claim("test_claim").unwrap();
         assert_eq!(retrieved.subject.display_name, "BRCA1");
         assert_eq!(retrieved.object.display_name, "TP53");
+    }
+
+    #[test]
+    fn test_lmdb_insert_claims_batch_adjacency() {
+        let (path, _guard) = temp_db();
+        let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
+        store.upsert_entity("a", "entity", "A", None, 0);
+        store.upsert_entity("b", "entity", "B", None, 0);
+        store.upsert_entity("c", "entity", "C", None, 0);
+
+        let claims = vec![
+            make_claim("c1", "a", "rel", "b", "obs"),
+            make_claim("c2", "b", "inhibits", "c", "exp"),
+            make_claim("c3", "a", "activates", "c", "lit"),
+        ];
+
+        let inserted = store.insert_claims_batch(claims);
+        assert_eq!(inserted, 3);
+        assert_eq!(store.stats().total_claims, 3);
+
+        // Adjacency works for batch-inserted claims
+        let claims_a = store.claims_for("a", None, None, 0.0);
+        assert_eq!(claims_a.len(), 2); // c1 + c3
+
+        let claims_b = store.claims_for("b", None, None, 0.0);
+        assert_eq!(claims_b.len(), 2); // c1 + c2
+
+        // BFS traversal works
+        assert!(store.path_exists("a", "c", 1)); // direct via c3
+        assert!(store.path_exists("a", "c", 2)); // also via b
+    }
+
+    #[test]
+    fn test_lmdb_insert_claims_batch_skips_existing() {
+        let (path, _guard) = temp_db();
+        let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
+        store.upsert_entity("a", "entity", "A", None, 0);
+        store.upsert_entity("b", "entity", "B", None, 0);
+
+        // Insert one claim normally
+        store.insert_claim(make_claim("existing", "a", "rel", "b", "obs"));
+        assert_eq!(store.stats().total_claims, 1);
+
+        // Batch includes the existing claim + a new one
+        let batch = vec![
+            make_claim("existing", "a", "rel", "b", "obs"),
+            make_claim("new_one", "a", "inhibits", "b", "exp"),
+        ];
+        let inserted = store.insert_claims_batch(batch);
+        assert_eq!(inserted, 1, "Only new claim should be inserted");
+        assert_eq!(store.stats().total_claims, 2);
+    }
+
+    #[test]
+    fn test_lmdb_insert_claims_batch_persists() {
+        let (path, _guard) = temp_db();
+        let path_str = path.to_str().unwrap();
+
+        // Batch insert, then close
+        {
+            let mut store = RustStore::new(path_str).unwrap();
+            store.upsert_entity("a", "entity", "A", None, 0);
+            store.upsert_entity("b", "entity", "B", None, 0);
+
+            let claims = vec![
+                make_claim("c1", "a", "rel", "b", "obs"),
+                make_claim("c2", "a", "inhibits", "b", "exp"),
+            ];
+            let inserted = store.insert_claims_batch(claims);
+            assert_eq!(inserted, 2);
+            store.close().unwrap();
+        }
+
+        // Reopen, verify data survived
+        {
+            let store = RustStore::new(path_str).unwrap();
+            assert!(store.claim_exists("c1"));
+            assert!(store.claim_exists("c2"));
+            assert_eq!(store.stats().total_claims, 2);
+        }
+    }
+
+    #[test]
+    fn test_lmdb_update_display_name() {
+        let (path, _guard) = temp_db();
+        let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
+        store.upsert_entity("gene_1956", "gene", "Gene_1956", None, 0);
+
+        // Verify original name
+        let entity = store.get_entity("gene_1956").unwrap();
+        assert_eq!(entity.name, "Gene_1956");
+
+        // Update display name
+        let updated = store.update_display_name("gene_1956", "EGFR");
+        assert!(updated);
+
+        // Verify new name
+        let entity = store.get_entity("gene_1956").unwrap();
+        assert_eq!(entity.name, "EGFR");
+    }
+
+    #[test]
+    fn test_lmdb_update_display_name_nonexistent() {
+        let (path, _guard) = temp_db();
+        let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
+
+        let updated = store.update_display_name("missing", "NewName");
+        assert!(!updated);
+    }
+
+    #[test]
+    fn test_lmdb_update_display_name_search_reindex() {
+        let (path, _guard) = temp_db();
+        let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
+        store.upsert_entity("gene_1956", "gene", "Gene_1956", None, 0);
+
+        // Searchable by old name
+        let results = store.search_entities("Gene_1956", 10);
+        assert_eq!(results.len(), 1);
+
+        // Update
+        store.update_display_name("gene_1956", "EGFR epidermal growth factor receptor");
+
+        // Searchable by new name
+        let results = store.search_entities("EGFR", 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "gene_1956");
+        assert_eq!(results[0].name, "EGFR epidermal growth factor receptor");
+    }
+
+    #[test]
+    fn test_lmdb_update_display_name_persists() {
+        let (path, _guard) = temp_db();
+        let path_str = path.to_str().unwrap();
+
+        // Update, close
+        {
+            let mut store = RustStore::new(path_str).unwrap();
+            store.upsert_entity("gene_1956", "gene", "Gene_1956", None, 0);
+            store.update_display_name("gene_1956", "EGFR");
+            store.close().unwrap();
+        }
+
+        // Reopen, verify
+        {
+            let store = RustStore::new(path_str).unwrap();
+            let entity = store.get_entity("gene_1956").unwrap();
+            assert_eq!(entity.name, "EGFR");
+
+            // Search index also persisted
+            let results = store.search_entities("EGFR", 10);
+            assert_eq!(results.len(), 1);
+        }
     }
 }
