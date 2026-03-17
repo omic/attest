@@ -435,10 +435,9 @@ impl PyRustStore {
 
     // ── Claim operations ───────────────────────────────────────────
 
-    fn insert_claim(&mut self, claim: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<()> {
+    fn insert_claim(&mut self, claim: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<bool> {
         let c = claim_from_py(py, claim)?;
-        self.inner.insert_claim(c);
-        Ok(())
+        Ok(self.inner.insert_claim(c))
     }
 
     /// Batch insert multiple claims in a single LMDB transaction.

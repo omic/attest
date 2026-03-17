@@ -46,8 +46,10 @@ const META_KEY_NEXT_SEQ: &str = "next_seq";
 /// Current schema version.
 const CURRENT_SCHEMA_VERSION: u32 = 3;
 
-/// LMDB max key size (default). Keys exceeding this are truncated or skipped.
-const LMDB_MAX_KEY_SIZE: usize = 511;
+/// Safe ceiling for LMDB key/DUP_SORT data values.
+/// LMDB hard limit is 511 bytes; we stay 21 bytes under so compound keys
+/// (entity_id + separator + predicate_id) have room.
+const LMDB_MAX_KEY: usize = 490;
 
 /// Default LMDB map size: 1 GB.
 /// This is virtual address space (costs nothing until pages are touched).
@@ -651,6 +653,14 @@ impl LmdbBackend {
             .map_err(|e| lmdb_err("serialize claim", e))?;
         let bytes = Self::compress_claim(&raw_bytes)?;
 
+        // LMDB enforces a 511-byte max key size, and DUP_SORT databases enforce
+        // the same limit on data values. Only object.id realistically exceeds this
+        // (hypothesis text, paper conclusions ~500 chars). We skip object-side
+        // secondary index entries rather than truncate, since truncation would
+        // corrupt lookup semantics. The claim is still retrievable via the primary
+        // claims table, claim_id_idx, content_id_idx, and other indexes.
+        let obj_fits = claim.object.id.len() <= LMDB_MAX_KEY;
+
         // CLAIMS: seq → compressed bytes
         self.dbs.claims.put(wtxn, &seq, &bytes)
             .map_err(|e| lmdb_err("put claims", e))?;
@@ -663,21 +673,20 @@ impl LmdbBackend {
         self.dbs.content_id_idx.put(wtxn, &claim.content_id, &seq)
             .map_err(|e| lmdb_err("put content_id_idx", e))?;
 
-        // ENTITY_CLAIMS_IDX (subject + object) — skip oversized keys
-        if claim.subject.id.len() <= LMDB_MAX_KEY_SIZE {
-            self.dbs.entity_claims_idx.put(wtxn, &claim.subject.id, &seq)
-                .map_err(|e| lmdb_err("put entity_claims_idx", e))?;
-        }
-        if claim.object.id != claim.subject.id && claim.object.id.len() <= LMDB_MAX_KEY_SIZE {
+        // ENTITY_CLAIMS_IDX (subject + object)
+        // Subject IDs are always short (normalized entity IDs). Skip object side
+        // when object.id exceeds LMDB key limit.
+        self.dbs.entity_claims_idx.put(wtxn, &claim.subject.id, &seq)
+            .map_err(|e| lmdb_err("put entity_claims_idx", e))?;
+        if obj_fits && claim.object.id != claim.subject.id {
             self.dbs.entity_claims_idx.put(wtxn, &claim.object.id, &seq)
                 .map_err(|e| lmdb_err("put entity_claims_idx", e))?;
         }
 
-        // ADJACENCY_IDX (bidirectional, skip self-loops and oversized keys)
-        if claim.subject.id != claim.object.id
-            && claim.subject.id.len() <= LMDB_MAX_KEY_SIZE
-            && claim.object.id.len() <= LMDB_MAX_KEY_SIZE
-        {
+        // ADJACENCY_IDX (bidirectional, skip self-loops)
+        // DUP_SORT data values are also limited to 511 bytes, so skip entirely
+        // when object.id would overflow either the key or the data slot.
+        if obj_fits && claim.subject.id != claim.object.id {
             self.dbs.adjacency_idx.put(wtxn, &claim.subject.id, &claim.object.id)
                 .map_err(|e| lmdb_err("put adjacency_idx", e))?;
             self.dbs.adjacency_idx.put(wtxn, &claim.object.id, &claim.subject.id)
@@ -688,20 +697,16 @@ impl LmdbBackend {
         self.dbs.timestamp_idx.put(wtxn, &claim.timestamp, &seq)
             .map_err(|e| lmdb_err("put timestamp_idx", e))?;
 
-        // SOURCE_IDX — skip oversized source_id
-        if claim.provenance.source_id.len() <= LMDB_MAX_KEY_SIZE {
-            self.dbs.source_idx.put(wtxn, &claim.provenance.source_id, &seq)
-                .map_err(|e| lmdb_err("put source_idx", e))?;
-        }
+        // SOURCE_IDX — source_id is always short (source names)
+        self.dbs.source_idx.put(wtxn, &claim.provenance.source_id, &seq)
+            .map_err(|e| lmdb_err("put source_idx", e))?;
 
-        // PREDICATE_IDX — skip oversized predicate_id
-        if claim.predicate.id.len() <= LMDB_MAX_KEY_SIZE {
-            self.dbs.predicate_idx.put(wtxn, &claim.predicate.id, &seq)
-                .map_err(|e| lmdb_err("put predicate_idx", e))?;
-        }
+        // PREDICATE_IDX — predicate_id is always short
+        self.dbs.predicate_idx.put(wtxn, &claim.predicate.id, &seq)
+            .map_err(|e| lmdb_err("put predicate_idx", e))?;
 
         // NAMESPACE_IDX — skip empty namespace (LMDB doesn't allow zero-length keys)
-        if !claim.namespace.is_empty() && claim.namespace.len() <= LMDB_MAX_KEY_SIZE {
+        if !claim.namespace.is_empty() {
             self.dbs.namespace_idx.put(wtxn, &claim.namespace, &seq)
                 .map_err(|e| lmdb_err("put namespace_idx", e))?;
         }
@@ -720,43 +725,47 @@ impl LmdbBackend {
                 .map_err(|e| lmdb_err("put claim_summaries", e))?;
 
             // entity_pred_counts: "{entity_id}\x1F{predicate_id}" → count
+            // Truncate object_id in compound key to stay under 511 bytes.
             {
                 let key_subj = format!("{}\x1F{}", &claim.subject.id, &claim.predicate.id);
-                if key_subj.len() <= LMDB_MAX_KEY_SIZE {
-                    Self::increment_counter(wtxn, &self.dbs.entity_pred_counts, &key_subj)?;
-                }
+                Self::increment_counter(wtxn, &self.dbs.entity_pred_counts, &key_subj)?;
                 if claim.object.id != claim.subject.id {
-                    let key_obj = format!("{}\x1F{}", &claim.object.id, &claim.predicate.id);
-                    if key_obj.len() <= LMDB_MAX_KEY_SIZE {
-                        Self::increment_counter(wtxn, &self.dbs.entity_pred_counts, &key_obj)?;
-                    }
+                    let obj_id = Self::truncate_to_bytes(&claim.object.id, LMDB_MAX_KEY);
+                    let key_obj = format!("{}\x1F{}", obj_id, &claim.predicate.id);
+                    Self::increment_counter(wtxn, &self.dbs.entity_pred_counts, &key_obj)?;
                 }
             }
 
             // entity_src_counts: "{entity_id}\x1F{source_id}" → (count, sum_conf)
             {
                 let key_subj = format!("{}\x1F{}", &claim.subject.id, &claim.provenance.source_id);
-                if key_subj.len() <= LMDB_MAX_KEY_SIZE {
-                    Self::increment_conf_counter(wtxn, &self.dbs.entity_src_counts, &key_subj, claim.confidence)?;
-                }
+                Self::increment_conf_counter(wtxn, &self.dbs.entity_src_counts, &key_subj, claim.confidence)?;
                 if claim.object.id != claim.subject.id {
-                    let key_obj = format!("{}\x1F{}", &claim.object.id, &claim.provenance.source_id);
-                    if key_obj.len() <= LMDB_MAX_KEY_SIZE {
-                        Self::increment_conf_counter(wtxn, &self.dbs.entity_src_counts, &key_obj, claim.confidence)?;
-                    }
+                    let obj_id = Self::truncate_to_bytes(&claim.object.id, 470);
+                    let key_obj = format!("{}\x1F{}", obj_id, &claim.provenance.source_id);
+                    Self::increment_conf_counter(wtxn, &self.dbs.entity_src_counts, &key_obj, claim.confidence)?;
                 }
             }
 
             // pred_pair_counts: "{predicate_id}\x1F{subject_id}\x1F{object_id}" → (count, sum_conf)
+            // Truncate the entire compound key to stay under 511 bytes.
             {
-                let key = format!("{}\x1F{}\x1F{}", &claim.predicate.id, &claim.subject.id, &claim.object.id);
-                if key.len() <= LMDB_MAX_KEY_SIZE {
-                    Self::increment_conf_counter(wtxn, &self.dbs.pred_pair_counts, &key, claim.confidence)?;
-                }
+                let raw_key = format!("{}\x1F{}\x1F{}", &claim.predicate.id, &claim.subject.id, &claim.object.id);
+                let key = Self::truncate_to_bytes(&raw_key, 500);
+                Self::increment_conf_counter(wtxn, &self.dbs.pred_pair_counts, key, claim.confidence)?;
             }
         }
 
         Ok(())
+    }
+
+    /// Truncate a string to at most `max_bytes` bytes at a UTF-8 character boundary.
+    #[inline]
+    fn truncate_to_bytes(s: &str, max_bytes: usize) -> &str {
+        if s.len() <= max_bytes { return s; }
+        let mut end = max_bytes;
+        while !s.is_char_boundary(end) { end -= 1; }
+        &s[..end]
     }
 
     /// Whether a claim should be included in query results.
@@ -1011,7 +1020,7 @@ impl LmdbBackend {
         external_ids: Option<&HashMap<String, String>>,
         timestamp: i64,
     ) {
-        if entity_id.len() > LMDB_MAX_KEY_SIZE || entity_type.len() > LMDB_MAX_KEY_SIZE {
+        if entity_id.len() > LMDB_MAX_KEY {
             log::warn!("Skipping entity with oversized key ({} bytes): {}...",
                 entity_id.len(), &entity_id[..entity_id.len().min(80)]);
             return;
@@ -1059,11 +1068,7 @@ impl LmdbBackend {
         // Update TEXT_IDX
         let mut seen = HashSet::new();
         for token in tokenize(display).into_iter().chain(tokenize(entity_id)) {
-            let key = if token.len() > LMDB_MAX_KEY_SIZE {
-                &token[..LMDB_MAX_KEY_SIZE]
-            } else {
-                token.as_str()
-            };
+            let key = Self::truncate_to_bytes(&token, LMDB_MAX_KEY);
             if seen.insert(key.to_string()) {
                 let _ = self.dbs.text_idx.put(&mut wtxn, key, entity_id);
             }
@@ -1096,8 +1101,8 @@ impl LmdbBackend {
             // Add new display name tokens to TEXT_IDX
             let mut seen = HashSet::new();
             for token in tokenize(new_display) {
-                let key = if token.len() > LMDB_MAX_KEY_SIZE {
-                    &token[..LMDB_MAX_KEY_SIZE]
+                let key = if token.len() > LMDB_MAX_KEY {
+                    &token[..LMDB_MAX_KEY]
                 } else {
                     token.as_str()
                 };
@@ -1126,7 +1131,7 @@ impl LmdbBackend {
 
         for (entity_id, entity_type, display_name, external_ids) in entities {
             // Skip entities whose ID exceeds LMDB max key size
-            if entity_id.len() > LMDB_MAX_KEY_SIZE || entity_type.len() > LMDB_MAX_KEY_SIZE {
+            if entity_id.len() > LMDB_MAX_KEY || entity_type.len() > LMDB_MAX_KEY {
                 log::warn!("Skipping entity with oversized key ({} bytes): {}...",
                     entity_id.len(), &entity_id[..entity_id.len().min(80)]);
                 continue;
@@ -1166,8 +1171,8 @@ impl LmdbBackend {
             let mut seen = HashSet::new();
             for token in tokenize(display).into_iter().chain(tokenize(entity_id)) {
                 // Truncate tokens exceeding LMDB max key size
-                let key = if token.len() > LMDB_MAX_KEY_SIZE {
-                    &token[..LMDB_MAX_KEY_SIZE]
+                let key = if token.len() > LMDB_MAX_KEY {
+                    &token[..LMDB_MAX_KEY]
                 } else {
                     token.as_str()
                 };
@@ -1864,26 +1869,29 @@ impl LmdbBackend {
                     // src_type_counts
                     *src_type_counts.entry(claim.provenance.source_type.clone()).or_insert(0) += 1;
 
-                    // entity_pred_counts
+                    // entity_pred_counts (truncate object_id for compound key)
                     let key_subj = format!("{}\x1F{}", &claim.subject.id, &claim.predicate.id);
                     *entity_pred_counts.entry(key_subj).or_insert(0) += 1;
                     if claim.object.id != claim.subject.id {
-                        let key_obj = format!("{}\x1F{}", &claim.object.id, &claim.predicate.id);
+                        let obj_id = Self::truncate_to_bytes(&claim.object.id, LMDB_MAX_KEY);
+                        let key_obj = format!("{}\x1F{}", obj_id, &claim.predicate.id);
                         *entity_pred_counts.entry(key_obj).or_insert(0) += 1;
                     }
 
-                    // entity_src_counts
+                    // entity_src_counts (truncate object_id for compound key)
                     let key_subj_src = format!("{}\x1F{}", &claim.subject.id, &claim.provenance.source_id);
                     let e = entity_src_counts.entry(key_subj_src).or_insert((0, 0.0));
                     e.0 += 1; e.1 += claim.confidence;
                     if claim.object.id != claim.subject.id {
-                        let key_obj_src = format!("{}\x1F{}", &claim.object.id, &claim.provenance.source_id);
+                        let obj_id = Self::truncate_to_bytes(&claim.object.id, 470);
+                        let key_obj_src = format!("{}\x1F{}", obj_id, &claim.provenance.source_id);
                         let e = entity_src_counts.entry(key_obj_src).or_insert((0, 0.0));
                         e.0 += 1; e.1 += claim.confidence;
                     }
 
-                    // pred_pair_counts
-                    let key_pair = format!("{}\x1F{}\x1F{}", &claim.predicate.id, &claim.subject.id, &claim.object.id);
+                    // pred_pair_counts (truncate entire compound key)
+                    let raw_key = format!("{}\x1F{}\x1F{}", &claim.predicate.id, &claim.subject.id, &claim.object.id);
+                    let key_pair = Self::truncate_to_bytes(&raw_key, 500).to_string();
                     let e = pred_pair_counts.entry(key_pair).or_insert((0, 0.0));
                     e.0 += 1; e.1 += claim.confidence;
 
@@ -1961,28 +1969,22 @@ impl LmdbBackend {
                 .map_err(|e| lmdb_err("put entity_type_counts", e))?;
         }
         for (k, v) in &entity_pred_counts {
-            if k.len() <= LMDB_MAX_KEY_SIZE {
-                self.dbs.entity_pred_counts.put(&mut wtxn, k, v)
-                    .map_err(|e| lmdb_err("put entity_pred_counts", e))?;
-            }
+            self.dbs.entity_pred_counts.put(&mut wtxn, k, v)
+                .map_err(|e| lmdb_err("put entity_pred_counts", e))?;
         }
         for (k, (count, sum)) in &entity_src_counts {
-            if k.len() <= LMDB_MAX_KEY_SIZE {
-                let mut buf = [0u8; 16];
-                buf[..8].copy_from_slice(&count.to_le_bytes());
-                buf[8..].copy_from_slice(&sum.to_le_bytes());
-                self.dbs.entity_src_counts.put(&mut wtxn, k, &buf)
-                    .map_err(|e| lmdb_err("put entity_src_counts", e))?;
-            }
+            let mut buf = [0u8; 16];
+            buf[..8].copy_from_slice(&count.to_le_bytes());
+            buf[8..].copy_from_slice(&sum.to_le_bytes());
+            self.dbs.entity_src_counts.put(&mut wtxn, k, &buf)
+                .map_err(|e| lmdb_err("put entity_src_counts", e))?;
         }
         for (k, (count, sum)) in &pred_pair_counts {
-            if k.len() <= LMDB_MAX_KEY_SIZE {
-                let mut buf = [0u8; 16];
-                buf[..8].copy_from_slice(&count.to_le_bytes());
-                buf[8..].copy_from_slice(&sum.to_le_bytes());
-                self.dbs.pred_pair_counts.put(&mut wtxn, k, &buf)
-                    .map_err(|e| lmdb_err("put pred_pair_counts", e))?;
-            }
+            let mut buf = [0u8; 16];
+            buf[..8].copy_from_slice(&count.to_le_bytes());
+            buf[8..].copy_from_slice(&sum.to_le_bytes());
+            self.dbs.pred_pair_counts.put(&mut wtxn, k, &buf)
+                .map_err(|e| lmdb_err("put pred_pair_counts", e))?;
         }
 
         // Write remaining summaries
@@ -2424,35 +2426,28 @@ impl LmdbBackend {
             // Write counter updates
             let mut wtxn = env.write_txn().map_err(|e| lmdb_err("begin_write", e))?;
             for s in &chunk {
-                // entity_pred_counts
+                // entity_pred_counts (truncate object_id for compound key)
                 let key_subj = format!("{}\x1F{}", &s.subject_id, &s.predicate_id);
-                if key_subj.len() <= LMDB_MAX_KEY_SIZE {
-                    Self::increment_counter(&mut wtxn, &self.dbs.entity_pred_counts, &key_subj)?;
-                }
+                Self::increment_counter(&mut wtxn, &self.dbs.entity_pred_counts, &key_subj)?;
                 if s.object_id != s.subject_id {
-                    let key_obj = format!("{}\x1F{}", &s.object_id, &s.predicate_id);
-                    if key_obj.len() <= LMDB_MAX_KEY_SIZE {
-                        Self::increment_counter(&mut wtxn, &self.dbs.entity_pred_counts, &key_obj)?;
-                    }
+                    let obj_id = Self::truncate_to_bytes(&s.object_id, LMDB_MAX_KEY);
+                    let key_obj = format!("{}\x1F{}", obj_id, &s.predicate_id);
+                    Self::increment_counter(&mut wtxn, &self.dbs.entity_pred_counts, &key_obj)?;
                 }
 
-                // entity_src_counts
+                // entity_src_counts (truncate object_id for compound key)
                 let key_subj_src = format!("{}\x1F{}", &s.subject_id, &s.source_id);
-                if key_subj_src.len() <= LMDB_MAX_KEY_SIZE {
-                    Self::increment_conf_counter(&mut wtxn, &self.dbs.entity_src_counts, &key_subj_src, s.confidence)?;
-                }
+                Self::increment_conf_counter(&mut wtxn, &self.dbs.entity_src_counts, &key_subj_src, s.confidence)?;
                 if s.object_id != s.subject_id {
-                    let key_obj_src = format!("{}\x1F{}", &s.object_id, &s.source_id);
-                    if key_obj_src.len() <= LMDB_MAX_KEY_SIZE {
-                        Self::increment_conf_counter(&mut wtxn, &self.dbs.entity_src_counts, &key_obj_src, s.confidence)?;
-                    }
+                    let obj_id = Self::truncate_to_bytes(&s.object_id, 470);
+                    let key_obj_src = format!("{}\x1F{}", obj_id, &s.source_id);
+                    Self::increment_conf_counter(&mut wtxn, &self.dbs.entity_src_counts, &key_obj_src, s.confidence)?;
                 }
 
-                // pred_pair_counts
-                let key_pair = format!("{}\x1F{}\x1F{}", &s.predicate_id, &s.subject_id, &s.object_id);
-                if key_pair.len() <= LMDB_MAX_KEY_SIZE {
-                    Self::increment_conf_counter(&mut wtxn, &self.dbs.pred_pair_counts, &key_pair, s.confidence)?;
-                }
+                // pred_pair_counts (truncate entire compound key)
+                let raw_key = format!("{}\x1F{}\x1F{}", &s.predicate_id, &s.subject_id, &s.object_id);
+                let key_pair = Self::truncate_to_bytes(&raw_key, 500);
+                Self::increment_conf_counter(&mut wtxn, &self.dbs.pred_pair_counts, key_pair, s.confidence)?;
             }
             wtxn.commit().map_err(|e| lmdb_err("commit", e))?;
 
