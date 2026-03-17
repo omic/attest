@@ -22,6 +22,10 @@ logger = logging.getLogger(__name__)
 # Import shared provider configs
 from attestdb.core.providers import PROVIDERS, load_env_file as _load_env_file
 
+# Default to open/free models for the OSS consensus engine.
+# These providers offer free tiers or very cheap rates.
+OPEN_PROVIDERS = ["gemini", "groq", "deepseek", "together", "glm"]
+
 # Per-1K-token pricing (USD). Input/output rates for default models.
 # Updated March 2026. Free-tier providers show 0.0.
 PROVIDER_PRICING: dict[str, dict[str, float]] = {
@@ -90,8 +94,12 @@ class ConsensusEngine:
     ):
         """Auto-detect available providers from API keys in environment.
 
+        Defaults to open/free providers (Gemini, Groq, DeepSeek, Together, GLM).
+        Pass providers=list(PROVIDERS.keys()) to use all available providers
+        including proprietary ones.
+
         Args:
-            providers: Filter to specific providers. None = auto-detect all available.
+            providers: Filter to specific providers. None = open providers only.
             model_overrides: Override default models, e.g. {"openai": "gpt-4o"}.
             env_path: Path to .env file for API key resolution.
         """
@@ -103,7 +111,7 @@ class ConsensusEngine:
         if env_path:
             env_vars = _load_env_file(env_path)
 
-        candidate_providers = providers or list(PROVIDERS.keys())
+        candidate_providers = providers or OPEN_PROVIDERS
 
         for name in candidate_providers:
             provider = PROVIDERS.get(name)
@@ -257,14 +265,30 @@ class ConsensusEngine:
         )
 
     def _initial_prompt(self, question: str, context: str) -> list[dict]:
-        """Build the initial prompt messages."""
-        system = (
-            "You are a knowledgeable expert. Give a thorough, accurate answer. "
-            "Be specific and cite mechanisms, evidence, or reasoning where possible."
-        )
-        user_content = question
+        """Build the initial prompt messages.
+
+        If context contains evidence from a knowledge database, providers
+        evaluate that evidence rather than answering from training data alone.
+        """
         if context:
-            user_content = f"Context:\n{context}\n\nQuestion: {question}"
+            system = (
+                "You are an expert evaluating claims from a knowledge database. "
+                "Below you will see existing claims with their sources, confidence "
+                "levels, and corroboration status. Your job is to:\n"
+                "1. Assess whether the evidence supports the question being asked\n"
+                "2. Identify which claims are well-supported and which are weak\n"
+                "3. Synthesize the evidence into a thorough answer\n"
+                "4. Note any gaps, contradictions, or areas needing more evidence\n\n"
+                "Ground your answer in the provided evidence. Cite specific sources "
+                "and confidence levels. If the evidence is insufficient, say so."
+            )
+            user_content = f"Evidence from knowledge database:\n{context}\n\nQuestion: {question}"
+        else:
+            system = (
+                "You are a knowledgeable expert. Give a thorough, accurate answer. "
+                "Be specific and cite mechanisms, evidence, or reasoning where possible."
+            )
+            user_content = question
         return [
             {"role": "system", "content": system},
             {"role": "user", "content": user_content},
@@ -504,12 +528,20 @@ class ConsensusEngine:
         critiques: dict[str, str] | None = None,
     ) -> list[dict]:
         """Build messages for round N+1: include all prior responses + critiques."""
-        system = (
-            "You are a knowledgeable expert participating in a multi-expert review. "
-            "Other experts have reviewed all responses and provided feedback. "
-            "Revise your answer to address their critiques and produce the best "
-            "possible answer."
-        )
+        if context:
+            system = (
+                "You are an expert evaluating evidence from a knowledge database, "
+                "participating in a multi-expert review. Other experts have reviewed "
+                "all responses and provided feedback. Revise your answer to address "
+                "their critiques. Stay grounded in the evidence provided."
+            )
+        else:
+            system = (
+                "You are a knowledgeable expert participating in a multi-expert review. "
+                "Other experts have reviewed all responses and provided feedback. "
+                "Revise your answer to address their critiques and produce the best "
+                "possible answer."
+            )
 
         # Find this provider's own prior response
         own_response = ""

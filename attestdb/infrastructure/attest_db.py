@@ -6555,6 +6555,66 @@ class AttestDB:
         )
 
 
+    def _gather_consensus_evidence(self, question: str, max_claims: int = 50) -> str:
+        """Pull relevant claims from the DB to ground consensus in real evidence.
+
+        Uses text_search to find claims related to the question, then formats
+        them with source, confidence, and corroboration info so LLM providers
+        can evaluate actual evidence instead of answering from training data.
+
+        Returns empty string if no relevant claims found.
+        """
+        try:
+            claims = self.text_search(question, top_k=max_claims)
+        except Exception:
+            return ""
+
+        if not claims:
+            return ""
+
+        # Group by content_id for corroboration counts
+        content_groups: dict[str, list] = {}
+        for c in claims:
+            content_groups.setdefault(c.content_id, []).append(c)
+
+        lines = []
+        seen_content = set()
+        for claim in claims:
+            if claim.content_id in seen_content:
+                continue
+            seen_content.add(claim.content_id)
+
+            corroboration = len(content_groups.get(claim.content_id, []))
+            sources = sorted({
+                c.provenance.source_id if c.provenance else "unknown"
+                for c in content_groups.get(claim.content_id, [])
+            })
+
+            subj = claim.subject.display_name or claim.subject.id
+            pred = claim.predicate.id
+            obj = claim.object.display_name or claim.object.id
+            line = (
+                f"- {subj} {pred} {obj} "
+                f"[confidence: {claim.confidence:.2f}, "
+                f"sources: {', '.join(sources)}"
+            )
+            if corroboration > 1:
+                line += f", corroborated by {corroboration} independent sources"
+            line += "]"
+            lines.append(line)
+
+            if len(lines) >= 30:  # cap evidence to keep prompts reasonable
+                break
+
+        if not lines:
+            return ""
+
+        return (
+            f"Found {len(lines)} relevant claims"
+            f" ({len(claims)} total including corroborations):\n"
+            + "\n".join(lines)
+        )
+
     def agent_consensus(
         self,
         question: str,
@@ -6584,6 +6644,10 @@ class AttestDB:
             AgentConsensusResult with synthesized answer and provenance.
         """
         from attestdb.core.consensus import ConsensusEngine
+
+        # Pull evidence from the DB to ground the consensus in real data
+        if not context:
+            context = self._gather_consensus_evidence(question)
 
         engine = ConsensusEngine(
             providers=providers,

@@ -536,6 +536,191 @@ class BrowserChat:
             print(response)
             print()
 
+    async def _run_tournament(self, max_rounds: int = 5):
+        """Tournament: providers iteratively improve and score each other until convergence.
+
+        Each round:
+          1. Each provider sees the other providers' latest responses
+          2. Each provider revises their answer AND scores all responses (including their own)
+          3. If all providers agree on the same winner → consensus. Otherwise → next round.
+        """
+        responses = {
+            name: session.last_response
+            for name, session in self.sessions.items()
+            if session.last_response
+        }
+        if len(responses) < 2:
+            print(_color("system", "Need at least 2 responses to start a tournament. Send a message first."))
+            return
+
+        provider_names = list(responses.keys())
+        provider_list_str = ", ".join(provider_names)
+
+        for round_num in range(1, max_rounds + 1):
+            print(_color("system", f"─── Tournament Round {round_num}/{max_rounds} ───"))
+            print()
+
+            # Build per-provider prompts: show others' responses, ask to revise + score
+            tasks = {}
+            for name, session in self.sessions.items():
+                if name not in responses:
+                    continue
+
+                others_text = "\n\n".join(
+                    f"=== {p} ===\n{r}"
+                    for p, r in responses.items()
+                    if p != name
+                )
+
+                prompt = (
+                    f"We put your question into other LLMs and they said the following:\n\n"
+                    f"{others_text}\n\n"
+                    f"Now do two things:\n"
+                    f"1. Give your REVISED best answer, considering what the other models said. "
+                    f"Where do you agree? Where do you still disagree and why?\n"
+                    f"2. After your answer, on a new line write SCORES: and rate each response "
+                    f"(including your own previous one) from 1-10 for accuracy, completeness, "
+                    f"and clarity. Format: SCORES: {provider_list_str} = X, Y, Z\n"
+                    f"   Example: SCORES: {', '.join(f'{p} = 8' for p in provider_names)}\n\n"
+                    f"Start with your revised answer:"
+                )
+                tasks[name] = asyncio.create_task(self._send_message(session, prompt))
+
+            # Collect revised responses + scores
+            scores_by_judge: dict[str, dict[str, int]] = {}
+
+            for provider, task in tasks.items():
+                response = await task
+                if not response:
+                    continue
+
+                # Parse score line from response
+                revised, provider_scores = self._parse_tournament_response(
+                    response, provider_names,
+                )
+                responses[provider] = revised
+                if provider_scores:
+                    scores_by_judge[provider] = provider_scores
+
+                # Print revised response
+                header = f"─── {provider} (round {round_num}) ───"
+                print(_color(provider, header))
+                # Show just the answer, not the scores line
+                print(revised[:3000] if len(revised) > 3000 else revised)
+                if provider_scores:
+                    scores_str = "  ".join(f"{p}: {s}/10" for p, s in provider_scores.items())
+                    print(_color("system", f"  Scores: {scores_str}"))
+                print()
+
+            # Check convergence: do all judges agree on the same winner?
+            if len(scores_by_judge) >= 2:
+                winners = {}
+                for judge, scores in scores_by_judge.items():
+                    if scores:
+                        best = max(scores, key=scores.get)
+                        winners[judge] = best
+
+                # Count how many judges picked each winner
+                winner_counts: dict[str, int] = {}
+                for w in winners.values():
+                    winner_counts[w] = winner_counts.get(w, 0) + 1
+
+                n_judges = len(winners)
+                top_winner = max(winner_counts, key=winner_counts.get) if winner_counts else None
+                top_count = winner_counts.get(top_winner, 0) if top_winner else 0
+
+                # Compute average scores
+                avg_scores: dict[str, float] = {}
+                for p in provider_names:
+                    vals = [s.get(p, 0) for s in scores_by_judge.values() if p in s]
+                    avg_scores[p] = sum(vals) / len(vals) if vals else 0
+
+                avg_str = "  ".join(f"{p}: {s:.1f}" for p, s in sorted(avg_scores.items(), key=lambda x: -x[1]))
+                print(_color("system", f"  Average scores: {avg_str}"))
+
+                # Unanimous or all agree
+                if top_count == n_judges:
+                    print()
+                    print(_color("consensus", f"─── CONSENSUS: {top_winner} wins (unanimous, round {round_num}) ───"))
+                    print(responses[top_winner])
+                    print()
+                    self._record_consensus_winner(top_winner, top_count / n_judges)
+                    return
+
+                # Supermajority (all but one agree) with 3+ judges
+                if n_judges >= 3 and top_count >= n_judges - 1:
+                    dissenters = [j for j, w in winners.items() if w != top_winner]
+                    print()
+                    print(_color("consensus", f"─── CONSENSUS: {top_winner} wins ({top_count}/{n_judges} agree, round {round_num}) ───"))
+                    if dissenters:
+                        print(_color("system", f"  Dissent from: {', '.join(dissenters)}"))
+                    print(responses[top_winner])
+                    print()
+                    self._record_consensus_winner(top_winner, top_count / n_judges)
+                    return
+
+                # No consensus yet — show who voted for whom
+                vote_str = ", ".join(f"{j} → {w}" for j, w in winners.items())
+                print(_color("system", f"  Votes: {vote_str} (no consensus yet)"))
+                print()
+
+        # Max rounds reached without full consensus
+        print(_color("system", f"─── Tournament ended after {max_rounds} rounds (no full consensus) ───"))
+        # Show final average scores
+        if scores_by_judge:
+            avg_scores = {}
+            for p in provider_names:
+                vals = [s.get(p, 0) for s in scores_by_judge.values() if p in s]
+                avg_scores[p] = sum(vals) / len(vals) if vals else 0
+            best_avg = max(avg_scores, key=avg_scores.get)
+            print(_color("system", f"  Best by average score: {best_avg} ({avg_scores[best_avg]:.1f}/10)"))
+            print()
+            print(_color("consensus", f"─── BEST ANSWER: {best_avg} ───"))
+            print(responses[best_avg])
+            print()
+            self._record_consensus_winner(best_avg, avg_scores[best_avg] / 10)
+
+    def _parse_tournament_response(
+        self, response: str, provider_names: list[str],
+    ) -> tuple[str, dict[str, int]]:
+        """Extract the revised answer and SCORES: line from a tournament response.
+
+        Returns (revised_answer, {provider: score}).
+        """
+        scores: dict[str, int] = {}
+        lines = response.split("\n")
+
+        # Find the SCORES: line (search from the end)
+        scores_line_idx = -1
+        for i in range(len(lines) - 1, -1, -1):
+            if "SCORES:" in lines[i].upper():
+                scores_line_idx = i
+                break
+
+        if scores_line_idx >= 0:
+            scores_text = lines[scores_line_idx]
+            # Remove the SCORES: prefix
+            scores_part = scores_text.split(":", 1)[-1].strip()
+
+            # Parse "chatgpt = 8, claude = 9, gemini = 7" style
+            for provider in provider_names:
+                # Look for "provider = N" or "provider: N"
+                import re
+                pattern = re.compile(
+                    rf"{re.escape(provider)}\s*[=:]\s*(\d+)",
+                    re.IGNORECASE,
+                )
+                match = pattern.search(scores_part)
+                if match:
+                    scores[provider] = min(int(match.group(1)), 10)
+
+            # Revised answer is everything before the SCORES line
+            revised = "\n".join(lines[:scores_line_idx]).strip()
+        else:
+            revised = response.strip()
+
+        return revised, scores
+
     def _record_consensus_winner(self, winner: str, confidence: float):
         """Record which provider won consensus."""
         if not self.db:
@@ -579,7 +764,7 @@ class BrowserChat:
             self._judge_client, self._judge_model, self._judge_name = _init_judge_client()
             judge_info = f" | Judge: {self._judge_name} API (free)" if self._judge_name else " | Judge: browser fallback"
         print(f"Working directory: {self.cwd}{judge_info}")
-        print(f"Use @filename to include files. Commands: /share /consensus /quit /help")
+        print(f"Use @filename to include files. Commands: /tournament /share /consensus /quit /help")
         print()
 
         try:
@@ -603,14 +788,21 @@ class BrowserChat:
                         await self._share_responses()
                     elif cmd == "/consensus":
                         await self._run_consensus()
+                    elif cmd == "/tournament":
+                        # Parse optional max_rounds: /tournament 5
+                        parts = user_input.split()
+                        max_rounds = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 5
+                        await self._run_tournament(max_rounds=max_rounds)
                     elif cmd == "/providers":
                         for name, session in self.sessions.items():
                             status = "logged in" if session.logged_in else "not logged in"
                             print(f"  {_color(name, name)}: {status}, {session.call_count} messages")
                     elif cmd == "/help":
                         print("Commands:")
-                        print("  /share       — Share all responses cross-provider for revision")
-                        print("  /consensus   — Judge all responses + synthesize best answer")
+                        print("  /share       — One round: share responses cross-provider for revision")
+                        print("  /tournament  — Loop: providers improve + score each other until they agree")
+                        print("  /tournament N — Same, with max N rounds (default: 5)")
+                        print("  /consensus   — Quick judge via free API (Gemini/Groq)")
                         print("  /providers   — List active providers")
                         print("  /quit        — Exit")
                     else:

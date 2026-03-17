@@ -1,6 +1,6 @@
 [project]
 name = "attestdb"
-version = "0.1.19"
+version = "0.1.20"
 description = "The database for knowledge you can verify"
 readme = "README.md"
 license = {text = "BSL-1.1"}
@@ -33,6 +33,10 @@ dev = [
     "mypy>=1.8",
 ]
 llm = [
+    "openai>=1.0",
+]
+browser = [
+    "playwright>=1.40",
     "openai>=1.0",
 ]
 mcp = [

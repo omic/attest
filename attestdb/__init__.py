@@ -75,6 +75,7 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     # Consensus engine + chat
     "ConsensusEngine": ("attestdb.core.consensus", "ConsensusEngine"),
     "MultiChat": ("attestdb.core.chat", "MultiChat"),
+    "BrowserChat": ("attestdb.core.browser_chat", "BrowserChat"),
 }
 
 # Backward-compat alias

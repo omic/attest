@@ -309,21 +309,35 @@ def cmd_cloud_status(args):
 def cmd_chat(args):
     """Launch interactive multi-LLM chat."""
     from attestdb.infrastructure.attest_db import AttestDB
-    from attestdb.core.chat import MultiChat
 
     db = AttestDB(args.db, embedding_dim=None)
     providers = [p.strip() for p in args.providers.split(",")] if args.providers else None
 
-    chat = MultiChat(
-        db=db,
-        providers=providers,
-        primary=args.primary,
-        cwd=os.getcwd(),
-    )
-    try:
-        chat.run()
-    finally:
-        db.close()
+    mode = getattr(args, "mode", "browser")
+
+    if mode == "api":
+        from attestdb.core.chat import MultiChat
+        chat = MultiChat(
+            db=db,
+            providers=providers,
+            primary=args.primary,
+            cwd=os.getcwd(),
+        )
+        try:
+            chat.run()
+        finally:
+            db.close()
+    else:
+        # Browser mode (default)
+        from attestdb.core.browser_chat import run_browser_chat
+        try:
+            run_browser_chat(
+                db=db,
+                providers=providers,
+                cwd=os.getcwd(),
+            )
+        finally:
+            db.close()
 
 
 def cmd_query(args):
@@ -360,12 +374,19 @@ def main():
     # --- chat ---
     p_chat = sub.add_parser("chat", help="Interactive multi-LLM chat with consensus")
     p_chat.add_argument(
+        "--mode", choices=["browser", "api"], default="browser",
+        help="browser (default): Playwright automation of ChatGPT/Claude/Gemini. "
+             "api: use provider APIs directly (requires API keys)",
+    )
+    p_chat.add_argument(
         "--providers", default=None,
-        help="Comma-separated providers (default: auto-detect all with API keys)",
+        help="Comma-separated providers. "
+             "Browser mode: chatgpt,claude,gemini (default: all three). "
+             "API mode: openai,gemini,deepseek,etc (default: auto-detect from keys)",
     )
     p_chat.add_argument(
         "--primary", default=None,
-        help="Primary provider for summarization/synthesis (default: first available)",
+        help="Primary provider for summarization (API mode only)",
     )
     p_chat.add_argument(
         "--db", default="attest.db",
