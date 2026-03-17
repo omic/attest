@@ -6493,6 +6493,156 @@ class AttestDB:
         )
 
 
+    def agent_consensus(
+        self,
+        question: str,
+        context: str = "",
+        max_rounds: int = 3,
+        convergence_threshold: float = 0.8,
+        providers: list[str] | None = None,
+        model_overrides: dict[str, str] | None = None,
+        ingest: bool = True,
+    ) -> "AgentConsensusResult":
+        """Query multiple LLM providers, cross-pollinate, converge, and optionally
+        ingest the consensus as claims.
+
+        Each provider's response is stored as a claim with source_id=provider_name.
+        The final consensus is stored with source_type="agent_consensus".
+
+        Args:
+            question: The question to get consensus on.
+            context: Optional document/chat context.
+            max_rounds: Maximum cross-pollination rounds.
+            convergence_threshold: Agreement score (0-1) to declare convergence.
+            providers: Filter to specific providers.
+            model_overrides: Override default models, e.g. {"openai": "gpt-4o"}.
+            ingest: If True, store consensus and individual responses as claims.
+
+        Returns:
+            AgentConsensusResult with synthesized answer and provenance.
+        """
+        from attestdb.intelligence.consensus import ConsensusEngine
+
+        engine = ConsensusEngine(
+            providers=providers,
+            model_overrides=model_overrides,
+            env_path=os.path.join(os.path.dirname(self._db_path or ""), ".env")
+            if self._db_path and self._db_path != ":memory:" else None,
+        )
+        result = engine.run(
+            question=question,
+            context=context,
+            max_rounds=max_rounds,
+            convergence_threshold=convergence_threshold,
+            providers=providers,
+        )
+
+        from attestdb.core.types import (
+            AgentConsensusResult,
+            JudgeVote as JVType,
+            ProviderResponse as PRType,
+        )
+
+        # Convert to shared types
+        typed_responses = [
+            PRType(
+                provider=r.provider,
+                model=r.model,
+                response=r.response,
+                tokens_in=r.tokens_in,
+                tokens_out=r.tokens_out,
+                latency_ms=r.latency_ms,
+                error=r.error,
+                round_number=r.round_number,
+            )
+            for r in result.responses
+        ]
+
+        typed_votes = [
+            JVType(
+                provider=v.provider,
+                converged=v.converged,
+                best_provider=v.best_provider,
+                rating=v.rating,
+                critique=v.critique,
+            )
+            for v in result.votes
+        ]
+
+        consensus_result = AgentConsensusResult(
+            question=result.question,
+            consensus=result.consensus,
+            confidence=result.confidence,
+            rounds=result.rounds,
+            providers_used=result.providers_used,
+            responses=typed_responses,
+            dissents=result.dissents,
+            votes=typed_votes,
+            total_tokens=result.total_tokens,
+            total_cost=result.total_cost,
+            converged=result.converged,
+        )
+
+        if ingest and result.consensus:
+            # Ingest individual provider responses
+            for r in result.responses:
+                if r.error or not r.response:
+                    continue
+                try:
+                    self.ingest(ClaimInput(
+                        subject=("question:" + question[:100], "question"),
+                        predicate=("has_response", "agent_response"),
+                        object=(r.provider + ":" + r.model, "llm_provider"),
+                        provenance={
+                            "source_id": r.provider,
+                            "source_type": "llm_api",
+                            "method": "agent_consensus",
+                            "model_version": r.model,
+                        },
+                        confidence=result.confidence,
+                        payload={
+                            "schema_ref": "agent_consensus/response/v1",
+                            "data": {
+                                "response": r.response[:4000],
+                                "round": r.round_number,
+                                "tokens_in": r.tokens_in,
+                                "tokens_out": r.tokens_out,
+                                "latency_ms": r.latency_ms,
+                            },
+                        },
+                    ))
+                except Exception as exc:
+                    logger.warning("Failed to ingest response from %s: %s", r.provider, exc)
+
+            # Ingest consensus
+            try:
+                self.ingest(ClaimInput(
+                    subject=("question:" + question[:100], "question"),
+                    predicate=("has_consensus", "agent_consensus"),
+                    object=("consensus:" + question[:80], "consensus_answer"),
+                    provenance={
+                        "source_id": "agent_consensus",
+                        "source_type": "agent_consensus",
+                        "method": f"multi_llm_{len(result.providers_used)}",
+                    },
+                    confidence=result.confidence,
+                    payload={
+                        "schema_ref": "agent_consensus/result/v1",
+                        "data": {
+                            "consensus": result.consensus[:4000],
+                            "rounds": result.rounds,
+                            "converged": result.converged,
+                            "providers": result.providers_used,
+                            "total_tokens": result.total_tokens,
+                        },
+                    },
+                ))
+            except Exception as exc:
+                logger.warning("Failed to ingest consensus: %s", exc)
+
+        return consensus_result
+
+
 # Backward-compat alias
 SubstrateDB = AttestDB
 

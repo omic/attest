@@ -946,6 +946,45 @@ class TemporalResult:
 
 
 @dataclass
+class JudgeVote:
+    """A single provider's judgment on whether the group has converged."""
+    provider: str
+    converged: bool                  # does this provider think we've converged?
+    best_provider: str = ""          # who gave the best answer?
+    rating: int = 0                  # 1-10 agreement rating
+    critique: str = ""               # what's still wrong / missing
+
+
+@dataclass
+class ProviderResponse:
+    """A single LLM provider's response in a consensus round."""
+    provider: str
+    model: str
+    response: str
+    tokens_in: int = 0
+    tokens_out: int = 0
+    latency_ms: float = 0.0
+    error: str = ""
+    round_number: int = 1
+
+
+@dataclass
+class AgentConsensusResult:
+    """Result of multi-LLM consensus: synthesized answer with provenance."""
+    question: str
+    consensus: str                          # final synthesized answer
+    confidence: float                       # 0-1 agreement level
+    rounds: int                             # how many rounds it took
+    providers_used: list[str] = field(default_factory=list)
+    responses: list[ProviderResponse] = field(default_factory=list)
+    dissents: list[str] = field(default_factory=list)
+    votes: list[JudgeVote] = field(default_factory=list)
+    total_tokens: int = 0
+    total_cost: float = 0.0
+    converged: bool = False
+
+
+@dataclass
 class MergeConflict:
     """A belief where two databases disagree."""
     content_id: str

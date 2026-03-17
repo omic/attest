@@ -2831,6 +2831,71 @@ def autodidact_history(limit: int = 10) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Consensus (1)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def agent_consensus(
+    question: str,
+    context: str = "",
+    max_rounds: int = 3,
+    providers: str = "",
+) -> str:
+    """Get consensus from multiple AI models on a question.
+
+    Queries all available LLM providers in parallel, shares their responses
+    cross-provider, and iterates until they converge on a best answer.
+    Each model's response and the final consensus are stored as verified claims.
+
+    Args:
+        question: The question to get consensus on.
+        context: Optional document/chat context.
+        max_rounds: Maximum cross-pollination rounds (1 = no cross-pollination).
+        providers: Comma-separated provider names (empty = auto-detect all available).
+    """
+    _track_tool_call("agent_consensus", f"question={question[:80]}")
+    db = _get_db()
+    provider_list = [p.strip() for p in providers.split(",") if p.strip()] or None
+    result = db.agent_consensus(
+        question=question,
+        context=context,
+        max_rounds=max_rounds,
+        providers=provider_list,
+    )
+    return json.dumps({
+        "consensus": result.consensus,
+        "confidence": result.confidence,
+        "converged": result.converged,
+        "rounds": result.rounds,
+        "providers_used": result.providers_used,
+        "dissents": result.dissents,
+        "total_tokens": result.total_tokens,
+        "responses": [
+            {
+                "provider": r.provider,
+                "model": r.model,
+                "response": r.response[:1000],
+                "round": r.round_number,
+                "latency_ms": r.latency_ms,
+                "error": r.error,
+            }
+            for r in result.responses
+        ],
+        "votes": [
+            {
+                "provider": v.provider,
+                "converged": v.converged,
+                "best_provider": v.best_provider,
+                "rating": v.rating,
+                "critique": v.critique,
+            }
+            for v in result.votes
+        ],
+    })
+
+
+# ---------------------------------------------------------------------------
 # Resources (2)
 # ---------------------------------------------------------------------------
 
