@@ -4222,6 +4222,9 @@ class BulkLoader:
             """Convert Monarch CURIE to (attest_id, entity_type, display_name)."""
             if not curie:
                 return None
+            # Reject biolink: predicates leaked into label column (data quality issue)
+            if label.startswith("biolink:"):
+                label = ""
             etype = BIOLINK_CATEGORY_MAP.get(category, "entity")
             prefix = curie.split(":")[0] if ":" in curie else ""
 
