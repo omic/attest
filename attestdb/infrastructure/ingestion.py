@@ -103,6 +103,10 @@ class IngestionPipeline:
         # Rule 1: Normalize entity IDs
         subj_canonical = normalize_entity_id(claim_input.subject[0])
         obj_canonical = normalize_entity_id(claim_input.object[0])
+        if not subj_canonical:
+            raise ValueError("Subject entity ID is empty after normalization")
+        if not obj_canonical:
+            raise ValueError("Object entity ID is empty after normalization")
         subj_type = claim_input.subject[1]
         obj_type = claim_input.object[1]
         pred_id = claim_input.predicate[0]
