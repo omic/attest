@@ -1101,11 +1101,7 @@ impl LmdbBackend {
             // Add new display name tokens to TEXT_IDX
             let mut seen = HashSet::new();
             for token in tokenize(new_display) {
-                let key = if token.len() > LMDB_MAX_KEY {
-                    &token[..LMDB_MAX_KEY]
-                } else {
-                    token.as_str()
-                };
+                let key = Self::truncate_to_bytes(&token, LMDB_MAX_KEY);
                 if seen.insert(key.to_string()) {
                     let _ = self.dbs.text_idx.put(&mut wtxn, key, entity_id);
                 }
@@ -1170,12 +1166,7 @@ impl LmdbBackend {
                 .map_err(|e| lmdb_err("put entity_type_idx", e))?;
             let mut seen = HashSet::new();
             for token in tokenize(display).into_iter().chain(tokenize(entity_id)) {
-                // Truncate tokens exceeding LMDB max key size
-                let key = if token.len() > LMDB_MAX_KEY {
-                    &token[..LMDB_MAX_KEY]
-                } else {
-                    token.as_str()
-                };
+                let key = Self::truncate_to_bytes(&token, LMDB_MAX_KEY);
                 if seen.insert(key.to_string()) {
                     self.dbs.text_idx.put(&mut wtxn, key, entity_id.as_str())
                         .map_err(|e| lmdb_err("put text_idx", e))?;
