@@ -807,7 +807,8 @@ class AttestDB:
 
         Events: "claim_ingested", "source_retracted", "claim_corroborated",
         "inquiry_matched", "snapshot_created", "inquiry_created",
-        "sync_completed", "insight_alerts"
+        "sync_completed", "insight_alerts", "autodidact_cycle_completed",
+        "autodidact_budget_exhausted"
         """
         self._event_hooks.setdefault(event, []).append(callback)
 

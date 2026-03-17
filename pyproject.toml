@@ -1,6 +1,6 @@
 [project]
 name = "attestdb"
-version = "0.1.17"
+version = "0.1.18"
 description = "The database for knowledge you can verify"
 readme = "README.md"
 license = {text = "BSL-1.1"}

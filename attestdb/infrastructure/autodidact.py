@@ -73,7 +73,6 @@ class AutodidactDaemon:
 
         # State (all access must hold self._lock)
         self._running = False
-        self._paused = False
         self._cycle_count = 0
         self._total_claims_ingested = 0
         self._llm_calls_today = 0
@@ -218,8 +217,7 @@ class AutodidactDaemon:
         with self._lock:
             return AutodidactStatus(
                 enabled=self._running,
-                running=self._running and not self._paused,
-                paused=self._paused,
+                running=self._running,
                 cycle_count=self._cycle_count,
                 total_claims_ingested=self._total_claims_ingested,
                 total_llm_calls_today=self._llm_calls_today,

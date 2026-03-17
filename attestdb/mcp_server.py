@@ -2702,6 +2702,135 @@ def openclaw_get_preferences(
 
 
 # ---------------------------------------------------------------------------
+# Autodidact — self-learning daemon control (5 tools)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def autodidact_enable(
+    interval: int = 3600,
+    max_llm_calls_per_day: int = 100,
+    max_questions_per_cycle: int = 5,
+    max_cost_per_day: float = 1.00,
+    sources: str = "auto",
+    gap_types: str = "",
+    entity_types: str = "",
+    use_curator: bool = True,
+) -> str:
+    """Start the autodidact self-learning daemon.
+
+    The daemon runs in a background thread, continuously detecting knowledge gaps
+    and researching them via registered evidence sources (PubMed, Semantic Scholar,
+    Perplexity, Serper — auto-detected from API keys).
+
+    Args:
+        interval: Seconds between cycles (default 3600 = 1 hour).
+        max_llm_calls_per_day: Daily LLM call budget (resets at midnight).
+        max_questions_per_cycle: Max research tasks per cycle.
+        max_cost_per_day: Estimated dollar cap per day (default $1.00).
+        sources: Source mode — "auto" (register sources from API keys) or "none" (gap detection only).
+        gap_types: Comma-separated filter (e.g. "single_source,low_confidence"). Empty = all.
+        entity_types: Comma-separated entity type filter. Empty = all.
+        use_curator: Whether to triage extracted claims through the curator.
+    """
+    _track_tool_call("autodidact_enable", f"interval={interval}")
+    db = _get_db()
+
+    gap_list = [g.strip() for g in gap_types.split(",") if g.strip()] or None
+    entity_list = [e.strip() for e in entity_types.split(",") if e.strip()] or None
+
+    status = db.enable_autodidact(
+        interval=interval,
+        max_llm_calls_per_day=max_llm_calls_per_day,
+        max_questions_per_cycle=max_questions_per_cycle,
+        max_cost_per_day=max_cost_per_day,
+        sources=sources,
+        gap_types=gap_list,
+        entity_types=entity_list,
+        use_curator=use_curator,
+    )
+    return _serialize(status)
+
+
+@mcp.tool()
+def autodidact_disable() -> str:
+    """Stop the autodidact self-learning daemon.
+
+    Gracefully shuts down the background thread. Cycle history is preserved
+    in the knowledge graph as journal claims.
+    """
+    _track_tool_call("autodidact_disable", "")
+    db = _get_db()
+    db.disable_autodidact()
+    return json.dumps({"disabled": True})
+
+
+@mcp.tool()
+def autodidact_status() -> str:
+    """Get the current status of the autodidact daemon.
+
+    Returns enabled state, cycle count, budget usage, cost tracking,
+    and details of the last completed cycle.
+    """
+    _track_tool_call("autodidact_status", "")
+    db = _get_db()
+    status = db.autodidact_status()
+    return _serialize(status)
+
+
+@mcp.tool()
+def autodidact_run_now() -> str:
+    """Trigger an immediate autodidact cycle.
+
+    Wakes the daemon from its sleep interval and runs one research cycle
+    immediately. The daemon must be enabled first via autodidact_enable.
+    """
+    _track_tool_call("autodidact_run_now", "")
+    db = _get_db()
+    if not db._autodidact:
+        return json.dumps({"error": "Autodidact is not enabled. Call autodidact_enable first."})
+    db.autodidact_run_now()
+    return json.dumps({"triggered": True, "message": "Immediate cycle triggered."})
+
+
+@mcp.tool()
+def autodidact_history(limit: int = 10) -> str:
+    """Get recent autodidact cycle reports.
+
+    Returns the most recent cycle reports with details on tasks generated,
+    claims ingested, negative results, cost, and blindspot changes.
+
+    Args:
+        limit: Maximum number of reports to return (default: 10, most recent first).
+    """
+    _track_tool_call("autodidact_history", f"limit={limit}")
+    db = _get_db()
+    reports = db.autodidact_history(limit=limit)
+    return json.dumps({
+        "count": len(reports),
+        "reports": [
+            {
+                "cycle_number": r.cycle_number,
+                "started_at": r.started_at,
+                "finished_at": r.finished_at,
+                "tasks_generated": r.tasks_generated,
+                "tasks_researched": r.tasks_researched,
+                "claims_ingested": r.claims_ingested,
+                "claims_rejected": r.claims_rejected,
+                "negative_results": r.negative_results,
+                "llm_calls": r.llm_calls,
+                "estimated_cost": r.estimated_cost,
+                "blindspot_before": r.blindspot_before,
+                "blindspot_after": r.blindspot_after,
+                "trigger": r.trigger,
+                "errors": r.errors,
+            }
+            for r in reports
+        ],
+    })
+
+
+# ---------------------------------------------------------------------------
 # Resources (2)
 # ---------------------------------------------------------------------------
 

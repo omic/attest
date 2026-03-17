@@ -1769,6 +1769,12 @@ class BulkLoader:
                 # Register entities
                 if gene_canonical not in entities:
                     display = gene_symbol if gene_symbol else gene_eid
+                    if display == gene_eid and mapper is not None and gene_eid.startswith("Gene_"):
+                        entrez_str = gene_eid[5:]
+                        if entrez_str.isdigit():
+                            sym = mapper.entrez_to_symbol(int(entrez_str))
+                            if sym:
+                                display = sym
                     entities[gene_canonical] = ("gene", display, "{}")
                 if go_canonical not in entities:
                     entities[go_canonical] = (go_type, go_name or go_id, "{}")
@@ -1854,7 +1860,8 @@ class BulkLoader:
             logger.warning("CTD gene-disease download failed: %s", e)
             return None
 
-    def load_ctd_chem_gene(self, path: str, human_only: bool = True) -> BatchResult:
+    def load_ctd_chem_gene(self, path: str, human_only: bool = True,
+                           mapper: GeneIDMapper | None = None) -> BatchResult:
         """Load CTD chemical-gene interactions.
 
         CTD uses NCBI Gene IDs and MeSH chemical IDs directly.
@@ -1913,6 +1920,12 @@ class BulkLoader:
                 # Register entities
                 if gene_canonical not in entities:
                     display = gene_symbol if gene_symbol else gene_eid
+                    if display == gene_eid and mapper is not None and gene_eid.startswith("Gene_"):
+                        entrez_str = gene_eid[5:]
+                        if entrez_str.isdigit():
+                            sym = mapper.entrez_to_symbol(int(entrez_str))
+                            if sym:
+                                display = sym
                     ext = json.dumps({"entrez": gene_id_str}) if gene_id_str else "{}"
                     entities[gene_canonical] = ("gene", display, ext)
                 if chem_canonical not in entities:
@@ -1951,7 +1964,8 @@ class BulkLoader:
         )
         return result
 
-    def load_ctd_gene_disease(self, path: str, direct_only: bool = True) -> BatchResult:
+    def load_ctd_gene_disease(self, path: str, direct_only: bool = True,
+                              mapper: GeneIDMapper | None = None) -> BatchResult:
         """Load CTD gene-disease associations.
 
         CTD uses NCBI Gene IDs and MeSH/OMIM disease IDs.
@@ -2011,6 +2025,12 @@ class BulkLoader:
                 # Register entities
                 if gene_canonical not in entities:
                     display = gene_symbol if gene_symbol else gene_eid
+                    if display == gene_eid and mapper is not None and gene_eid.startswith("Gene_"):
+                        entrez_str = gene_eid[5:]
+                        if entrez_str.isdigit():
+                            sym = mapper.entrez_to_symbol(int(entrez_str))
+                            if sym:
+                                display = sym
                     ext = json.dumps({"entrez": gene_id_str}) if gene_id_str else "{}"
                     entities[gene_canonical] = ("gene", display, ext)
                 if disease_canonical not in entities:
@@ -2097,7 +2117,8 @@ class BulkLoader:
             logger.warning("BioGRID extraction failed: %s", e)
             return None
 
-    def load_biogrid(self, path: str, low_throughput_only: bool = False) -> BatchResult:
+    def load_biogrid(self, path: str, low_throughput_only: bool = False,
+                     mapper: GeneIDMapper | None = None) -> BatchResult:
         """Load BioGRID protein-protein interactions.
 
         BioGRID TAB3 format uses Entrez Gene IDs directly.
@@ -2166,10 +2187,22 @@ class BulkLoader:
 
                 if gene_a_canonical not in entities:
                     display_a = symbol_a if symbol_a else gene_a_eid
+                    if display_a == gene_a_eid and mapper is not None and gene_a_eid.startswith("Gene_"):
+                        entrez_str = gene_a_eid[5:]
+                        if entrez_str.isdigit():
+                            sym = mapper.entrez_to_symbol(int(entrez_str))
+                            if sym:
+                                display_a = sym
                     ext_a = json.dumps({"entrez": gene_a_str}) if gene_a_str else "{}"
                     entities[gene_a_canonical] = ("gene", display_a, ext_a)
                 if gene_b_canonical not in entities:
                     display_b = symbol_b if symbol_b else gene_b_eid
+                    if display_b == gene_b_eid and mapper is not None and gene_b_eid.startswith("Gene_"):
+                        entrez_str = gene_b_eid[5:]
+                        if entrez_str.isdigit():
+                            sym = mapper.entrez_to_symbol(int(entrez_str))
+                            if sym:
+                                display_b = sym
                     ext_b = json.dumps({"entrez": gene_b_str}) if gene_b_str else "{}"
                     entities[gene_b_canonical] = ("gene", display_b, ext_b)
 
@@ -2224,7 +2257,7 @@ class BulkLoader:
         logger.info("ClinVar downloaded: %.0f KB", size_kb)
         return dest
 
-    def load_clinvar(self, path: str) -> BatchResult:
+    def load_clinvar(self, path: str, mapper: GeneIDMapper | None = None) -> BatchResult:
         """Load ClinVar gene-disease associations.
 
         Uses gene_condition_source_id file which maps Entrez Gene IDs
@@ -2277,6 +2310,12 @@ class BulkLoader:
 
                 if gene_canonical not in entities:
                     display = gene_symbol if gene_symbol else gene_eid
+                    if display == gene_eid and mapper is not None and gene_eid.startswith("Gene_"):
+                        entrez_str = gene_eid[5:]
+                        if entrez_str.isdigit():
+                            sym = mapper.entrez_to_symbol(int(entrez_str))
+                            if sym:
+                                display = sym
                     ext = json.dumps({"entrez": gene_id_str}) if gene_id_str else "{}"
                     entities[gene_canonical] = ("gene", display, ext)
                 if disease_canonical not in entities:
@@ -2716,7 +2755,7 @@ class BulkLoader:
         logger.info("HPO downloaded to %s", dest)
         return dest
 
-    def load_hpo(self, path: str) -> BatchResult:
+    def load_hpo(self, path: str, mapper: GeneIDMapper | None = None) -> BatchResult:
         """Load HPO gene-phenotype associations.
 
         Format (TSV, header): gene_id, gene_symbol, hpo_id, hpo_name,
@@ -2767,6 +2806,12 @@ class BulkLoader:
 
                 if gene_canonical not in entities:
                     display = gene_symbol if gene_symbol else gene_eid
+                    if display == gene_eid and mapper is not None and gene_eid.startswith("Gene_"):
+                        entrez_str = gene_eid[5:]
+                        if entrez_str.isdigit():
+                            sym = mapper.entrez_to_symbol(int(entrez_str))
+                            if sym:
+                                display = sym
                     ext = json.dumps({"entrez": gene_id_str}) if gene_id_str else "{}"
                     entities[gene_canonical] = ("gene", display, ext)
                 if phenotype_canonical not in entities:
@@ -5971,7 +6016,10 @@ class BulkLoader:
 
         # 2. Build ID mapper (needed by DISEASES, STRING, DrugBank, ChEMBL, GOA)
         mapper = None
-        needs_mapper = {"diseases", "string", "drugbank", "chembl", "goa", "intact", "pharmgkb", "tissues", "open_targets"}
+        needs_mapper = {"diseases", "string", "drugbank", "chembl", "goa", "intact",
+                        "pharmgkb", "tissues", "open_targets",
+                        "stitch", "ctd_chem_gene", "ctd_gene_disease",
+                        "biogrid", "clinvar", "hpo"}
         if sources & needs_mapper:
             logger.info("=== Building ID mapper ===")
             mapper = GeneIDMapper(dest_dir)
@@ -5979,6 +6027,7 @@ class BulkLoader:
             if "hetionet" in sources:
                 nodes_path = self.download_hetionet_nodes(dest_dir)
             mapper.load(hetionet_nodes_path=nodes_path)
+            mapper.load_gene_info()  # +45K genes from NCBI gene_info
 
             # Load UniProt mapping if DrugBank, ChEMBL, GOA, or IntAct requested
             if sources & {"drugbank", "chembl", "goa", "intact"}:
@@ -6057,7 +6106,7 @@ class BulkLoader:
             logger.info("=== Loading CTD chemical-gene ===")
             ctd_cg_path = self.download_ctd_chem_gene(dest_dir)
             if ctd_cg_path:
-                result = self.load_ctd_chem_gene(ctd_cg_path)
+                result = self.load_ctd_chem_gene(ctd_cg_path, mapper=mapper)
                 total_ingested += result.ingested
                 logger.info("CTD chem-gene: %d interactions ingested", result.ingested)
             else:
@@ -6068,7 +6117,7 @@ class BulkLoader:
             logger.info("=== Loading CTD gene-disease ===")
             ctd_gd_path = self.download_ctd_gene_disease(dest_dir)
             if ctd_gd_path:
-                result = self.load_ctd_gene_disease(ctd_gd_path)
+                result = self.load_ctd_gene_disease(ctd_gd_path, mapper=mapper)
                 total_ingested += result.ingested
                 logger.info("CTD gene-disease: %d associations ingested", result.ingested)
             else:
@@ -6079,7 +6128,7 @@ class BulkLoader:
             logger.info("=== Loading BioGRID ===")
             biogrid_path = self.download_biogrid(dest_dir)
             if biogrid_path:
-                result = self.load_biogrid(biogrid_path)
+                result = self.load_biogrid(biogrid_path, mapper=mapper)
                 total_ingested += result.ingested
                 logger.info("BioGRID: %d interactions ingested", result.ingested)
             else:
@@ -6089,7 +6138,7 @@ class BulkLoader:
         if "clinvar" in sources:
             logger.info("=== Loading ClinVar ===")
             clinvar_path = self.download_clinvar(dest_dir)
-            result = self.load_clinvar(clinvar_path)
+            result = self.load_clinvar(clinvar_path, mapper=mapper)
             total_ingested += result.ingested
             logger.info("ClinVar: %d associations ingested", result.ingested)
 
@@ -6121,7 +6170,7 @@ class BulkLoader:
         if "hpo" in sources:
             logger.info("=== Loading HPO ===")
             hpo_path = self.download_hpo(dest_dir)
-            result = self.load_hpo(hpo_path)
+            result = self.load_hpo(hpo_path, mapper=mapper)
             total_ingested += result.ingested
             logger.info("HPO: %d gene-phenotype pairs ingested", result.ingested)
 
@@ -6153,7 +6202,7 @@ class BulkLoader:
         if "stitch" in sources:
             logger.info("=== Loading STITCH ===")
             stitch_path = self.download_stitch(dest_dir)
-            result = self.load_stitch(stitch_path)
+            result = self.load_stitch(stitch_path, mapper=mapper)
             total_ingested += result.ingested
             logger.info("STITCH: %d interactions ingested", result.ingested)
 

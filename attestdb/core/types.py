@@ -877,7 +877,6 @@ class AutodidactStatus:
 
     enabled: bool = False
     running: bool = False
-    paused: bool = False
     cycle_count: int = 0
     total_claims_ingested: int = 0
     total_llm_calls_today: int = 0
