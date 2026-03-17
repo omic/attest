@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -151,6 +152,7 @@ class AttestDB:
         instance._purge_interval = 0
         instance._webhooks = []
         instance._webhooks_path = None
+        instance._webhook_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="attest-webhook")
         instance._chain_log = []
         instance._last_chain_hash = "genesis"
         instance._actor = ""
@@ -246,6 +248,7 @@ class AttestDB:
         # Webhook registrations
         self._webhooks: list[dict] = []
         self._webhooks_path: str | None = None
+        self._webhook_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="attest-webhook")
         if not self._is_memory_db:
             self._webhooks_path = self._db_path + ".webhooks.json"
             self._load_webhooks()
@@ -520,6 +523,7 @@ class AttestDB:
                 if self._scheduler:
                     self._scheduler.stop_all()
                     self._scheduler = None
+                self._webhook_executor.shutdown(wait=False)
                 self._flush_chain_log()
                 if self._multi_embedding_index and len(self._multi_embedding_index) > 0:
                     self._multi_embedding_index.save(self._db_path)
@@ -873,11 +877,11 @@ class AttestDB:
         ]
 
     def _fire_webhooks(self, event: str, data: dict) -> None:
-        """POST event payload to matching webhook URLs (fire-and-forget)."""
+        """POST event payload to matching webhook URLs (fire-and-forget, non-blocking)."""
         if not self._webhooks:
             return
         try:
-            import requests
+            import requests as _requests
         except ImportError:
             return
         payload = json.dumps({"event": event, "data": {k: str(v) for k, v in data.items()}})
@@ -890,10 +894,17 @@ class AttestDB:
                     wh["secret"].encode(), payload.encode(), hashlib.sha256,
                 ).hexdigest()
                 headers["X-Attest-Signature"] = sig
-            try:
-                requests.post(wh["url"], data=payload, headers=headers, timeout=5)
-            except Exception as exc:
-                logger.warning("Webhook POST to %s failed: %s", wh["url"], exc)
+            self._webhook_executor.submit(
+                self._post_webhook, _requests, wh["url"], payload, headers,
+            )
+
+    @staticmethod
+    def _post_webhook(requests_mod, url: str, payload: str, headers: dict) -> None:
+        """Execute a single webhook POST (runs in thread pool)."""
+        try:
+            requests_mod.post(url, data=payload, headers=headers, timeout=5)
+        except Exception as exc:
+            logger.warning("Webhook POST to %s failed: %s", url, exc)
 
     # --- Auto-purge ---
 
@@ -3761,23 +3772,18 @@ class AttestDB:
         from attestdb.core.types import BlindspotMap
         from attestdb.core.vocabulary import knowledge_sort_key
 
-        # Single-source detection via Rust index (no claim materialization).
-        # entity_source_counts returns [(source_id, count, avg_conf)] per entity.
+        # Single-source detection via bulk Rust scan (one call, no per-entity roundtrip).
         from attestdb.infrastructure.agents import is_autodidact_source
 
+        raw_single = self._store.find_single_source_entities(min_claims)
         single_source = []
-        entities = self.list_entities()
-        for entity in entities:
-            if entity.claim_count < min_claims:
+        for entity_id in raw_single:
+            # Filter out entities whose sole source is autodidact
+            src_counts = self._store.entity_source_counts(entity_id)
+            sole_source_id = src_counts[0][0] if src_counts else ""
+            if is_autodidact_source(sole_source_id):
                 continue
-            src_counts = self._store.entity_source_counts(entity.id)
-            if len(src_counts) == 1:
-                # Skip entities whose sole source is autodidact — these are
-                # self-generated and shouldn't be flagged as blindspots.
-                sole_source_id = src_counts[0][0] if src_counts else ""
-                if is_autodidact_source(sole_source_id):
-                    continue
-                single_source.append(entity.id)
+            single_source.append(entity_id)
 
         # Single pass over claims for subject→predicate map (unresolved warnings)
         subject_predicates: dict[str, set[str]] = {}

@@ -108,6 +108,8 @@ def export_store(store, output_path: str) -> dict:
                     "organization": claim.provenance.organization,
                     "timestamp": claim.timestamp,
                     "status": claim.status.value,
+                    "namespace": claim.namespace,
+                    "expires_at": claim.expires_at,
                 }
                 if claim.payload:
                     record["payload_schema"] = claim.payload.schema_ref
@@ -264,6 +266,8 @@ def import_store(store, input_path: str, verify: bool = True) -> dict:
                     payload=payload,
                     timestamp=record["timestamp"],
                     status=ClaimStatus(record.get("status", "active")),
+                    namespace=record.get("namespace", ""),
+                    expires_at=record.get("expires_at", 0),
                 )
                 store.insert_claim(claim)
                 claim_count += 1

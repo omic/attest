@@ -2792,6 +2792,42 @@ impl LmdbBackend {
         result.sort_by(|a, b| b.1.cmp(&a.1));
         result
     }
+
+    /// Find entities with exactly one distinct source, where total claims >= min_claims.
+    /// Single scan over the entity_src_counts table — O(table size), no per-entity roundtrip.
+    pub fn find_single_source_entities(&self, min_claims: u64) -> Vec<String> {
+        let rtxn = match self.env().read_txn() {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+
+        // entity_src_counts keys: "{entity_id}\x1F{source_id}" → (count:u64, sum_conf:f64)
+        // Accumulate per-entity: (total_claims, distinct_sources)
+        let mut entity_stats: HashMap<String, (u64, u32)> = HashMap::new();
+
+        if let Ok(iter) = self.dbs.entity_src_counts.iter(&rtxn) {
+            for entry in iter {
+                if let Ok((key, data)) = entry {
+                    if let Some(sep) = key.find('\x1F') {
+                        let entity_id = &key[..sep];
+                        if data.len() >= 8 {
+                            let count = u64::from_le_bytes(data[..8].try_into().unwrap());
+                            if count > 0 {
+                                let stats = entity_stats.entry(entity_id.to_string()).or_insert((0, 0));
+                                stats.0 += count;
+                                stats.1 += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        entity_stats.into_iter()
+            .filter(|(_, (total, sources))| *sources == 1 && *total >= min_claims)
+            .map(|(id, _)| id)
+            .collect()
+    }
 }
 
 #[cfg(test)]

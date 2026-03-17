@@ -69,8 +69,9 @@ class AutodidactDaemon:
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
+        self._lock = threading.Lock()  # guards mutable state below
 
-        # State
+        # State (all access must hold self._lock)
         self._running = False
         self._paused = False
         self._cycle_count = 0
@@ -113,11 +114,12 @@ class AutodidactDaemon:
 
     def start(self) -> None:
         """Start the daemon background thread."""
-        if self._running:
-            return
-        self._stop_event.clear()
-        self._wake_event.clear()
-        self._running = True
+        with self._lock:
+            if self._running:
+                return
+            self._stop_event.clear()
+            self._wake_event.clear()
+            self._running = True
 
         # Recover history from persisted journal claims
         self._recover_history()
@@ -137,15 +139,15 @@ class AutodidactDaemon:
 
     def stop(self) -> None:
         """Stop the daemon and wait for thread to finish."""
-        if not self._running:
-            return
+        with self._lock:
+            if not self._running:
+                return
+            self._running = False
 
         # Unregister event hooks BEFORE signaling stop to prevent
         # race where an event fires mid-shutdown
         self._db.off("source_retracted", self._on_retraction)
         self._db.off("inquiry_created", self._on_inquiry)
-
-        self._running = False
         self._stop_event.set()
         self._wake_event.set()
 
@@ -155,7 +157,8 @@ class AutodidactDaemon:
 
     def run_now(self) -> None:
         """Trigger an immediate cycle."""
-        self._pending_trigger = "manual"
+        with self._lock:
+            self._pending_trigger = "manual"
         self._wake_event.set()
 
     def cost_estimate(self, cycles: int = 24) -> dict:
@@ -212,68 +215,75 @@ class AutodidactDaemon:
     @property
     def status(self) -> AutodidactStatus:
         """Return current daemon status."""
-        return AutodidactStatus(
-            enabled=self._running,
-            running=self._running and not self._paused,
-            paused=self._paused,
-            cycle_count=self._cycle_count,
-            total_claims_ingested=self._total_claims_ingested,
-            total_llm_calls_today=self._llm_calls_today,
-            estimated_cost_today=round(self._estimated_cost_today, 4),
-            max_cost_per_day=self._config.max_cost_per_day,
-            budget_exhausted=self._budget_exhausted,
-            last_cycle=self._last_cycle,
-            next_cycle_at=self._next_cycle_at,
-        )
+        with self._lock:
+            return AutodidactStatus(
+                enabled=self._running,
+                running=self._running and not self._paused,
+                paused=self._paused,
+                cycle_count=self._cycle_count,
+                total_claims_ingested=self._total_claims_ingested,
+                total_llm_calls_today=self._llm_calls_today,
+                estimated_cost_today=round(self._estimated_cost_today, 4),
+                max_cost_per_day=self._config.max_cost_per_day,
+                budget_exhausted=self._budget_exhausted,
+                last_cycle=self._last_cycle,
+                next_cycle_at=self._next_cycle_at,
+            )
 
     @property
     def history(self) -> list[CycleReport]:
         """Return cycle history."""
-        return list(self._history)
+        with self._lock:
+            return list(self._history)
 
     # --- Event handlers ---
 
     def _on_retraction(self, **kwargs) -> None:
         """Handle source_retracted event."""
-        now = time.time()
-        if now - self._last_event_trigger_time < self._config.trigger_cooldown:
-            return  # debounce
-        self._last_event_trigger_time = now
-        self._pending_trigger = "retraction"
+        with self._lock:
+            now = time.time()
+            if now - self._last_event_trigger_time < self._config.trigger_cooldown:
+                return  # debounce
+            self._last_event_trigger_time = now
+            self._pending_trigger = "retraction"
         self._wake_event.set()
 
     def _on_inquiry(self, **kwargs) -> None:
         """Handle inquiry_created event."""
-        now = time.time()
-        if now - self._last_event_trigger_time < self._config.trigger_cooldown:
-            return
-        self._last_event_trigger_time = now
-        self._pending_trigger = "inquiry"
+        with self._lock:
+            now = time.time()
+            if now - self._last_event_trigger_time < self._config.trigger_cooldown:
+                return
+            self._last_event_trigger_time = now
+            self._pending_trigger = "inquiry"
         self._wake_event.set()
 
     # --- Budget ---
 
     def _budget_ok(self) -> bool:
         """Check if both call count and cost budgets allow more work."""
-        if self._llm_calls_today >= self._config.max_llm_calls_per_day:
-            return False
-        if self._estimated_cost_today >= self._config.max_cost_per_day:
-            return False
-        return True
+        with self._lock:
+            if self._llm_calls_today >= self._config.max_llm_calls_per_day:
+                return False
+            if self._estimated_cost_today >= self._config.max_cost_per_day:
+                return False
+            return True
 
     def _record_cost(self, amount: float, calls: int = 1) -> None:
         """Record API cost and call count."""
-        self._llm_calls_today += calls
-        self._estimated_cost_today += amount
+        with self._lock:
+            self._llm_calls_today += calls
+            self._estimated_cost_today += amount
 
     def _reset_daily_budget(self) -> None:
         """Reset daily budgets when the date changes."""
         today = time.strftime("%Y-%m-%d")
-        if today != self._budget_date:
-            self._budget_date = today
-            self._llm_calls_today = 0
-            self._estimated_cost_today = 0.0
-            self._budget_exhausted = False
+        with self._lock:
+            if today != self._budget_date:
+                self._budget_date = today
+                self._llm_calls_today = 0
+                self._estimated_cost_today = 0.0
+                self._budget_exhausted = False
 
     # --- Main loop ---
 
@@ -295,18 +305,20 @@ class AutodidactDaemon:
             if self._stop_event.is_set():
                 break
 
-            trigger = self._pending_trigger or "timer"
-            self._pending_trigger = None
+            with self._lock:
+                trigger = self._pending_trigger or "timer"
+                self._pending_trigger = None
             self._wake_event.clear()
 
             try:
                 report = self._run_cycle(trigger)
-                self._last_cycle = report
-                self._cycle_count += 1
-                self._total_claims_ingested += report.claims_ingested
-                self._history.append(report)
-                if len(self._history) > self._config.max_history:
-                    self._history = self._history[-self._config.max_history:]
+                with self._lock:
+                    self._last_cycle = report
+                    self._cycle_count += 1
+                    self._total_claims_ingested += report.claims_ingested
+                    self._history.append(report)
+                    if len(self._history) > self._config.max_history:
+                        self._history = self._history[-self._config.max_history:]
             except Exception as exc:
                 logger.warning("Autodidact cycle failed: %s", exc)
 
@@ -332,7 +344,8 @@ class AutodidactDaemon:
         # 1. Budget check
         self._reset_daily_budget()
         if not self._budget_ok():
-            self._budget_exhausted = True
+            with self._lock:
+                self._budget_exhausted = True
             self._db._fire("autodidact_budget_exhausted")
             # Still measure blindspots for reporting
             try:
@@ -343,7 +356,8 @@ class AutodidactDaemon:
                 pass
             report.finished_at = time.time()
             return report
-        self._budget_exhausted = False
+        with self._lock:
+            self._budget_exhausted = False
 
         # 2. Detect gaps
         tasks = generate_tasks(
@@ -373,7 +387,8 @@ class AutodidactDaemon:
             if self._stop_event.is_set():
                 break
             if not self._budget_ok():
-                self._budget_exhausted = True
+                with self._lock:
+                    self._budget_exhausted = True
                 self._db._fire("autodidact_budget_exhausted")
                 break
 

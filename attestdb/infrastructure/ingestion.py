@@ -216,7 +216,7 @@ class IngestionPipeline:
         # Rule 10: Payload schema validation
         payload = None
         if claim_input.payload:
-            schema_ref = claim_input.payload.get("schema", "")
+            schema_ref = claim_input.payload.get("schema_ref") or claim_input.payload.get("schema", "")
             data = claim_input.payload.get("data", {})
             if schema_ref:
                 registered = self._store.get_payload_schemas().get(schema_ref)

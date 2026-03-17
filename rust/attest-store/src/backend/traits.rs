@@ -249,6 +249,10 @@ pub trait StorageBackend {
     /// Get source_id → (count, avg_confidence) for a single entity.
     fn entity_source_counts(&self, entity_id: &str) -> Vec<(String, u64, f64)>;
 
+    /// Find entities that have claims from exactly one source.
+    /// Returns entity IDs where total claim count >= min_claims and distinct sources == 1.
+    fn find_single_source_entities(&self, min_claims: u64) -> Vec<String>;
+
     // ── Bulk load mode ───────────────────────────────────────────────
 
     /// Enable or disable bulk load mode. In bulk mode, analytics counters

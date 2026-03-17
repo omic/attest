@@ -427,6 +427,13 @@ impl StorageBackend for Backend {
         }
     }
 
+    fn find_single_source_entities(&self, min_claims: u64) -> Vec<String> {
+        match self {
+            Backend::InMemory(m) => m.find_single_source_entities(min_claims),
+            Backend::Lmdb(l) => l.find_single_source_entities(min_claims),
+        }
+    }
+
     fn set_bulk_load_mode(&mut self, enabled: bool) {
         match self {
             Backend::InMemory(_) => {} // no-op

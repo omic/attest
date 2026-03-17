@@ -951,6 +951,28 @@ impl MemoryBackend {
         result.sort_by(|a, b| b.1.cmp(&a.1));
         result
     }
+
+    pub fn find_single_source_entities(&self, min_claims: u64) -> Vec<String> {
+        // Build per-entity source sets from adjacency
+        let mut entity_stats: HashMap<String, HashMap<String, u64>> = HashMap::new();
+        for claim in self.claims.all_claims() {
+            if !self.should_include_claim(&claim.claim_id)
+                || !self.should_include_namespace(&claim.namespace) {
+                continue;
+            }
+            let src = &claim.provenance.source_id;
+            for eid in [&claim.subject.id, &claim.object.id] {
+                *entity_stats.entry(eid.clone()).or_default()
+                    .entry(src.clone()).or_insert(0) += 1;
+            }
+        }
+        entity_stats.into_iter()
+            .filter(|(_, sources)| {
+                sources.len() == 1 && sources.values().sum::<u64>() >= min_claims
+            })
+            .map(|(id, _)| id)
+            .collect()
+    }
 }
 
 impl Drop for MemoryBackend {

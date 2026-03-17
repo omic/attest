@@ -876,14 +876,11 @@ def _retrieve_candidates(
             for claim_id, dist in hits:
                 semantic_claim_ids.add(claim_id)
                 similarity_scores[claim_id] = max(0.0, 1.0 - float(dist))
-            # Resolve claim_ids to full Claim objects via entity scan
-            if semantic_claim_ids:
-                for entity in db.list_entities():
-                    for claim in db.claims_for(entity.id):
-                        if claim.claim_id in semantic_claim_ids:
-                            _add_claim(claim)
-                    if not semantic_claim_ids - seen:
-                        break  # All hits resolved
+            # Resolve claim_ids to full Claim objects via direct lookup
+            for cid in semantic_claim_ids:
+                claim = db.get_claim(cid)
+                if claim:
+                    _add_claim(claim)
         except Exception as e:
             logger.warning("Embedding search failed: %s", e)
 
@@ -1029,9 +1026,9 @@ def _record_outcome_impl(
 ) -> int:
     """Shared logic for recording an outcome against a session. Returns count of updated claims."""
     try:
-        from attestdb.intelligence.ai_tools_vocabulary import AI_TOOLS_PREDICATES  # noqa: F401
+        from attestdb.intelligence.ai_tools_vocabulary import AI_TOOLS_PREDICATES
     except ImportError:
-        pass  # AI tools vocabulary not available
+        AI_TOOLS_PREDICATES = set()  # AI tools vocabulary not available
 
     # Ingest outcome claim: (session_id) —[had_outcome]→ (outcome)
     db.ingest(
@@ -2003,7 +2000,7 @@ def attest_graph(
                         "label": rel.predicate, "confidence": rel.confidence,
                     })
         except Exception as e:
-            logger.warning("Failed to build entity graph for %s: %s", entity_id, e)
+            logger.warning("Failed to build entity graph for %s: %s", center_entity, e)
     else:
         # Show top entities by claim count
         entities = db.list_entities()
@@ -2286,7 +2283,7 @@ def autoresearch_get_priors(metric_name: str, limit: int = 20) -> str:
     db = _get_db()
 
     # Search for experiment runs related to this metric
-    results = db.search_entities(metric_name, limit=50)
+    results = db.search_entities(metric_name, top_k=50)
     experiments = []
 
     for entity in results:
@@ -2300,7 +2297,7 @@ def autoresearch_get_priors(metric_name: str, limit: int = 20) -> str:
 
                 if payload_data.get("metric_name") == metric_name or not payload_data:
                     experiments.append({
-                        "change": claim.object.name,
+                        "change": claim.object.id,
                         "effect": claim.predicate.id,
                         "delta": payload_data.get("delta", 0),
                         "baseline": payload_data.get("baseline_value"),
@@ -2349,7 +2346,7 @@ def autoresearch_suggest_next(
     db = _get_db()
 
     # Gather past experiments
-    results = db.search_entities(metric_name, limit=50)
+    results = db.search_entities(metric_name, top_k=50)
     improvements = []
     failures = []
 
@@ -2363,23 +2360,23 @@ def autoresearch_suggest_next(
 
             if claim.predicate.id == "improved_by" and payload_data.get("kept"):
                 improvements.append({
-                    "change": claim.object.name,
+                    "change": claim.object.id,
                     "delta": payload_data.get("delta", 0),
                 })
             elif claim.predicate.id == "degraded_by":
                 failures.append({
-                    "change": claim.object.name,
+                    "change": claim.object.id,
                     "delta": payload_data.get("delta", 0),
                 })
 
     # Check for negative results (dead ends)
     dead_ends = []
-    neg_results = db.search_entities("no_evidence_for", limit=20)
+    neg_results = db.search_entities("no_evidence_for", top_k=20)
     for entity in neg_results:
         claims = db.claims_for(entity.id)
         for claim in claims:
             if claim.predicate.id == "no_evidence_for":
-                dead_ends.append(claim.object.name)
+                dead_ends.append(claim.object.id)
 
     suggestions = []
 
@@ -2501,7 +2498,7 @@ def openclaw_query_knowledge(
     _track_tool_call("openclaw_query_knowledge", query)
     db = _get_db()
 
-    results = db.search_entities(query, limit=limit)
+    results = db.search_entities(query, top_k=limit)
     knowledge = []
 
     for entity in results:
@@ -2554,7 +2551,7 @@ def openclaw_heartbeat_check(agent_id: str, window_minutes: int = 30) -> str:
     db = _get_db()
 
     cutoff = time.time() - (window_minutes * 60)
-    results = db.search_entities(agent_id, limit=10)
+    results = db.search_entities(agent_id, top_k=10)
 
     recent_actions = []
     last_seen = 0
@@ -2569,7 +2566,7 @@ def openclaw_heartbeat_check(agent_id: str, window_minutes: int = 30) -> str:
                 if ts >= cutoff:
                     recent_actions.append({
                         "predicate": claim.predicate.id,
-                        "object": claim.object.name,
+                        "object": claim.object.id,
                         "timestamp": ts,
                     })
 
@@ -2658,7 +2655,7 @@ def openclaw_get_preferences(
     _track_tool_call("openclaw_get_preferences", agent_id)
     db = _get_db()
 
-    results = db.search_entities(agent_id, limit=20)
+    results = db.search_entities(agent_id, top_k=20)
 
     action_counts: dict[str, int] = {}
     success_counts: dict[str, int] = {}
@@ -2686,7 +2683,7 @@ def openclaw_get_preferences(
             elif claim.predicate.id == "failed_at":
                 failure_counts[action] = failure_counts.get(action, 0) + 1
 
-            targets[claim.object.name] = targets.get(claim.object.name, 0) + 1
+            targets[claim.object.id] = targets.get(claim.object.id, 0) + 1
 
     top_actions = sorted(action_counts.items(), key=lambda x: x[1], reverse=True)[:10]
     top_targets = sorted(targets.items(), key=lambda x: x[1], reverse=True)[:10]

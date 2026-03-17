@@ -456,6 +456,11 @@ impl RustStore {
         self.backend.entity_source_counts(entity_id)
     }
 
+    /// Find entities with exactly one distinct source and >= min_claims total claims.
+    pub fn find_single_source_entities(&self, min_claims: u64) -> Vec<String> {
+        self.backend.find_single_source_entities(min_claims)
+    }
+
     // ── Bulk load mode ───────────────────────────────────────────────
 
     /// Enable or disable bulk load mode. Skips analytics counters during insert

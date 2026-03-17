@@ -1053,6 +1053,19 @@ impl PyRustStore {
         }
         Ok(list.into())
     }
+
+    /// Find entities with exactly one distinct source and >= min_claims total claims.
+    /// Returns list of entity ID strings. Single Rust-side scan — no per-entity roundtrip.
+    #[pyo3(signature = (min_claims=5))]
+    fn find_single_source_entities<'py>(
+        &self,
+        min_claims: u64,
+        py: Python<'py>,
+    ) -> PyResult<PyObject> {
+        let results = self.inner.find_single_source_entities(min_claims);
+        let list = PyList::new(py, &results)?;
+        Ok(list.into())
+    }
 }
 
 /// Helper: convert a Python dict to a JSON string via Python's json module.
