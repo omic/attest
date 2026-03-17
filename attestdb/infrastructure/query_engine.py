@@ -36,6 +36,7 @@ from attestdb.core.vocabulary import (
     SYMMETRIC_PREDICATES,
     compose_predicates,
 )
+from attestdb.infrastructure.tracing import span as _span, set_attribute as _set_attr
 
 # Recency bonus: 7-day half-life
 RECENCY_HALF_LIFE_SECONDS = 7 * 24 * 3600
@@ -108,11 +109,36 @@ class QueryEngine:
         include_contradictions: bool = True,
         include_narrative: bool = True,
     ) -> ContextFrame:
+        with _span("attestdb.query.execute", {"focal_entity": focal_entity, "depth": depth}):
+            return self._execute_query_inner(
+                focal_entity, depth, min_confidence, exclude_source_types,
+                max_claims, max_tokens, confidence_threshold, predicate_types,
+                claim_filter, include_quantitative, include_contradictions, include_narrative,
+            )
+
+    def _execute_query_inner(
+        self,
+        focal_entity: str,
+        depth: int = 2,
+        min_confidence: float = 0.0,
+        exclude_source_types: list[str] | None = None,
+        max_claims: int = 500,
+        max_tokens: int = 4000,
+        confidence_threshold: float = 0.0,
+        predicate_types: list[str] | None = None,
+        claim_filter: "Callable[[Claim], bool] | None" = None,  # noqa: F821
+        include_quantitative: bool = True,
+        include_contradictions: bool = True,
+        include_narrative: bool = True,
+    ) -> ContextFrame:
         exclude = set(exclude_source_types or [])
         # Effective confidence floor: max of min_confidence and confidence_threshold
         effective_min_conf = max(min_confidence, confidence_threshold)
         allowed_predicates = set(predicate_types) if predicate_types else None
         now_ns = time.time_ns()
+
+        def _is_expired(claim: Claim) -> bool:
+            return claim.expires_at > 0 and now_ns >= claim.expires_at
 
         # Build inverse pairs and transitive set from predicate constraints.
         # inverse_of: bidirectional map — inverse_of["causes"] = "caused_by"
@@ -180,6 +206,8 @@ class QueryEngine:
                         continue
                     if claim.status != ClaimStatus.ACTIVE:
                         continue
+                    if _is_expired(claim):
+                        continue
                     if allowed_predicates and claim.predicate.id not in allowed_predicates:
                         continue
                     seen_claim_ids.add(claim.claim_id)
@@ -206,6 +234,9 @@ class QueryEngine:
                         else:
                             path_chains.setdefault(other, []).append([step])
             frontier = next_frontier
+
+        _set_attr("bfs.candidates", len(candidates))
+        _set_attr("bfs.entities_visited", len(visited_entities))
 
         # STEP 3: Score and rank (using Tier 2 confidence with corroboration)
         seen_source_types: set[str] = set()
@@ -237,6 +268,7 @@ class QueryEngine:
 
         scored.sort(key=lambda x: x[2], reverse=True)
         scored = scored[:max_claims]
+        _set_attr("scored.count", len(scored))
 
         # STEP 4: Group by relationship (with inverse flipping)
         relationships: dict[tuple[str, str, str], Relationship] = {}
@@ -520,6 +552,8 @@ class QueryEngine:
                     if claim.provenance.source_type in exclude:
                         continue
                     if claim.status != ClaimStatus.ACTIVE:
+                        continue
+                    if claim.expires_at > 0 and time.time_ns() >= claim.expires_at:
                         continue
                     if allowed_predicates and claim.predicate.id not in allowed_predicates:
                         continue

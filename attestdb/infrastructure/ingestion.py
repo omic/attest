@@ -35,6 +35,7 @@ from attestdb.core.vocabulary import (
     BUILT_IN_SOURCE_TYPES,
 )
 from attestdb.infrastructure.embedding_index import EmbeddingIndex
+from attestdb.infrastructure.tracing import span as _span, set_attribute as _set_attr, record_exception as _record_exc
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,10 @@ class IngestionPipeline:
         Returns (claim, embedding). Raises on validation failure.
         Does NOT write to the store or track corroboration.
         """
+        with _span("attestdb.ingest.validate", {"subject": claim_input.subject[0], "predicate": claim_input.predicate[0]}):
+            return self._validate_and_build_inner(claim_input)
+
+    def _validate_and_build_inner(self, claim_input: ClaimInput) -> tuple[Claim, list[float] | None]:
         # Rule 1: Normalize entity IDs
         subj_canonical = normalize_entity_id(claim_input.subject[0])
         obj_canonical = normalize_entity_id(claim_input.object[0])
@@ -317,6 +322,10 @@ class IngestionPipeline:
 
     def _persist(self, claim: Claim, embedding: list[float] | None) -> None:
         """Write validated claim to store and embedding index."""
+        with _span("attestdb.ingest.persist", {"claim_id": claim.claim_id}):
+            self._persist_inner(claim, embedding)
+
+    def _persist_inner(self, claim: Claim, embedding: list[float] | None) -> None:
         self._store.upsert_entity(
             claim.subject.id, claim.subject.entity_type,
             claim.subject.display_name, claim.subject.external_ids, claim.timestamp,
@@ -382,45 +391,58 @@ class IngestionPipeline:
         Args:
             on_ingested: Optional callback invoked with each claim_id on successful persist.
         """
+        with _span("attestdb.ingest_batch", {"batch_size": len(claims)}):
+            return self._ingest_batch_inner(claims, on_ingested)
+
+    def _ingest_batch_inner(
+        self,
+        claims: list[ClaimInput],
+        on_ingested: "Callable[[str], None] | None" = None,  # noqa: F821
+    ) -> BatchResult:
         self._store.warm_caches()
         result = BatchResult()
 
         # Phase 1: Validate all claims
         validated: list[tuple[Claim, list[float] | None]] = []
-        for ci in claims:
-            try:
-                claim, embedding = self._validate_and_build(ci)
-                validated.append((claim, embedding))
-            except DuplicateClaimError:
-                result.duplicates += 1
-            except Exception as e:
-                result.errors.append(str(e))
+        with _span("attestdb.ingest_batch.validate", {"batch_size": len(claims)}):
+            for ci in claims:
+                try:
+                    claim, embedding = self._validate_and_build_inner(ci)
+                    validated.append((claim, embedding))
+                except DuplicateClaimError:
+                    result.duplicates += 1
+                except Exception as e:
+                    result.errors.append(str(e))
 
         if not validated:
+            _set_attr("validated_count", 0)
             return result
+
+        _set_attr("validated_count", len(validated))
 
         # Phase 2: Batch persist — entities + claims in 2 LMDB transactions
         use_batch = hasattr(self._store, "insert_claims_batch")
         if use_batch:
             import json as _json
-            # 2a. Batch entity upserts (1 transaction)
-            entities: dict[str, tuple[str, str, str]] = {}
-            max_ts = 0
-            for claim, _ in validated:
-                subj, obj = claim.subject, claim.object
-                if subj.id not in entities:
-                    ext = _json.dumps(subj.external_ids) if subj.external_ids else "{}"
-                    entities[subj.id] = (subj.entity_type, subj.display_name, ext)
-                if obj.id not in entities:
-                    ext = _json.dumps(obj.external_ids) if obj.external_ids else "{}"
-                    entities[obj.id] = (obj.entity_type, obj.display_name, ext)
-                if claim.timestamp > max_ts:
-                    max_ts = claim.timestamp
-            self._store.upsert_entities_batch(entities, max_ts)
+            with _span("attestdb.ingest_batch.persist", {"claim_count": len(validated)}):
+                # 2a. Batch entity upserts (1 transaction)
+                entities: dict[str, tuple[str, str, str]] = {}
+                max_ts = 0
+                for claim, _ in validated:
+                    subj, obj = claim.subject, claim.object
+                    if subj.id not in entities:
+                        ext = _json.dumps(subj.external_ids) if subj.external_ids else "{}"
+                        entities[subj.id] = (subj.entity_type, subj.display_name, ext)
+                    if obj.id not in entities:
+                        ext = _json.dumps(obj.external_ids) if obj.external_ids else "{}"
+                        entities[obj.id] = (obj.entity_type, obj.display_name, ext)
+                    if claim.timestamp > max_ts:
+                        max_ts = claim.timestamp
+                self._store.upsert_entities_batch(entities, max_ts)
 
-            # 2b. Batch claim inserts (1 transaction per 100K chunk)
-            claim_objects = [claim for claim, _ in validated]
-            result.ingested = self._store.insert_claims_batch(claim_objects)
+                # 2b. Batch claim inserts (1 transaction per 100K chunk)
+                claim_objects = [claim for claim, _ in validated]
+                result.ingested = self._store.insert_claims_batch(claim_objects)
 
             # 2c. Embeddings, callbacks, resolver (Python-side)
             for claim, embedding in validated:
