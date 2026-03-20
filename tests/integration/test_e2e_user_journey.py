@@ -240,8 +240,9 @@ class TestClaimsFiltering:
             object=("B", "entity"),
             provenance={"source_type": "observation", "source_id": "s1"},
         )
+        from attestdb.core.vocabulary import normalize_predicate
         content_id = compute_content_id(
-            normalize_entity_id("A"), "relates_to", normalize_entity_id("B"),
+            normalize_entity_id("A"), normalize_predicate("relates_to"), normalize_entity_id("B"),
         )
         claims = db.claims_by_content_id(content_id)
         assert len(claims) >= 1

@@ -110,13 +110,23 @@ PREDICATE_COMPOSITION: dict[tuple[str, str], str] = {
     ("enables", "inhibits"): "inhibits",
     ("blocks", "activates"): "inhibits",
     ("blocks", "inhibits"): "activates",
+    # regulates — non-directional, preserves the other predicate's direction
+    ("regulates", "activates"): "regulates",
+    ("regulates", "inhibits"): "regulates",
+    ("regulates", "upregulates"): "regulates",
+    ("regulates", "downregulates"): "regulates",
+    ("regulates", "regulates"): "regulates",
+    ("activates", "regulates"): "regulates",
+    ("inhibits", "regulates"): "regulates",
+    ("upregulates", "regulates"): "regulates",
+    ("downregulates", "regulates"): "regulates",
 }
 
 # Predicates that don't compose meaningfully — produce "associated_with" in compositions
 _WEAK_PREDICATES: set[str] = {
     "associated_with", "relates_to", "resembles", "interacts_with",
     "interacts", "coexpressed_with", "same_as", "associates",
-    "participates_in", "investigated_in", "regulates", "expresses",
+    "participates_in", "investigated_in", "expresses",
 }
 
 # Causal predicates — directional, compose via PREDICATE_COMPOSITION rules
@@ -126,6 +136,7 @@ CAUSAL_PREDICATES: set[str] = {
     "causes", "prevents", "enables", "blocks",
     "enhances", "reduces", "stabilizes", "destabilizes",
     "phosphorylates", "dephosphorylates", "methylates", "demethylates",
+    "regulates",  # non-directional but still indicates regulatory relationship
 }
 
 # Predicate equivalence — semantically close predicates that should match
@@ -209,6 +220,126 @@ def predict_predicate_from_paths(
     best = max(votes, key=lambda k: votes[k])
     fraction = votes[best] / total_weight if total_weight > 0 else 0.0
     return (best, fraction)
+
+
+# ---------------------------------------------------------------------------
+# Predicate normalization — map LLM-generated variants to controlled vocabulary
+# ---------------------------------------------------------------------------
+
+# Standard predicates — the canonical set that AttestDB accepts.
+# LLM-generated predicates are normalized to these at ingestion time.
+STANDARD_PREDICATES: set[str] = {
+    # Causal / regulatory
+    "inhibits", "activates", "upregulates", "downregulates",
+    "promotes", "suppresses", "increases", "decreases",
+    "causes", "prevents", "enables", "blocks",
+    "enhances", "reduces", "regulates",
+    # Interaction
+    "interacts_with", "interacts", "binds", "targets",
+    # Association
+    "associated_with", "correlates_with", "contributes_to",
+    # Spatial / structural
+    "expressed_in", "participates_in", "involved_in",
+    # Therapeutic / clinical
+    "treats", "biomarker_for",
+    # Post-translational
+    "phosphorylates", "dephosphorylates", "methylates", "demethylates",
+    "stabilizes", "destabilizes",
+    # Semantic
+    "induces", "modulates", "mediates", "encodes",
+}
+
+# Map common LLM-generated predicate variants to standard forms.
+# Covers: verb tense normalization, wordy phrasings, synonyms.
+PREDICATE_ALIAS_MAP: dict[str, str] = {
+    # Verb stem / tense variants
+    "activate": "activates", "inhibit": "inhibits",
+    "reduce": "reduces", "treat": "treats",
+    "cause": "causes", "prevent": "prevents",
+    "regulate": "regulates", "bind": "binds",
+    "increase": "increases", "decrease": "decreases",
+    "enhance": "enhances", "promote": "promotes",
+    "suppress": "suppresses", "induce": "induces",
+    "block": "blocks", "modulate": "modulates",
+    "target": "targets", "mediate": "mediates",
+    "detect": "detects", "predict": "predicts",
+    "encode": "encodes", "upregulate": "upregulates",
+    "downregulate": "downregulates", "stabilize": "stabilizes",
+    "destabilize": "destabilizes",
+    "phosphorylate": "phosphorylates",
+    "dephosphorylate": "dephosphorylates",
+    "methylate": "methylates", "demethylate": "demethylates",
+    # Wordy / LLM phrasings
+    "is_associated_with": "associated_with",
+    "is_linked_to": "associated_with",
+    "is_correlated_with": "correlates_with",
+    "is_involved_in": "involved_in",
+    "is_used_for": "treats",
+    "is_a_biomarker_for": "biomarker_for",
+    "facilitate_the_spread_of": "promotes",
+    "facilitates": "promotes",
+    "concerned_with": "associated_with",
+    "affects": "regulates",
+    "influences": "regulates",
+    "complicated_by": "associated_with",
+    "is_major_mechanism_for": "mediates",
+    "serves_as": "biomarker_for",
+    "associates": "associated_with",
+    "relates_to": "associated_with",
+    "linked_to": "associated_with",
+    "connected_to": "associated_with",
+    "implicated_in": "associated_with",
+    "resistant_to": "associated_with",
+    "sensitive_to": "associated_with",
+}
+
+
+def normalize_predicate(pred: str) -> str:
+    """Normalize an LLM-generated predicate to the controlled vocabulary.
+
+    4-stage normalization:
+    1. Direct match to standard set
+    2. Alias map lookup
+    3. Strip common prefixes/suffixes and retry
+    4. Fallback to 'associated_with' for unknown long predicates
+
+    Usage:
+        normalize_predicate("is_associated_with")  → "associated_with"
+        normalize_predicate("activate")             → "activates"
+        normalize_predicate("inhibit")              → "inhibits"
+        normalize_predicate("may_potentially_cause") → "causes"
+    """
+    cleaned = pred.lower().strip().rstrip(".").replace(" ", "_")
+
+    # Stage 1: direct match
+    if cleaned in STANDARD_PREDICATES:
+        return cleaned
+
+    # Stage 2: alias map
+    mapped = PREDICATE_ALIAS_MAP.get(cleaned)
+    if mapped:
+        return mapped
+
+    # Stage 3: strip common prefixes/suffixes and retry
+    stripped = cleaned
+    for prefix in ("is_", "can_", "may_", "potentially_", "directly_"):
+        if stripped.startswith(prefix):
+            stripped = stripped[len(prefix):]
+    for suffix in ("_in", "_of", "_by", "_to", "_for", "_with"):
+        if stripped.endswith(suffix):
+            stripped = stripped[: -len(suffix)]
+
+    if stripped in STANDARD_PREDICATES:
+        return stripped
+    mapped = PREDICATE_ALIAS_MAP.get(stripped)
+    if mapped:
+        return mapped
+
+    # Stage 4: fallback for unknown long predicates
+    if len(cleaned) > 30:
+        return "associated_with"
+
+    return cleaned
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +439,118 @@ def knowledge_sort_key(predicate_id: str, confidence: float = 0.5) -> tuple:
 
 
 # Quantitative payload schemas — schemas whose data has {value, unit}
+# ---------------------------------------------------------------------------
+# Entity alias map — map common synonyms to canonical entity names
+# ---------------------------------------------------------------------------
+
+# Maps normalized aliases to canonical entity IDs.  Applied AFTER
+# normalize_entity_id() (NFKD, lowercase, whitespace collapse, Greek) so all
+# keys must already be in normalized form.
+#
+# This is the built-in map.  Users can extend it at runtime via
+# AttestDB.add_entity_alias() which merges into the pipeline's alias table.
+ENTITY_ALIAS_MAP: dict[str, str] = {
+    # TP53 family
+    "p53": "tp53",
+    "tumour protein p53": "tp53",
+    "tumor protein p53": "tp53",
+    "trp53": "tp53",
+    # PD-L1 / CD274
+    "pd-l1": "cd274",
+    "pdl1": "cd274",
+    "pd l1": "cd274",
+    "programmed death-ligand 1": "cd274",
+    "programmed death ligand 1": "cd274",
+    # BRCA
+    "brca": "brca1",
+    # Amyloid beta
+    "abeta": "amyloid beta",
+    "a-beta": "amyloid beta",
+    "amyloid-beta": "amyloid beta",
+    "beta-amyloid": "amyloid beta",
+    "beta amyloid": "amyloid beta",
+    "abeta42": "amyloid beta 42",
+    "abeta-42": "amyloid beta 42",
+    "a-beta-42": "amyloid beta 42",
+    "abeta40": "amyloid beta 40",
+    "abeta-40": "amyloid beta 40",
+    # TNF-alpha
+    "tnf-alpha": "tnf",
+    "tnf alpha": "tnf",
+    "tnfalpha": "tnf",
+    "tumor necrosis factor alpha": "tnf",
+    "tumour necrosis factor alpha": "tnf",
+    "tumor necrosis factor": "tnf",
+    # IL-6
+    "interleukin-6": "il6",
+    "interleukin 6": "il6",
+    "il-6": "il6",
+    # EGFR
+    "erbb1": "egfr",
+    "her1": "egfr",
+    "epidermal growth factor receptor": "egfr",
+    # HER2
+    "erbb2": "her2",
+    "neu": "her2",
+    "cd340": "her2",
+    # VEGF
+    "vascular endothelial growth factor": "vegfa",
+    "vegf": "vegfa",
+    "vegf-a": "vegfa",
+    # Common disease aliases
+    "alzheimer's disease": "alzheimer disease",
+    "alzheimer's": "alzheimer disease",
+    "alzheimers": "alzheimer disease",
+    "alzheimers disease": "alzheimer disease",
+    "ad": "alzheimer disease",
+    "parkinson's disease": "parkinson disease",
+    "parkinson's": "parkinson disease",
+    "parkinsons": "parkinson disease",
+    "parkinsons disease": "parkinson disease",
+    "pd": "parkinson disease",
+    "als": "amyotrophic lateral sclerosis",
+    "lou gehrig's disease": "amyotrophic lateral sclerosis",
+    "lou gehrigs disease": "amyotrophic lateral sclerosis",
+    # TREM2
+    "triggering receptor expressed on myeloid cells 2": "trem2",
+    # APOE
+    "apolipoprotein e": "apoe",
+    "apolipoprotein e4": "apoe4",
+    "apoe epsilon4": "apoe4",
+    "apoe-epsilon4": "apoe4",
+}
+
+
+def normalize_entity_name(name: str, extra_aliases: dict[str, str] | None = None) -> str:
+    """Normalize an entity name, resolving known synonyms to canonical IDs.
+
+    Two-stage normalization:
+    1. Run normalize_entity_id() (NFKD, lowercase, whitespace collapse, Greek)
+    2. Check alias maps (extra_aliases first, then built-in ENTITY_ALIAS_MAP)
+
+    The extra_aliases parameter is for runtime aliases registered via
+    AttestDB.add_entity_alias().
+
+    Does NOT modify normalize_entity_id() — that function is locked.
+    """
+    from attestdb.core.normalization import normalize_entity_id
+
+    normalized = normalize_entity_id(name)
+
+    # Check runtime aliases first (user-registered take precedence)
+    if extra_aliases:
+        canonical = extra_aliases.get(normalized)
+        if canonical is not None:
+            return canonical
+
+    # Check built-in alias map
+    canonical = ENTITY_ALIAS_MAP.get(normalized)
+    if canonical is not None:
+        return canonical
+
+    return normalized
+
+
 QUANTITATIVE_SCHEMAS: set[str] = {
     "binding_affinity",
     "expression_data",

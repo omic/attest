@@ -3838,17 +3838,16 @@ class BulkLoader:
         claim_rows: list[tuple] = []
         skipped = 0
         processed = 0
+        total_ingested = 0
 
         # Determine if gzipped
         open_fn = gzip.open if path.endswith(".gz") else open
 
         with open_fn(path, "rt", errors="replace") as f:
-            for line in f:
-                parts = line.rstrip("\n").split(",")
-                # SemMedDB CSV has 12+ columns
-                if len(parts) < 12:
-                    # Try pipe delimiter
-                    parts = line.rstrip("\n").split("|")
+            import csv as csv_mod
+            reader = csv_mod.reader(f)
+            for parts in reader:
+                # SemMedDB CSV has 12+ columns (quoted, comma-delimited)
                 if len(parts) < 12:
                     skipped += 1
                     continue
@@ -3885,16 +3884,21 @@ class BulkLoader:
                 predicate = SEMMEDDB_PREDICATE_MAP.get(predicate_raw, "associated_with")
 
                 # Build entity IDs from UMLS CUIs
-                # Prefix with type for better entity resolution
-                subj_prefix = {"gene": "Gene", "protein": "Protein",
-                               "compound": "Compound", "disease": "Disease",
-                               "phenotype": "Phenotype"}.get(subj_type, "Entity")
-                obj_prefix = {"gene": "Gene", "protein": "Protein",
-                              "compound": "Compound", "disease": "Disease",
-                              "phenotype": "Phenotype"}.get(obj_type, "Entity")
+                # SemMedDB CUI field may contain NCBI Gene ID after pipe:
+                # "C0079419|7157" → use "gene_7157" to match existing entities
+                def _semmed_entity_id(cui: str, etype: str) -> str:
+                    prefix = {"gene": "gene", "protein": "protein",
+                              "compound": "compound", "disease": "disease",
+                              "phenotype": "phenotype"}.get(etype, "entity")
+                    if "|" in cui and etype in ("gene", "protein"):
+                        parts_cui = cui.split("|")
+                        ncbi_id = parts_cui[-1]
+                        if ncbi_id.isdigit():
+                            return f"{prefix}_{ncbi_id}"
+                    return f"{prefix}_{cui}"
 
-                subj_eid = f"{subj_prefix}_{subject_cui}"
-                obj_eid = f"{obj_prefix}_{object_cui}"
+                subj_eid = _semmed_entity_id(subject_cui, subj_type)
+                obj_eid = _semmed_entity_id(object_cui, obj_type)
 
                 subj_canonical = normalize_entity_id(subj_eid)
                 obj_canonical = normalize_entity_id(obj_eid)
@@ -3923,24 +3927,26 @@ class BulkLoader:
                 ))
 
                 processed += 1
+
+                # Flush every 5M rows to keep memory bounded
                 if processed % 5_000_000 == 0:
-                    logger.info("SemMedDB: %dM rows processed...", processed // 1_000_000)
+                    logger.info("SemMedDB: %dM rows — flushing chunk...", processed // 1_000_000)
+                    self._ingest_append_direct(entities, claim_rows, timestamp)
+                    total_ingested += len(claim_rows)
+                    entities = {}
+                    claim_rows = []
 
-        logger.info(
-            "SemMedDB: %d predications parsed, %d skipped",
-            len(claim_rows), skipped,
-        )
+        # Final flush
+        if claim_rows:
+            self._ingest_append_direct(entities, claim_rows, timestamp)
+            total_ingested += len(claim_rows)
 
-        if not claim_rows:
-            return BatchResult(ingested=0)
-
-        result = self._ingest_append_direct(entities, claim_rows, timestamp)
         elapsed = time.time() - t0
         logger.info(
-            "SemMedDB loaded: %d entities, %d claims in %.1fs",
-            len(entities), len(claim_rows), elapsed,
+            "SemMedDB: %d parsed, %d ingested, %d skipped in %.1fs",
+            processed, total_ingested, skipped, elapsed,
         )
-        return result
+        return BatchResult(ingested=total_ingested)
 
     # ---- RTX-KG2c (composite biomedical KG, 40-55M edges) ----
 

@@ -578,6 +578,9 @@ class AttestDB:
             self._rbac_path = self._db_path + ".rbac.json"
             self._load_rbac()
 
+        # Entity aliases (runtime synonym table)
+        self._load_entity_aliases()
+
         # Autodidact daemon (lazy-init)
         self._autodidact: "AutodidactDaemon | None" = None
 
@@ -1823,10 +1826,11 @@ class AttestDB:
         )
         self._fire("claim_ingested", claim_id=claim_id, claim_input=ci)
         self._check_subscriptions(claim_id, ci)
-        # Check corroboration
+        # Check corroboration (use normalized predicate to match stored claims)
+        from attestdb.core.vocabulary import normalize_predicate
         content_id = compute_content_id(
             normalize_entity_id(ci.subject[0]),
-            ci.predicate[0],
+            normalize_predicate(ci.predicate[0]),
             normalize_entity_id(ci.object[0]),
         )
         existing = self.claims_by_content_id(content_id)
@@ -2264,6 +2268,59 @@ class AttestDB:
     def search_entities(self, query: str, top_k: int = 10) -> list[EntitySummary]:
         """Search entities by text matching on id and display_name."""
         return [entity_summary_from_dict(d) for d in self._store.search_entities(query, top_k)]
+
+    # --- Entity aliases ---
+
+    def add_entity_alias(self, alias: str, canonical: str) -> None:
+        """Register a runtime entity alias.
+
+        After this call, any ingested claim mentioning *alias* (after
+        normalize_entity_id) will be stored under *canonical* instead.
+
+        Runtime aliases are persisted to a ``.aliases.json`` sidecar
+        file alongside the database.  They take precedence over the
+        built-in ``ENTITY_ALIAS_MAP`` in ``vocabulary.py``.
+        """
+        normalized_alias = normalize_entity_id(alias)
+        normalized_canonical = normalize_entity_id(canonical)
+        self._pipeline._entity_aliases[normalized_alias] = normalized_canonical
+        self._save_entity_aliases()
+
+    def remove_entity_alias(self, alias: str) -> bool:
+        """Remove a runtime entity alias.  Returns True if it existed."""
+        normalized = normalize_entity_id(alias)
+        removed = self._pipeline._entity_aliases.pop(normalized, None) is not None
+        if removed:
+            self._save_entity_aliases()
+        return removed
+
+    def get_entity_aliases(self) -> dict[str, str]:
+        """Return a copy of the runtime entity alias map."""
+        return dict(self._pipeline._entity_aliases)
+
+    def _aliases_path(self) -> str | None:
+        if self._is_memory_db:
+            return None
+        return self._db_path + ".aliases.json"
+
+    def _load_entity_aliases(self) -> None:
+        path = self._aliases_path()
+        if path and os.path.exists(path):
+            with builtins.open(path, "r") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self._pipeline._entity_aliases = data
+
+    def _save_entity_aliases(self) -> None:
+        path = self._aliases_path()
+        if not path:
+            return
+        aliases = self._pipeline._entity_aliases
+        if aliases:
+            with builtins.open(path, "w") as f:
+                json.dump(aliases, f, indent=2, sort_keys=True)
+        elif os.path.exists(path):
+            os.remove(path)
 
     # --- Ask (question answering) ---
 

@@ -60,6 +60,8 @@ class IngestionPipeline:
         self._embed_fn: callable | None = None
         # Optional DomainSpec for display name quality warnings
         self._domain_spec = None
+        # Runtime entity aliases (registered via AttestDB.add_entity_alias)
+        self._entity_aliases: dict[str, str] = {}
         # Vocabulary caches (invalidated via invalidate_vocab_caches)
         self._valid_entity_types: set[str] | None = None
         self._valid_pred_types: set[str] | None = None
@@ -105,9 +107,14 @@ class IngestionPipeline:
             return self._validate_and_build_inner(claim_input)
 
     def _validate_and_build_inner(self, claim_input: ClaimInput) -> tuple[Claim, list[float] | None]:
-        # Rule 1: Normalize entity IDs
-        subj_canonical = normalize_entity_id(claim_input.subject[0])
-        obj_canonical = normalize_entity_id(claim_input.object[0])
+        # Rule 1: Normalize entity IDs + resolve aliases
+        from attestdb.core.vocabulary import normalize_entity_name
+        subj_canonical = normalize_entity_name(
+            claim_input.subject[0], self._entity_aliases
+        )
+        obj_canonical = normalize_entity_name(
+            claim_input.object[0], self._entity_aliases
+        )
         if not subj_canonical:
             raise ValueError("Subject entity ID is empty after normalization")
         if not obj_canonical:
@@ -116,6 +123,10 @@ class IngestionPipeline:
         obj_type = claim_input.object[1]
         pred_id = claim_input.predicate[0]
         pred_type = claim_input.predicate[1]
+
+        # Normalize predicate to controlled vocabulary
+        from attestdb.core.vocabulary import normalize_predicate
+        pred_id = normalize_predicate(pred_id)
 
         # Display name quality warning (informational, non-blocking)
         if self._domain_spec is not None:
