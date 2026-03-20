@@ -38,6 +38,22 @@ OPPOSITE_PREDICATES: dict[str, str] = {
     "inhibits": "activates",
     "upregulates": "downregulates",
     "downregulates": "upregulates",
+    "promotes": "suppresses",
+    "suppresses": "promotes",
+    "increases": "decreases",
+    "decreases": "increases",
+    "causes": "prevents",
+    "prevents": "causes",
+    "enables": "blocks",
+    "blocks": "enables",
+    "enhances": "reduces",
+    "reduces": "enhances",
+    "stabilizes": "destabilizes",
+    "destabilizes": "stabilizes",
+    "phosphorylates": "dephosphorylates",
+    "dephosphorylates": "phosphorylates",
+    "methylates": "demethylates",
+    "demethylates": "methylates",
 }
 
 # Predicate composition rules — (pred_A_to_C, pred_C_to_B) → predicted_A_to_B
@@ -58,16 +74,94 @@ PREDICATE_COMPOSITION: dict[tuple[str, str], str] = {
     ("inhibits", "upregulates"): "downregulates",
     # promotes chains
     ("promotes", "activates"): "promotes",
-    ("promotes", "inhibits"): "inhibits",
+    ("promotes", "inhibits"): "suppresses",
+    ("promotes", "promotes"): "promotes",
+    ("promotes", "suppresses"): "suppresses",
+    # suppresses chains (double negative)
+    ("suppresses", "activates"): "suppresses",
+    ("suppresses", "inhibits"): "promotes",
+    ("suppresses", "promotes"): "suppresses",
+    ("suppresses", "suppresses"): "promotes",
     # upregulates / downregulates
     ("upregulates", "activates"): "upregulates",
     ("upregulates", "inhibits"): "downregulates",
+    ("upregulates", "upregulates"): "upregulates",
+    ("upregulates", "downregulates"): "downregulates",
     ("downregulates", "activates"): "downregulates",
     ("downregulates", "inhibits"): "upregulates",
+    ("downregulates", "downregulates"): "upregulates",
+    ("downregulates", "upregulates"): "downregulates",
+    # causes / prevents chains
+    ("causes", "activates"): "activates",
+    ("causes", "inhibits"): "inhibits",
+    ("causes", "causes"): "causes",
+    ("causes", "prevents"): "prevents",
+    ("prevents", "activates"): "inhibits",
+    ("prevents", "inhibits"): "activates",
+    ("prevents", "causes"): "prevents",
+    ("prevents", "prevents"): "causes",
+    # increases / decreases
+    ("increases", "activates"): "activates",
+    ("increases", "inhibits"): "inhibits",
+    ("decreases", "activates"): "inhibits",
+    ("decreases", "inhibits"): "activates",
+    # enables / blocks
+    ("enables", "activates"): "activates",
+    ("enables", "inhibits"): "inhibits",
+    ("blocks", "activates"): "inhibits",
+    ("blocks", "inhibits"): "activates",
 }
 
-# Predicates that don't compose meaningfully
-_WEAK_PREDICATES: set[str] = {"associated_with", "relates_to", "resembles"}
+# Predicates that don't compose meaningfully — produce "associated_with" in compositions
+_WEAK_PREDICATES: set[str] = {
+    "associated_with", "relates_to", "resembles", "interacts_with",
+    "interacts", "coexpressed_with", "same_as", "associates",
+    "participates_in", "investigated_in", "regulates", "expresses",
+}
+
+# Causal predicates — directional, compose via PREDICATE_COMPOSITION rules
+CAUSAL_PREDICATES: set[str] = {
+    "activates", "inhibits", "upregulates", "downregulates",
+    "promotes", "suppresses", "increases", "decreases",
+    "causes", "prevents", "enables", "blocks",
+    "enhances", "reduces", "stabilizes", "destabilizes",
+    "phosphorylates", "dephosphorylates", "methylates", "demethylates",
+}
+
+# Predicate equivalence — semantically close predicates that should match
+# when comparing predictions against expected outcomes.
+# "upregulates" and "activates" both mean positive regulation;
+# "downregulates" and "inhibits" both mean negative regulation.
+PREDICATE_EQUIVALENCE: dict[str, str] = {
+    "activates": "positive",
+    "upregulates": "positive",
+    "promotes": "positive",
+    "increases": "positive",
+    "enables": "positive",
+    "enhances": "positive",
+    "stabilizes": "positive",
+    "inhibits": "negative",
+    "downregulates": "negative",
+    "suppresses": "negative",
+    "decreases": "negative",
+    "blocks": "negative",
+    "reduces": "negative",
+    "destabilizes": "negative",
+    "prevents": "negative",
+}
+
+
+def predicates_agree(pred_a: str, pred_b: str) -> bool:
+    """Check if two predicates are semantically equivalent (same direction).
+
+    Returns True if both are positive regulation or both are negative.
+    Returns False if they oppose or either is unknown.
+    """
+    class_a = PREDICATE_EQUIVALENCE.get(pred_a)
+    class_b = PREDICATE_EQUIVALENCE.get(pred_b)
+    if class_a and class_b:
+        return class_a == class_b
+    return pred_a == pred_b
 
 
 def compose_predicates(pred_ac: str, pred_cb: str) -> str:

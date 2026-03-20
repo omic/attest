@@ -317,6 +317,7 @@ def claims_for(
             "confidence": c.confidence,
             "source_type": c.provenance.source_type,
             "source_id": c.provenance.source_id,
+            "source_url": _source_url(c.provenance.source_id, c.provenance.source_type),
         }
         for c in claims[:50]
     ])
@@ -364,6 +365,24 @@ def quality_report() -> str:
     db = _get_db()
     report = db.quality_report()
     return _serialize(report)
+
+
+def _source_url(source_id: str, source_type: str = "") -> str | None:
+    """Resolve source_id to URL (cached import)."""
+    from attestdb.core.provenance import resolve_source_url
+    return resolve_source_url(source_id, source_type)
+
+
+@mcp.tool()
+def resolve_source_url(source_id: str, source_type: str = "") -> str:
+    """Resolve a claim's source_id to a clickable URL for the original source.
+
+    Returns the URL string or null if no URL can be derived.
+    Supports 30+ sources: PubMed, UniProt, CTD, Slack, GitHub, etc.
+    """
+    _track_tool_call("resolve_source_url", source_id[:80])
+    url = _source_url(source_id, source_type)
+    return json.dumps({"source_id": source_id, "url": url})
 
 
 @mcp.tool()
@@ -449,6 +468,10 @@ def changes(since: int = 0, limit: int = 100) -> str:
                 "confidence": c.confidence,
                 "namespace": c.namespace,
                 "timestamp": c.timestamp,
+                "source_url": _source_url(
+                    c.provenance.source_id if c.provenance else "",
+                    c.provenance.source_type if c.provenance else "",
+                ),
             }
             for c in claims
         ],
@@ -594,14 +617,17 @@ def claims_in_namespace(namespace: str, limit: int = 500) -> str:
         claims = []
         for claim in db.iter_claims():
             payload_data = claim.payload.data if claim.payload else {}
+            src_id = claim.provenance.source_id if claim.provenance else ""
+            src_type = claim.provenance.source_type if claim.provenance else ""
             claims.append({
                 "claim_id":   claim.claim_id,
                 "subject":    claim.subject.id,
                 "predicate":  claim.predicate.id,
                 "object":     claim.object.id,
                 "confidence": claim.confidence,
-                "source_type": claim.provenance.source_type if claim.provenance else "",
-                "source_id":   claim.provenance.source_id if claim.provenance else "",
+                "source_type": src_type,
+                "source_id":   src_id,
+                "source_url":  _source_url(src_id, src_type),
                 "payload":    payload_data,
                 "timestamp":  claim.timestamp,
             })
@@ -793,6 +819,124 @@ def attest_hypothetical(
     )
     report = db.hypothetical(claim)
     return _serialize(report)
+
+
+# Active sandboxes for multi-step sandbox sessions
+_active_sandboxes: dict[str, object] = {}
+
+
+@mcp.tool()
+def attest_what_if(
+    subject_id: str, subject_type: str,
+    predicate_id: str, predicate_type: str,
+    object_id: str, object_type: str,
+    confidence: float = 0.6,
+) -> str:
+    """Rich hypothetical reasoning: create sandbox, analyze evidence paths, gaps, contradictions.
+
+    Returns a SandboxVerdict with multi-hop evidence, predicted predicates,
+    gap detection, follow-up suggestions, and an overall verdict — all instant,
+    no LLM calls.
+    """
+    db = _get_db()
+    verdict = db.what_if(
+        (subject_id, subject_type),
+        (predicate_id, predicate_type),
+        (object_id, object_type),
+        confidence=confidence,
+    )
+    return _serialize(verdict)
+
+
+@mcp.tool()
+def attest_sandbox_create(
+    description: str,
+    seed_entities: Optional[str] = None,
+) -> str:
+    """Create a hypothetical sandbox for multi-step reasoning.
+
+    Returns a sandbox_id. Use attest_sandbox_analyze to test hypotheses in it.
+    seed_entities: comma-separated entity IDs to preload.
+    """
+    db = _get_db()
+    entities = [e.strip() for e in seed_entities.split(",")] if seed_entities else []
+    ctx = db.hypothetical_sandbox(description, seed_entities=entities)
+    sandbox_id = str(uuid.uuid4())[:8]
+    _active_sandboxes[sandbox_id] = ctx
+    return json.dumps({"sandbox_id": sandbox_id, "description": description,
+                        "claims_loaded": ctx.sandbox.count_claims()})
+
+
+@mcp.tool()
+def attest_sandbox_analyze(
+    sandbox_id: str,
+    subject_id: str, subject_type: str,
+    predicate_id: str, predicate_type: str,
+    object_id: str, object_type: str,
+    confidence: float = 0.6,
+) -> str:
+    """Test a hypothesis in an existing sandbox and get rich analysis.
+
+    Returns SandboxVerdict with evidence paths, contradictions, gaps, and suggestions.
+    """
+    ctx = _active_sandboxes.get(sandbox_id)
+    if ctx is None:
+        return json.dumps({"error": f"Sandbox {sandbox_id} not found. Create one with attest_sandbox_create."})
+    verdict = ctx.ingest_and_analyze(
+        subject=(subject_id, subject_type),
+        predicate=(predicate_id, predicate_type),
+        object_=(object_id, object_type),
+        confidence=confidence,
+    )
+    return _serialize(verdict)
+
+
+@mcp.tool()
+def attest_predict(
+    entity_id: str,
+    max_intermediaries: int = 100,
+    min_paths: int = 3,
+    top_k: int = 20,
+) -> str:
+    """Discover novel regulatory predictions for an entity via causal composition.
+
+    Follows causal edges (activates, inhibits, upregulates, downregulates)
+    through intermediaries and composes them to predict new relationships.
+    Returns predictions ranked by convergent evidence — genuine gaps first.
+    No LLM calls. Pure graph structure.
+
+    Example: attest_predict("gene_7157") discovers genes TP53 likely
+    up/downregulates based on shared chemical intermediaries across 30+ databases.
+    """
+    db = _get_db()
+    predictions = db.predict(
+        entity_id,
+        max_intermediaries=max_intermediaries,
+        min_paths=min_paths,
+    )
+    results = []
+    for p in predictions[:top_k]:
+        results.append({
+            "target": p.target,
+            "predicted_predicate": p.predicted_predicate,
+            "supporting_paths": p.supporting_paths,
+            "opposing_paths": p.opposing_paths,
+            "consensus": round(p.consensus, 2),
+            "intermediaries": p.intermediaries,
+            "is_gap": p.is_gap,
+            "existing_predicates": p.existing_predicates,
+            "top_evidence": [
+                {
+                    "path": ie.path,
+                    "predicates": ie.predicates,
+                    "composed": ie.predicted_predicate,
+                    "confidence": round(ie.confidence, 4),
+                }
+                for ie in p.evidence[:3]
+            ],
+        })
+    return json.dumps({"entity": entity_id, "predictions": len(predictions),
+                        "top": results}, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -2903,13 +3047,17 @@ def agent_consensus(
 
 @mcp.resource("attest://entities")
 def list_all_entities() -> str:
-    """Full entity list."""
+    """Entity list (capped at 1000 by claim count)."""
     db = _get_db()
-    entities = db.list_entities()
-    return json.dumps([
+    entities = db.list_entities(limit=1000)
+    entities.sort(key=lambda e: -e.claim_count)
+    result = [
         {"id": e.id, "name": e.name, "type": e.entity_type, "claim_count": e.claim_count}
-        for e in entities
-    ])
+        for e in entities[:1000]
+    ]
+    if len(entities) >= 1000:
+        result.append({"_note": "Results truncated to 1000 entities. Use search_entities for specific queries."})
+    return json.dumps(result)
 
 
 @mcp.resource("attest://schema")

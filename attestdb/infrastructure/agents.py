@@ -684,22 +684,56 @@ class AttestAgent:
         self._entity_id = register_agent(
             db, agent_id, capabilities=capabilities, model=model
         )
+        self._domain_stats: dict[str, dict[str, int]] = {}
+
+    def _track_outcome(self, entity_type: str, success: bool) -> None:
+        """Record whether a research attempt in this domain succeeded."""
+        if entity_type not in self._domain_stats:
+            self._domain_stats[entity_type] = {"successes": 0, "attempts": 0}
+        self._domain_stats[entity_type]["attempts"] += 1
+        if success:
+            self._domain_stats[entity_type]["successes"] += 1
+
+    def _affinity_score(self, entity_type: str) -> float:
+        """How much this agent should prefer tasks in this domain. Higher = more affinity."""
+        stats = self._domain_stats.get(entity_type)
+        if not stats or stats["attempts"] < 2:
+            return 1.0  # neutral — haven't tried enough
+        return stats["successes"] / stats["attempts"]
+
+    @property
+    def specializations(self) -> list[tuple[str, float]]:
+        """Domains ranked by affinity. Shows emergent specialization."""
+        return sorted(
+            [(d, self._affinity_score(d)) for d in self._domain_stats],
+            key=lambda x: -x[1],
+        )
 
     def next_task(
         self,
         gap_types: list[str] | None = None,
         entity_types: list[str] | None = None,
+        max_candidates: int = 10,
     ) -> tuple[ResearchTask, dict] | None:
         """Claim the highest-priority task from the queue.
+
+        Uses affinity scoring to bias toward domains where this agent
+        has historically succeeded. Tasks are scored by
+        ``priority * affinity_score(entity_type)``.
 
         Returns (task, context) where context is the research context for the
         task's entity, or None if no tasks are available.
         """
         tasks = generate_tasks(
-            self.db, max_tasks=1, gap_types=gap_types, entity_types=entity_types
+            self.db, max_tasks=max_candidates, gap_types=gap_types, entity_types=entity_types
         )
         if not tasks:
             return None
+        # Score by priority * domain affinity
+        if self._domain_stats:
+            tasks.sort(
+                key=lambda t: -(t.priority * self._affinity_score(t.entity_type)),
+            )
         task = tasks[0]
         claim_task(self.db, self.agent_id, task.entity_id)
         task.claimed_by = self.agent_id

@@ -12,6 +12,7 @@ import shutil
 import tempfile
 import threading
 import time
+import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
@@ -121,6 +122,306 @@ def _make_store(db_path: str, *, read_only: bool = False):
     return RustStore(rust_path)
 
 
+class HypotheticalContext:
+    """Sandbox for speculative what-if reasoning.
+
+    Created by AttestDB.hypothetical(). Supports context manager protocol.
+    """
+
+    def __init__(self, sandbox: "AttestDB", parent: "AttestDB", description: str):
+        self.sandbox = sandbox
+        self._parent = parent
+        self.description = description
+        self._parent_claim_ids = {
+            d["claim_id"]
+            for d in parent._store.all_claims(0, 0)
+        }
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.sandbox.close()
+
+    @property
+    def new_claims(self) -> list[Claim]:
+        """Claims in sandbox that aren't in parent (by claim_id)."""
+        result = []
+        for d in self.sandbox._store.all_claims(0, 0):
+            if d["claim_id"] not in self._parent_claim_ids:
+                result.append(claim_from_dict(d))
+        return result
+
+    def find_contradictions(self) -> list[tuple[Claim, Claim]]:
+        """Find pairs where same (subject, object) have opposing predicates."""
+        from attestdb.core.vocabulary import OPPOSITE_PREDICATES
+
+        contradictions = []
+        new = self.new_claims
+        for nc in new:
+            pred = nc.predicate.id
+            opposite = OPPOSITE_PREDICATES.get(pred)
+            if not opposite:
+                continue
+            # Check sandbox for claims with opposite predicate on same entities
+            for d in self.sandbox._store.claims_for(nc.subject.id, None, None, 0.0):
+                existing = claim_from_dict(d)
+                if existing.claim_id == nc.claim_id:
+                    continue
+                if (existing.predicate.id == opposite
+                        and existing.object.id == nc.object.id):
+                    contradictions.append((nc, existing))
+        return contradictions
+
+    def promote(self, min_confidence: float = 0.0) -> int:
+        """Merge new claims back to parent. Returns count promoted."""
+        count = 0
+        for claim in self.new_claims:
+            if claim.confidence < min_confidence:
+                continue
+            self._parent.ingest(
+                subject=(claim.subject.id, claim.subject.entity_type),
+                predicate=(claim.predicate.id, claim.predicate.predicate_type),
+                object=(claim.object.id, claim.object.entity_type),
+                provenance={
+                    "source_type": claim.provenance.source_type,
+                    "source_id": claim.provenance.source_id,
+                    "method": "hypothetical_reasoning",
+                },
+                confidence=claim.confidence,
+            )
+            count += 1
+        return count
+
+    def report(self) -> str:
+        """Summary of new claims and contradictions found."""
+        new = self.new_claims
+        contradictions = self.find_contradictions()
+        lines = [f'Hypothesis: "{self.description}"']
+        lines.append(f"New claims in sandbox: {len(new)}")
+        for c in new:
+            lines.append(f"  + {c.subject.id} —{c.predicate.id}→ {c.object.id} (conf: {c.confidence:.2f})")
+        if contradictions:
+            lines.append(f"Contradictions found: {len(contradictions)}")
+            for nc, existing in contradictions:
+                lines.append(
+                    f"  ✗ {nc.predicate.id} vs {existing.predicate.id}"
+                    f" on {nc.subject.id}→{nc.object.id}"
+                    f" (existing conf: {existing.confidence:.2f})"
+                )
+        else:
+            lines.append("Contradictions: none")
+        return "\n".join(lines)
+
+    def analyze(self):
+        """Rich analysis of all new claims in the sandbox.
+
+        Returns a SandboxVerdict with direct contradictions, multi-hop evidence,
+        gap analysis, follow-up suggestions, and an overall verdict — all purely
+        graph-structural, no LLM calls.
+        """
+        from attestdb.core.types import IndirectEvidence, SandboxVerdict
+        from attestdb.core.vocabulary import OPPOSITE_PREDICATES, compose_predicates
+
+        new = self.new_claims
+        if not new:
+            return SandboxVerdict(hypothesis=self.description, explanation="No claims to analyze.")
+
+        all_direct_contradictions: list[tuple[str, str]] = []
+        total_corroborations = 0
+        all_indirect: list[IndirectEvidence] = []
+        gaps_closed = 0
+        gap_descs: list[str] = []
+        follow_ups: list[str] = []
+
+        for nc in new:
+            subj_id = nc.subject.id
+            obj_id = nc.object.id
+            hyp_pred = nc.predicate.id
+
+            # 1. Direct contradictions
+            opposite = OPPOSITE_PREDICATES.get(hyp_pred)
+            if opposite:
+                for d in self.sandbox._store.claims_for(subj_id, None, None, 0.0):
+                    existing = claim_from_dict(d)
+                    if existing.claim_id == nc.claim_id:
+                        continue
+                    if existing.predicate.id == opposite and existing.object.id == obj_id:
+                        all_direct_contradictions.append((hyp_pred, existing.predicate.id))
+
+            # 2. Direct corroborations (same content_id in parent)
+            content_id = nc.content_id
+            parent_matches = self._parent.claims_by_content_id(content_id)
+            total_corroborations += len(parent_matches)
+
+            # 3. Multi-hop evidence via find_paths on parent
+            try:
+                paths = self._parent.find_paths(subj_id, obj_id, max_depth=3, top_k=5)
+            except Exception:
+                paths = []
+
+            for path in paths:
+                if len(path.steps) < 2:
+                    continue
+                entity_ids = [path.steps[0].entity_id] + [s.entity_id for s in path.steps[1:]]
+                preds = [s.predicate for s in path.steps]
+                # Compose predicates along the chain
+                composed = preds[0]
+                for p in preds[1:]:
+                    composed = compose_predicates(composed, p)
+                # Determine direction
+                if composed == hyp_pred:
+                    direction = "supporting"
+                elif OPPOSITE_PREDICATES.get(composed) == hyp_pred or OPPOSITE_PREDICATES.get(hyp_pred) == composed:
+                    direction = "contradicting"
+                else:
+                    direction = "neutral"
+                all_indirect.append(IndirectEvidence(
+                    path=entity_ids,
+                    predicates=preds,
+                    predicted_predicate=composed,
+                    confidence=path.total_confidence,
+                    direction=direction,
+                ))
+
+            # 4. Gap detection — does this hypothesis bridge disconnected entities?
+            subj_exists = self._parent._store.get_entity(
+                normalize_entity_id(subj_id)) is not None
+            obj_exists = self._parent._store.get_entity(
+                normalize_entity_id(obj_id)) is not None
+            if subj_exists and obj_exists:
+                if not self._parent.path_exists(subj_id, obj_id, max_depth=2):
+                    gaps_closed += 1
+                    gap_descs.append(
+                        f"{subj_id} and {obj_id} exist but are not connected within 2 hops"
+                    )
+
+            # 5. Follow-up suggestions
+            follow_ups.extend(self._suggest_nearby(subj_id, obj_id))
+
+        # Deduplicate follow-ups
+        seen = set()
+        unique_follow_ups = []
+        for f in follow_ups:
+            if f not in seen:
+                seen.add(f)
+                unique_follow_ups.append(f)
+        follow_ups = unique_follow_ups[:5]
+
+        # Best predicted predicate from indirect evidence
+        supporting = [ie for ie in all_indirect if ie.direction == "supporting"]
+        contradicting = [ie for ie in all_indirect if ie.direction == "contradicting"]
+        if supporting:
+            predicted = supporting[0].predicted_predicate
+        elif all_indirect:
+            predicted = all_indirect[0].predicted_predicate
+        else:
+            predicted = ""
+
+        # Score and verdict
+        score = 0.5  # base
+        score += min(total_corroborations * 0.15, 0.3)
+        score += min(len(supporting) * 0.1, 0.2)
+        score -= min(len(all_direct_contradictions) * 0.25, 0.5)
+        score -= min(len(contradicting) * 0.1, 0.2)
+        score += min(gaps_closed * 0.05, 0.1)
+        score = max(0.0, min(1.0, score))
+
+        if all_direct_contradictions:
+            verdict = "contradicted"
+        elif total_corroborations > 0 and not contradicting:
+            verdict = "supported"
+        elif supporting or gaps_closed > 0:
+            verdict = "plausible"
+        else:
+            verdict = "insufficient_data"
+
+        # Build explanation
+        parts = []
+        if all_direct_contradictions:
+            parts.append(f"{len(all_direct_contradictions)} direct contradiction(s)")
+        if total_corroborations:
+            parts.append(f"{total_corroborations} existing corroboration(s)")
+        if supporting:
+            parts.append(f"{len(supporting)} supporting indirect path(s)")
+        if contradicting:
+            parts.append(f"{len(contradicting)} contradicting indirect path(s)")
+        neutral = [ie for ie in all_indirect if ie.direction == "neutral"]
+        if neutral and not supporting and not contradicting:
+            parts.append(f"{len(neutral)} indirect path(s) (neutral)")
+        if gaps_closed:
+            parts.append(f"closes {gaps_closed} gap(s)")
+        explanation = "; ".join(parts) if parts else "No evidence found in graph."
+
+        return SandboxVerdict(
+            hypothesis=self.description,
+            verdict=verdict,
+            direct_contradictions=all_direct_contradictions,
+            direct_corroborations=total_corroborations,
+            indirect_evidence=all_indirect,
+            predicted_predicate=predicted,
+            gaps_closed=gaps_closed,
+            gap_descriptions=gap_descs,
+            follow_up_hypotheses=follow_ups,
+            confidence_score=score,
+            explanation=explanation,
+        )
+
+    def _suggest_nearby(self, subj_id: str, obj_id: str) -> list[str]:
+        """Find entities 1-hop from subject/object in parent that are unconnected."""
+        subj_neighbors: set[str] = set()
+        obj_neighbors: set[str] = set()
+        for d in self._parent._store.claims_for(subj_id, None, None, 0.0):
+            c = claim_from_dict(d)
+            subj_neighbors.add(c.object.id if c.subject.id == normalize_entity_id(subj_id) else c.subject.id)
+        for d in self._parent._store.claims_for(obj_id, None, None, 0.0):
+            c = claim_from_dict(d)
+            obj_neighbors.add(c.object.id if c.subject.id == normalize_entity_id(obj_id) else c.subject.id)
+
+        suggestions = []
+        for sn in subj_neighbors:
+            if sn == obj_id or sn == subj_id:
+                continue
+            for on in obj_neighbors:
+                if on == subj_id or on == obj_id or on == sn:
+                    continue
+                if not self._parent.path_exists(sn, on, max_depth=1):
+                    suggestions.append(f"{sn} may relate to {on}")
+                    if len(suggestions) >= 5:
+                        return suggestions
+        return suggestions
+
+    def ingest_and_analyze(self, subject, predicate, object_, confidence=0.6,
+                           source_type="hypothesis", source_id="agent"):
+        """Add a hypothesis claim to the sandbox and immediately analyze.
+
+        Args:
+            subject: (id, entity_type) tuple
+            predicate: (id, predicate_type) tuple
+            object_: (id, entity_type) tuple
+            confidence: claim confidence (default 0.6)
+            source_type: provenance source type
+            source_id: provenance source id
+
+        Returns:
+            SandboxVerdict with full analysis.
+        """
+        self.sandbox.ingest(
+            subject=subject,
+            predicate=predicate,
+            object=object_,
+            provenance={"source_type": source_type, "source_id": source_id},
+            confidence=confidence,
+        )
+        return self.analyze()
+
+    def report_dict(self) -> dict:
+        """Machine-readable report for MCP serialization."""
+        from dataclasses import asdict
+        verdict = self.analyze()
+        return asdict(verdict)
+
+
 class AttestDB:
     """Main entry point for Attest — wraps all infrastructure components."""
 
@@ -163,6 +464,8 @@ class AttestDB:
         instance._autodidact = None
         instance._federation = None
         instance._decay_config = None
+        instance._subscriptions = {}
+        instance._trust_policy = None
         instance._curator = None
         instance._text_extractor = None
         instance._insight_engine = None
@@ -172,6 +475,8 @@ class AttestDB:
         instance._curator_api_key = None
         instance._curator_env_path = None
         instance._domain_context = None
+        instance._cache = {}
+        instance._cache_ts = {}
         return instance
 
     def __init__(
@@ -282,6 +587,12 @@ class AttestDB:
         # Confidence decay config (query-time only)
         self._decay_config: "DecayConfig | None" = None
 
+        # Topic subscriptions (in-memory session state)
+        self._subscriptions: dict[str, dict] = {}
+
+        # Trust policy (in-memory session state)
+        self._trust_policy: list | None = None
+
         # Lazy-init intelligence components
         self._curator = None
         self._text_extractor = None
@@ -292,6 +603,27 @@ class AttestDB:
         self._curator_api_key = None
         self._curator_env_path = None
         self._domain_context: str | None = None
+
+        # TTL cache for expensive analytical methods
+        self._cache: dict[str, object] = {}
+        self._cache_ts: dict[str, float] = {}
+
+    # --- TTL cache helper ---
+
+    def _cached(self, key: str, fn, ttl: float = 120) -> object:
+        """Return cached result or call fn() on cache miss. Thread-safe."""
+        now = time.time()
+        if key in self._cache and (now - self._cache_ts.get(key, 0)) < ttl:
+            return self._cache[key]
+        result = fn()
+        self._cache[key] = result
+        self._cache_ts[key] = now
+        return result
+
+    def _invalidate_cache(self) -> None:
+        """Clear all cached analytical results (called on writes)."""
+        self._cache.clear()
+        self._cache_ts.clear()
 
     # --- Retraction sidecar migration ---
 
@@ -807,6 +1139,174 @@ class AttestDB:
         new_cursor = claims[-1].timestamp if claims else since
         return claims, new_cursor
 
+    # --- Topic subscriptions ---
+
+    def subscribe(
+        self,
+        subscriber_id: str,
+        topics: list[str],
+        callback,
+        predicates: list[str] | None = None,
+        min_confidence: float = 0.0,
+    ) -> str:
+        """Register interest in topics. Callback fires on matching ingested claims.
+
+        Args:
+            subscriber_id: Identifier for the subscribing agent.
+            topics: Entity IDs to watch (normalized for matching).
+            callback: Called with (claim, sub_id, subscriber_id) on match.
+            predicates: If set, only match claims with these predicate IDs.
+            min_confidence: Minimum confidence to trigger notification.
+
+        Returns:
+            Subscription ID (use to unsubscribe).
+        """
+        sub_id = str(uuid.uuid4())
+        self._subscriptions[sub_id] = {
+            "subscriber_id": subscriber_id,
+            "topics": {normalize_entity_id(t) for t in topics},
+            "callback": callback,
+            "predicates": set(predicates) if predicates else None,
+            "min_confidence": min_confidence,
+        }
+        return sub_id
+
+    def unsubscribe(self, sub_id: str) -> bool:
+        """Remove a subscription. Returns True if it existed."""
+        return self._subscriptions.pop(sub_id, None) is not None
+
+    def _check_subscriptions(self, claim_id: str, claim_input: ClaimInput) -> None:
+        """Check all subscriptions against a newly ingested claim."""
+        if not self._subscriptions:
+            return
+        subj_id = normalize_entity_id(claim_input.subject[0])
+        obj_id = normalize_entity_id(claim_input.object[0])
+        pred_id = claim_input.predicate[0]
+        conf = claim_input.confidence if claim_input.confidence is not None else 0.5
+        # Build a lightweight claim dict for callbacks
+        claim = claim_from_dict(self._store.get_claim(claim_id)) if claim_id else None
+        for sub_id, sub in list(self._subscriptions.items()):
+            if conf < sub["min_confidence"]:
+                continue
+            if sub["predicates"] is not None and pred_id not in sub["predicates"]:
+                continue
+            if subj_id in sub["topics"] or obj_id in sub["topics"]:
+                try:
+                    sub["callback"](claim, sub_id, sub["subscriber_id"])
+                except Exception as exc:
+                    logger.warning("Subscription %s callback failed: %s", sub_id, exc)
+
+    # --- Hypothetical reasoning ---
+
+    def hypothetical_sandbox(self, description: str, seed_entities: list[str] | None = None):
+        """Create a lightweight sandbox for speculative reasoning.
+
+        Returns a HypotheticalContext (use as context manager) with:
+        - .sandbox: an in-memory AttestDB preloaded with relevant claims
+        - .promote(): merge surviving claims back to parent
+        - .report(): summary of new claims, contradictions, gaps
+
+        Usage::
+
+            with db.hypothetical_sandbox("BRCA1 inhibits PD-L1", seed_entities=["BRCA1", "PD-L1"]) as h:
+                h.sandbox.ingest(subject=("BRCA1", "gene"), ...)
+                contradictions = h.find_contradictions()
+                if not contradictions:
+                    h.promote()
+        """
+        sandbox = AttestDB(":memory:", embedding_dim=None)
+
+        # Determine seed entities
+        entities = seed_entities or []
+        if not entities:
+            # Try to extract entity IDs from description
+            for word in description.replace(",", " ").split():
+                word = word.strip()
+                if word and len(word) > 1:
+                    results = self._store.search_entities(word, 3)
+                    for r in results:
+                        entities.append(r["id"])
+
+        # Copy claims within 2 hops of seed entities
+        seen_claims = set()
+        for entity_id in entities:
+            for depth_hop in range(2):
+                hop_entities = [entity_id] if depth_hop == 0 else list(neighbors)
+                neighbors = set()
+                for eid in hop_entities:
+                    for cd in self._store.claims_for(eid, None, None, 0.0):
+                        cid = cd["claim_id"]
+                        if cid in seen_claims:
+                            continue
+                        seen_claims.add(cid)
+                        claim = claim_from_dict(cd)
+                        sandbox.ingest(
+                            subject=(claim.subject.id, claim.subject.entity_type),
+                            predicate=(claim.predicate.id, claim.predicate.predicate_type),
+                            object=(claim.object.id, claim.object.entity_type),
+                            provenance={
+                                "source_type": claim.provenance.source_type,
+                                "source_id": claim.provenance.source_id,
+                                "method": claim.provenance.method,
+                            },
+                            confidence=claim.confidence,
+                            timestamp=claim.timestamp,
+                        )
+                        neighbors.add(claim.subject.id)
+                        neighbors.add(claim.object.id)
+
+        return HypotheticalContext(sandbox=sandbox, parent=self, description=description)
+
+    # --- Trust policies ---
+
+    def set_trust_policy(self, rules: list) -> None:
+        """Set trust policy for current session. Filters claims_for() results.
+
+        Each rule is a TrustRule (from core.types). First matching rule wins.
+        Claims that match no rule are included by default.
+        """
+        self._trust_policy = rules
+
+    def clear_trust_policy(self) -> None:
+        """Remove trust policy — all claims visible."""
+        self._trust_policy = None
+
+    def _apply_trust_filter(self, claims: list[Claim]) -> list[Claim]:
+        """Apply trust policy to a list of claims. Returns filtered list."""
+        if not self._trust_policy:
+            return claims
+        result = []
+        for claim in claims:
+            action = self._match_trust_rule(claim)
+            if action == "include":
+                result.append(claim)
+        return result
+
+    def _match_trust_rule(self, claim: Claim) -> str:
+        """Find the first matching trust rule for a claim. Returns action."""
+        from attestdb.core.types import TrustRule
+        for rule in self._trust_policy:
+            matched = True
+            if rule.source_types is not None:
+                if claim.provenance.source_type not in rule.source_types:
+                    matched = False
+            if rule.source_ids is not None:
+                if claim.provenance.source_id not in rule.source_ids:
+                    matched = False
+            if rule.predicates is not None:
+                if claim.predicate.id not in rule.predicates:
+                    matched = False
+            if rule.min_confidence is not None:
+                if claim.confidence < rule.min_confidence:
+                    matched = False
+            if rule.min_corroboration is not None:
+                corr = len(self.claims_by_content_id(claim.content_id))
+                if corr < rule.min_corroboration:
+                    matched = False
+            if matched:
+                return rule.action
+        return "include"  # default: include if no rule matches
+
     # --- Event hooks ---
 
     def on(self, event: str, callback) -> None:
@@ -1312,6 +1812,7 @@ class AttestDB:
             self._append_chain(claim_id)
             self._flush_chain_log()
             _set_attr("claim_id", claim_id)
+        self._invalidate_cache()
         self._audit_write(
             "claim_ingested",
             claim_id=claim_id,
@@ -1321,6 +1822,7 @@ class AttestDB:
             object=ci.object[0],
         )
         self._fire("claim_ingested", claim_id=claim_id, claim_input=ci)
+        self._check_subscriptions(claim_id, ci)
         # Check corroboration
         content_id = compute_content_id(
             normalize_entity_id(ci.subject[0]),
@@ -1346,6 +1848,7 @@ class AttestDB:
             _set_attr("ingested", result.ingested)
             _set_attr("duplicates", result.duplicates)
         if result.ingested > 0:
+            self._invalidate_cache()
             self._audit_write(
                 "batch_ingested",
                 count=result.ingested,
@@ -1811,12 +2314,16 @@ class AttestDB:
         if len(entity_ids) <= 1:
             return [list(entity_ids)] if entity_ids else []
 
-        adj = self.get_adjacency_list()
-
-        # Build neighbor sets for each candidate (from full graph adjacency)
+        # Build neighbor sets only for the candidate entities (not the full graph)
         neighbors: dict[str, set[str]] = {}
         for eid in entity_ids:
-            neighbors[eid] = adj.get(eid, set())
+            raw = self._store.claims_for(eid, None, None, 0.0)
+            adj: set[str] = set()
+            for c in raw:
+                claim = claim_from_dict(c)
+                other = claim.object.id if claim.subject.id == eid else claim.subject.id
+                adj.add(other)
+            neighbors[eid] = adj
 
         # Build candidate-level adjacency: two candidates are connected if
         # they share a direct edge OR share >= 1 common neighbor (2-hop)
@@ -1901,7 +2408,8 @@ class AttestDB:
         clusters: list[list[str]],
         entity_map: dict[str, "EntitySummary"],
         max_rels: int = DEFAULT_MAX_RELATIONSHIPS,
-    ) -> str:
+        collect_citations: bool = False,
+    ) -> str | tuple:
         """Build evidence organized by topic cluster.
 
         Each cluster gets a ``# Topic: {label}`` section header.
@@ -1912,37 +2420,40 @@ class AttestDB:
         total_entities = sum(len(c) for c in clusters)
 
         sections: list[str] = []
+        all_citations: list[Citation] = []
+        all_contradictions: list[dict] = []
+        all_gaps: list[str] = []
         for cluster in clusters:
             label = self._label_cluster(cluster, entity_map)
-            # Proportional budget, floor of 60
             budget = max(ENTITY_BUDGET_FLOOR, int(max_rels * len(cluster) / max(total_entities, 1)))
-            evidence = self._gather_evidence(cluster, max_rels=budget)
+            if collect_citations:
+                evidence, cit, contra, gaps = self._gather_evidence(
+                    cluster, max_rels=budget, collect_citations=True,
+                )
+                all_citations.extend(cit)
+                all_contradictions.extend(contra)
+                for g in gaps:
+                    if g not in all_gaps:
+                        all_gaps.append(g)
+            else:
+                evidence = self._gather_evidence(cluster, max_rels=budget)
             if evidence.strip():
                 sections.append(f"# Topic: {label}\n{evidence}")
 
-        return "\n\n".join(sections)
+        text = "\n\n".join(sections)
+        if collect_citations:
+            return text, all_citations, all_contradictions, all_gaps
+        return text
 
     def ask(self, question: str, top_k: int = 10) -> AskResult:
         """Answer a natural-language question using the knowledge graph.
 
-        Two lightweight LLM passes:
-        1. Select relevant entity types from a compact catalog
-        2. Gather deep evidence for matching entities and synthesize
+        Fast path (search hits >= 3): search → evidence → single LLM call.
+        Slow path (few search hits): adds type catalog + LLM type selection.
 
         Returns AskResult with structured citations, contradictions, and gaps.
         Dict-compatible for backward compat (r["answer"] works).
         """
-        all_entities = self.list_entities()
-        if not all_entities:
-            return AskResult(meta={"n_searched": 0, "n_search_hits": 0, "selected_types": []})
-
-        # Group entities by type
-        by_type: dict[str, list] = {}
-        for e in all_entities:
-            by_type.setdefault(e.entity_type, []).append(e)
-        for t in by_type:
-            by_type[t].sort(key=lambda e: -e.claim_count)
-
         # Step 1: Search for entities whose names match the question
         _stop = frozenset({
             "what", "who", "how", "why", "when", "where", "which", "does",
@@ -1955,28 +2466,27 @@ class AttestDB:
             "to", "it", "its", "be", "not", "no", "or", "but", "if",
             "than", "them", "they", "their", "there", "then", "top",
             "best", "most", "also", "just", "only", "very", "more",
+            "good", "bad", "new", "old", "like", "use", "used", "using",
+            "target", "role", "effect", "type", "cause", "work", "works",
+            "related", "involved", "between", "affect", "impact",
         })
         words = [w.strip("?.,!\"'()[]{}:;") for w in question.lower().split()]
         query_terms = " ".join(w for w in words if w and len(w) >= 2 and w not in _stop)
 
         search_hits: list = []
         if query_terms:
-            # Get candidates from text index, then rank by claim count
-            # so knowledge-rich entities surface above name-only matches
             search_hits = self.search_entities(query_terms, top_k=30)
 
-            # Also search individual content words and progressively
-            # shorter prefixes — the text index does exact token matching,
-            # so "immunotoxicity" won't match "immunotox". Trying prefixes
-            # from len-2 down to 5 chars catches stem variations.
+            # Also search individual content words (catches entities whose
+            # names match only one query term, e.g. "Pain" for "gpr55 pain")
+            # and progressively shorter prefixes for stem variations.
             hit_ids = {e.id for e in search_hits}
-            content_words = [w for w in query_terms.split() if len(w) >= 5]
+            content_words = [w for w in query_terms.split() if len(w) >= 3]
             for word in content_words:
                 for hit in self.search_entities(word, top_k=10):
                     if hit.id not in hit_ids:
                         search_hits.append(hit)
                         hit_ids.add(hit.id)
-                # Try progressively shorter prefixes
                 if len(word) >= 7:
                     for plen in range(len(word) - 2, 4, -1):
                         prefix = word[:plen]
@@ -1986,83 +2496,89 @@ class AttestDB:
                                 search_hits.append(hit)
                                 hit_ids.add(hit.id)
                         if len(hit_ids) > before:
-                            break  # found new hits at this prefix length
+                            break
 
             search_hits.sort(key=lambda e: -e.claim_count)
-            search_hits = search_hits[:10]
+            search_hits = search_hits[:top_k]
 
-        # Step 2: Ask LLM which entity types are relevant to the question
-        # Include types with >= 3 entities (singletons/pairs are noise)
-        min_type_size = 3
-        type_catalog = ", ".join(
-            f"{t} ({len(ents)}: "
-            f"{', '.join((e.name or e.id) for e in ents[:2])})"
-            for t, ents in sorted(by_type.items(), key=lambda x: -len(x[1]))
-            if len(ents) >= min_type_size
-        )
-        type_prompt = (
-            f"Entity types in a knowledge graph: {type_catalog}\n\n"
-            f"Question: {question}\n\n"
-            "Which 5-8 entity types contain the most interesting "
-            "domain-specific knowledge for answering this question? "
-            "Avoid generic types like process, concept, information, "
-            "activity, task, or change. "
-            "Return ONLY type names, comma-separated."
-        )
-        type_response = self._llm_call(type_prompt, max_tokens=100, temperature=0.0)
-
+        # Step 2: Build entity set
+        # Fast path: search hits are sufficient — skip type catalog + LLM type selection
+        # Filter to entities whose names actually contain a query term (BM25 can
+        # return high-claim-count entities with marginal text overlap in small DBs)
         selected_types: set[str] = set()
-        if type_response:
-            for part in type_response.split(","):
-                t = part.strip().lower()
-                if t in by_type:
-                    selected_types.add(t)
+        if search_hits and query_terms:
+            terms_lower = set(query_terms.lower().split())
+            relevant_hits: list = []
+            for e in search_hits:
+                ename = (e.name or e.id).lower()
+                if any(t in ename for t in terms_lower):
+                    relevant_hits.append(e)
+            if relevant_hits:
+                search_hits = relevant_hits
+            # Drop entities with 0 claims — they produce no evidence
+            search_hits = [e for e in search_hits if e.claim_count > 0]
+            # Deduplicate by display name — keep highest-claim-count per name
+            seen_names: dict[str, int] = {}  # name -> best claim_count
+            deduped: list = []
+            for e in search_hits:
+                key = (e.name or e.id).lower()
+                if key not in seen_names or e.claim_count > seen_names[key]:
+                    if key in seen_names:
+                        deduped = [x for x in deduped if (x.name or x.id).lower() != key]
+                    seen_names[key] = e.claim_count
+                    deduped.append(e)
+            search_hits = deduped
 
-        # Step 3: Build entity set — search hits + top entities from selected types
-        seen_ids: set[str] = set()
-        selected: list = []
+        clusters: list[list[str]] = []
+        cluster_labels: list[str] = []
+        entity_map: dict = {}
 
-        for e in search_hits:
-            if e.id not in seen_ids:
-                seen_ids.add(e.id)
-                selected.append(e)
-
-        for t in selected_types:
-            for e in by_type[t][:3]:
-                if e.id not in seen_ids and len(selected) < 20:
-                    seen_ids.add(e.id)
-                    selected.append(e)
-
-        # Step 4: Cluster candidates by graph connectivity
-        selected_ids = [e.id for e in selected[:20]]
-        entity_map = {e.id: e for e in selected[:20]}
-        clusters = self._cluster_entities(selected_ids)
-
-        search_hit_ids = {e.id for e in search_hits}
-        multi_topic = len(clusters) > 1
-
-        if multi_topic and search_hit_ids:
-            # Focused question — keep only cluster(s) containing search hits
-            relevant = [c for c in clusters if search_hit_ids & set(c)]
-            if relevant:
-                clusters = relevant
-                # Narrow selected entities to relevant clusters only
-                kept = set()
-                for c in clusters:
-                    kept.update(c)
-                selected = [e for e in selected if e.id in kept]
-                selected_ids = [e.id for e in selected[:20]]
-                multi_topic = len(clusters) > 1
-
-        # Step 5: Gather evidence (clustered or flat)
-        if multi_topic:
-            evidence = self._gather_clustered_evidence(
-                clusters, entity_map, max_rels=DEFAULT_MAX_RELATIONSHIPS,
-            )
+        if len(search_hits) >= 3:
+            # Fast path: search hits are good — go straight to evidence
+            selected = list(search_hits)
         else:
-            evidence = self._gather_evidence(selected_ids, max_rels=DEFAULT_MAX_RELATIONSHIPS)
+            # Slow path: type catalog + LLM + clustering
+            selected = list(search_hits)
+            selected, selected_types = self._ask_type_expand(
+                question, selected, top_k,
+            )
+            # Cluster and filter/organize by topic
+            entity_map = {e.id: e for e in selected[:20]}
+            entity_ids_for_cluster = [e.id for e in selected[:20]]
+            clusters = self._cluster_entities(entity_ids_for_cluster)
+            search_hit_ids = {e.id for e in search_hits}
+            if len(clusters) > 1 and search_hit_ids:
+                relevant = [c for c in clusters if search_hit_ids & set(c)]
+                if relevant:
+                    clusters = relevant
+                    kept = set()
+                    for c in clusters:
+                        kept.update(c)
+                    selected = [e for e in selected if e.id in kept]
 
-        # Step 6: LLM synthesis
+        if not selected:
+            return AskResult(meta={
+                "n_searched": 0, "n_search_hits": len(search_hits),
+                "selected_types": sorted(selected_types),
+            })
+
+        # Step 3: Gather evidence AND citations in a single pass (no re-querying)
+        multi_topic = len(clusters) > 1
+        if multi_topic:
+            evidence, citations, all_contradictions, gaps = self._gather_clustered_evidence(
+                clusters, entity_map, max_rels=DEFAULT_MAX_RELATIONSHIPS,
+                collect_citations=True,
+            )
+            cluster_labels = [
+                self._label_cluster(c, entity_map) for c in clusters
+            ]
+        else:
+            entity_ids = [e.id for e in selected[:top_k]]
+            evidence, citations, all_contradictions, gaps = self._gather_evidence(
+                entity_ids, max_rels=DEFAULT_MAX_RELATIONSHIPS, collect_citations=True,
+            )
+
+        # Step 4: Single LLM synthesis call
         base_instructions = (
             "- Trace multi-hop reasoning chains explicitly (A → B → C) when they "
             "answer the question.\n"
@@ -2098,53 +2614,7 @@ class AttestDB:
         )
         answer = self._llm_call(prompt, max_tokens=1024)
 
-        # Build cluster diagnostics
-        cluster_labels = [
-            self._label_cluster(c, entity_map) for c in clusters
-        ] if multi_topic else []
-
-        # Sort entities by claim count so richest show first in UI
         selected.sort(key=lambda e: -e.claim_count)
-
-        # Collect structured citations, contradictions, and gaps from entities
-        citations: list[Citation] = []
-        all_contradictions: list[dict] = []
-        gaps: list[str] = []
-        seen_claim_ids: set[str] = set()
-        for e in selected[:top_k]:
-            try:
-                frame = self.query(e.id, depth=1)
-            except Exception:
-                continue
-            # Citations from direct relationships
-            for rel in frame.direct_relationships:
-                for claim in self.claims_for(e.id, predicate_type=rel.predicate):
-                    if claim.claim_id in seen_claim_ids:
-                        continue
-                    seen_claim_ids.add(claim.claim_id)
-                    citations.append(Citation(
-                        claim_id=claim.claim_id,
-                        subject=claim.subject.id,
-                        predicate=claim.predicate.id,
-                        object=claim.object.id,
-                        confidence=claim.confidence,
-                        source_id=claim.provenance.source_id,
-                        source_type=claim.provenance.source_type,
-                    ))
-                    if len(citations) >= 50:
-                        break
-                if len(citations) >= 50:
-                    break
-            # Contradictions
-            for c in frame.contradictions:
-                all_contradictions.append({
-                    "claim_a": c.claim_a, "claim_b": c.claim_b,
-                    "description": c.description, "status": c.status,
-                })
-            # Gaps
-            for g in frame.knowledge_gaps:
-                if g not in gaps:
-                    gaps.append(g)
 
         return AskResult(
             answer=answer,
@@ -2163,7 +2633,73 @@ class AttestDB:
             },
         )
 
-    def _gather_evidence(self, entity_ids: list[str], max_rels: int = 60) -> str:
+    def _ask_type_expand(
+        self,
+        question: str,
+        search_hits: list,
+        top_k: int,
+    ) -> tuple:
+        """Slow path: use type catalog + LLM to find relevant entity types.
+
+        Called when search_entities() returns fewer than 3 hits, so we need
+        LLM guidance to figure out which entity types are relevant.
+
+        Returns (selected_entities, selected_types).
+        """
+        db_stats = self.stats()
+        type_counts: dict[str, int] = db_stats.get("entity_types", {})
+        if not type_counts:
+            return list(search_hits), set()
+
+        min_type_size = 3
+        eligible_types = sorted(
+            ((t, c) for t, c in type_counts.items() if c >= min_type_size),
+            key=lambda x: -x[1],
+        )
+        catalog_parts = []
+        for t, count in eligible_types[:20]:
+            examples = self.list_entities(entity_type=t, limit=2)
+            name_str = ", ".join((e.name or e.id) for e in examples)
+            catalog_parts.append(f"{t} ({count}: {name_str})")
+        type_catalog = ", ".join(catalog_parts)
+        type_prompt = (
+            f"Entity types in a knowledge graph: {type_catalog}\n\n"
+            f"Question: {question}\n\n"
+            "Which 5-8 entity types contain the most interesting "
+            "domain-specific knowledge for answering this question? "
+            "Avoid generic types like process, concept, information, "
+            "activity, task, or change. "
+            "Return ONLY type names, comma-separated."
+        )
+        type_response = self._llm_call(type_prompt, max_tokens=100, temperature=0.0)
+
+        selected_types: set[str] = set()
+        if type_response:
+            for part in type_response.split(","):
+                t = part.strip().lower()
+                if t in type_counts and type_counts[t] >= min_type_size:
+                    selected_types.add(t)
+
+        seen_ids: set[str] = set()
+        selected: list = []
+        for e in search_hits:
+            if e.id not in seen_ids:
+                seen_ids.add(e.id)
+                selected.append(e)
+        for t in selected_types:
+            for e in self.list_entities(entity_type=t, limit=3):
+                if e.id not in seen_ids and len(selected) < top_k:
+                    seen_ids.add(e.id)
+                    selected.append(e)
+
+        return selected, selected_types
+
+    def _gather_evidence(
+        self,
+        entity_ids: list[str],
+        max_rels: int = 60,
+        collect_citations: bool = False,
+    ) -> str | tuple:
         """Build rich evidence from relationships for a set of entities.
 
         Each relationship is annotated with confidence and source count.
@@ -2173,9 +2709,13 @@ class AttestDB:
         keeping latency bounded regardless of entity degree.
         Adaptive budget: entities with fewer relationships yield unused slots
         to knowledge-rich entities.
+
+        If *collect_citations* is True, returns
+        ``(evidence_text, citations, contradictions, gaps)`` so ask() can
+        reuse the frames already fetched here (no redundant re-queries).
         """
         # First pass: collect frames and rels per entity (depth=1 — fast)
-        entity_data: list[tuple] = []  # (eid, entity, rels_sorted, contradictions)
+        entity_data: list[tuple] = []  # (eid, entity, rels_sorted, contradictions, gaps)
         for eid in entity_ids:
             try:
                 frame = self.query(eid, depth=1)
@@ -2183,15 +2723,15 @@ class AttestDB:
                 continue
             entity = frame.focal_entity
             direct = sorted(frame.direct_relationships, key=lambda r: -r.confidence)
-            entity_data.append((eid, entity, direct, frame.contradictions))
+            entity_data.append((eid, entity, direct, frame.contradictions, frame.knowledge_gaps))
 
         if not entity_data:
-            return ""
+            return ("", [], [], []) if collect_citations else ""
 
         # Adaptive budget: start with equal share, reallocate unused
         n = len(entity_data)
         per_entity = max(max_rels // n, 3)
-        available = [len(rels) for _, _, rels, _ in entity_data]
+        available = [len(rels) for _, _, rels, _, _ in entity_data]
         allocated = [min(per_entity, a) for a in available]
         surplus = max_rels - sum(allocated)
 
@@ -2208,7 +2748,7 @@ class AttestDB:
         # Cap at 5 hop-2 queries per entity to keep latency bounded.
         _HOP2_PER_ENTITY = 5
         hop2_maps: list[dict[str, list]] = []
-        for idx, (eid, entity, rels, _) in enumerate(entity_data):
+        for idx, (eid, entity, rels, _, _) in enumerate(entity_data):
             hop2_map: dict[str, list] = {}
             hop2_count = 0
             for rel in rels[:allocated[idx]]:
@@ -2230,9 +2770,15 @@ class AttestDB:
                     hop2_count += 1
             hop2_maps.append(hop2_map)
 
+        # Build citation/contradiction/gap data alongside evidence text
+        citations: list[Citation] = []
+        all_contradictions: list[dict] = []
+        all_gaps: list[str] = []
+        seen_claim_ids: set[str] = set()
+
         lines: list[str] = []
         seen: set[str] = set()
-        for idx, (eid, entity, rels, contradictions) in enumerate(entity_data):
+        for idx, (eid, entity, rels, contradictions, gaps) in enumerate(entity_data):
             ename = entity.name or entity.id
             hop2_map = hop2_maps[idx]
             lines.append(f"\n## {ename} ({entity.entity_type})")
@@ -2263,6 +2809,36 @@ class AttestDB:
                     if ev:
                         lines.append(f'    Evidence: "{ev}"')
 
+                # Collect citation from this relationship
+                if collect_citations and len(citations) < 50:
+                    cid = rel.claim_id if hasattr(rel, "claim_id") else None
+                    if cid and cid not in seen_claim_ids:
+                        seen_claim_ids.add(cid)
+                        citations.append(Citation(
+                            claim_id=cid,
+                            subject=eid,
+                            predicate=rel.predicate,
+                            object=rel.target.id,
+                            confidence=rel.confidence,
+                            source_id=rel.source_types[0] if rel.source_types else "",
+                            source_type=rel.source_types[0] if rel.source_types else "",
+                        ))
+                    elif collect_citations and not cid and len(citations) < 50:
+                        # RelationshipSummary doesn't have claim_id — build
+                        # citation from the relationship fields directly
+                        synth_key = f"{eid}|{rel.predicate}|{rel.target.id}"
+                        if synth_key not in seen_claim_ids:
+                            seen_claim_ids.add(synth_key)
+                            citations.append(Citation(
+                                claim_id=synth_key,
+                                subject=eid,
+                                predicate=rel.predicate,
+                                object=rel.target.id,
+                                confidence=rel.confidence,
+                                source_id=rel.source_types[0] if rel.source_types else "",
+                                source_type=rel.source_types[0] if rel.source_types else "",
+                            ))
+
                 # 2-hop extensions
                 tid = rel.target.id
                 if tid in hop2_map:
@@ -2290,7 +2866,21 @@ class AttestDB:
                     if c.description:
                         lines.append(f"    - {c.description}")
 
-        return "\n".join(lines)
+            # Collect structured contradictions and gaps
+            if collect_citations:
+                for c in contradictions:
+                    all_contradictions.append({
+                        "claim_a": c.claim_a, "claim_b": c.claim_b,
+                        "description": c.description, "status": c.status,
+                    })
+                for g in gaps:
+                    if g not in all_gaps:
+                        all_gaps.append(g)
+
+        evidence_text = "\n".join(lines)
+        if collect_citations:
+            return evidence_text, citations, all_contradictions, all_gaps
+        return evidence_text
 
     # --- Claim operations ---
 
@@ -2301,10 +2891,11 @@ class AttestDB:
         source_type: str | None = None,
         min_confidence: float = 0.0,
     ) -> list[Claim]:
-        return [
+        claims = [
             claim_from_dict(d)
             for d in self._store.claims_for(entity_id, predicate_type, source_type, min_confidence)
         ]
+        return self._apply_trust_filter(claims)
 
     def claims_by_content_id(self, content_id: str) -> list[Claim]:
         return [claim_from_dict(d) for d in self._store.claims_by_content_id(content_id)]
@@ -2319,6 +2910,10 @@ class AttestDB:
         Returns corroborated claims (grouped by content_id) and single-source
         claims that need independent confirmation.
         """
+        cache_key = f"corroboration_report:{min_sources}"
+        cached = self._cache.get(cache_key)
+        if cached is not None and (time.time() - self._cache_ts.get(cache_key, 0)) < 120:
+            return cached
         from attestdb.core.confidence import count_independent_sources, corroboration_boost
 
         content_id_claims: dict[str, list] = {}
@@ -2360,7 +2955,7 @@ class AttestDB:
         single_source.sort(key=lambda x: x["confidence"])
 
         total = len(content_id_claims)
-        return {
+        result = {
             "total_content_ids": total,
             "corroborated_count": len(corroborated),
             "single_source_count": len(single_source),
@@ -2368,6 +2963,9 @@ class AttestDB:
             "corroborated": corroborated,
             "needs_corroboration": single_source[:50],
         }
+        self._cache[cache_key] = result
+        self._cache_ts[cache_key] = time.time()
+        return result
 
     def claims_for_predicate(self, predicate_id: str) -> list[Claim]:
         """Return all claims with the given predicate id via Rust index (O(k))."""
@@ -2547,6 +3145,7 @@ class AttestDB:
                 provenance={"source_type": "human_annotation", "source_id": source_id},
                 payload={"schema": "", "data": {"reason": reason}},
             ))
+        self._invalidate_cache()
         result = RetractResult(source_id, reason, len(claim_ids), claim_ids)
         self._audit_write(
             "source_retracted",
@@ -2909,6 +3508,10 @@ class AttestDB:
         - entity_source_counts() for single-source detection
         - Single-pass iter_claims for source_type distribution and staleness
         """
+        cache_key = f"quality_report:{stale_threshold}:{id(expected_patterns)}"
+        cached = self._cache.get(cache_key)
+        if cached is not None and (time.time() - self._cache_ts.get(cache_key, 0)) < 120:
+            return cached
         report = QualityReport()
         rust_stats = self._store.stats()
         report.total_entities = rust_stats.get("entity_count", 0)
@@ -2968,6 +3571,8 @@ class AttestDB:
         alerts = self.find_confidence_alerts(min_claims=2)
         report.confidence_alert_count = len(alerts)
 
+        self._cache[cache_key] = report
+        self._cache_ts[cache_key] = time.time()
         return report
 
     # --- Confidence calibration ---
@@ -2994,6 +3599,9 @@ class AttestDB:
         1. Rust entity_source_counts() for multi-source detection (no claim materialization)
         2. Single iter_claims pass for confidence/timestamp/corroboration stats
         """
+        cached = self._cache.get("knowledge_health")
+        if cached is not None and (time.time() - self._cache_ts.get("knowledge_health", 0)) < 120:
+            return cached
         h = KnowledgeHealth()
         rust_stats = self._store.stats()
         h.total_entities = rust_stats.get("entity_count", 0)
@@ -3081,6 +3689,8 @@ class AttestDB:
             + max(0.0, min(1.0, 0.5 + h.confidence_trend)) * 10.0
         )))
 
+        self._cache["knowledge_health"] = h
+        self._cache_ts["knowledge_health"] = time.time()
         return h
 
     # --- Topic query ---
@@ -3504,13 +4114,27 @@ class AttestDB:
         return ingestor.ingest_slack_export(path, bot_ids=bot_ids, channels=channels)
 
     def find_bridges(self, **kwargs) -> list:
-        return self._get_insight_engine().find_bridges(**kwargs)
+        cache_key = f"find_bridges:{sorted(kwargs.items())}"
+        cached = self._cache.get(cache_key)
+        if cached is not None and (time.time() - self._cache_ts.get(cache_key, 0)) < 300:
+            return cached
+        result = self._get_insight_engine().find_bridges(**kwargs)
+        self._cache[cache_key] = result
+        self._cache_ts[cache_key] = time.time()
+        return result
 
     def find_gaps(self, expected_patterns, **kwargs) -> list:
         return self._get_insight_engine().find_gaps(expected_patterns, **kwargs)
 
     def find_confidence_alerts(self, **kwargs) -> list:
-        return self._get_insight_engine().find_confidence_alerts(**kwargs)
+        cache_key = f"find_confidence_alerts:{sorted(kwargs.items())}"
+        cached = self._cache.get(cache_key)
+        if cached is not None and (time.time() - self._cache_ts.get(cache_key, 0)) < 120:
+            return cached
+        result = self._get_insight_engine().find_confidence_alerts(**kwargs)
+        self._cache[cache_key] = result
+        self._cache_ts[cache_key] = time.time()
+        return result
 
     # --- Temporal analysis ---
 
@@ -3756,6 +4380,14 @@ class AttestDB:
         s["embedding_index_size"] = len(self._embedding_index) if self._embedding_index else 0
         return s
 
+    # --- Provenance ---
+
+    @staticmethod
+    def resolve_source_url(source_id: str, source_type: str = "") -> str | None:
+        """Resolve a source_id to a clickable URL for the original source."""
+        from attestdb.core.provenance import resolve_source_url
+        return resolve_source_url(source_id, source_type)
+
     # --- Build manifest & source health ---
 
     def build_manifest(self) -> "BuildManifest":
@@ -3832,6 +4464,10 @@ class AttestDB:
         Uses Rust entity_source_counts() for single-source detection (no claim
         materialization), and a single iter_claims pass for unresolved warnings.
         """
+        cache_key = f"blindspots:{min_claims}"
+        cached = self._cache.get(cache_key)
+        if cached is not None and (time.time() - self._cache_ts.get(cache_key, 0)) < 120:
+            return cached
         from attestdb.core.types import BlindspotMap
         from attestdb.core.vocabulary import knowledge_sort_key
 
@@ -3917,12 +4553,15 @@ class AttestDB:
         except Exception:
             logger.debug("Could not compute unresolved warnings", exc_info=True)
 
-        return BlindspotMap(
+        result = BlindspotMap(
             single_source_entities=single_source,
             knowledge_gaps=knowledge_gaps,
             low_confidence_areas=low_conf,
             unresolved_warnings=unresolved,
         )
+        self._cache[cache_key] = result
+        self._cache_ts[cache_key] = time.time()
+        return result
 
     def consensus(self, topic: str) -> "ConsensusReport":
         """Analyze consensus around a topic (entity)."""
@@ -3956,6 +4595,10 @@ class AttestDB:
 
     def fragile(self, max_sources: int = 1, min_age_days: int = 0) -> list[Claim]:
         """Find fragile claims: backed by few sources, optionally filtered by age."""
+        cache_key = f"fragile:{max_sources}:{min_age_days}"
+        cached = self._cache.get(cache_key)
+        if cached is not None and (time.time() - self._cache_ts.get(cache_key, 0)) < 120:
+            return cached
         now_ns = int(time.time() * 1_000_000_000)
         min_age_ns = min_age_days * 86400 * 1_000_000_000
 
@@ -3976,10 +4619,21 @@ class AttestDB:
             if len(sources) <= max_sources:
                 fragile_claims.extend(content_claims[cid])
 
+        self._cache[cache_key] = fragile_claims
+        self._cache_ts[cache_key] = time.time()
         return fragile_claims
 
-    def stale(self, days: int = 90) -> list[Claim]:
-        """Find stale claims: not updated within the given number of days."""
+    def stale(self, days: int = 90, limit: int = 0) -> list[Claim]:
+        """Find stale claims: not updated within the given number of days.
+
+        Args:
+            days: Age threshold.
+            limit: Max results (0 = unlimited).
+        """
+        cache_key = f"stale:{days}:{limit}"
+        cached = self._cache.get(cache_key)
+        if cached is not None and (time.time() - self._cache_ts.get(cache_key, 0)) < 120:
+            return cached
         cutoff_ns = int(time.time() * 1_000_000_000) - (days * 86400 * 1_000_000_000)
         stale_claims = []
         for claim in self.iter_claims():
@@ -3987,7 +4641,10 @@ class AttestDB:
                 continue
             if claim.timestamp < cutoff_ns:
                 stale_claims.append(claim)
-
+                if limit and len(stale_claims) >= limit:
+                    break
+        self._cache[cache_key] = stale_claims
+        self._cache_ts[cache_key] = time.time()
         return stale_claims
 
     def audit(self, claim_id: str) -> "AuditTrail":
@@ -4090,12 +4747,22 @@ class AttestDB:
         # Include retracted claims so we can compute retraction rates
         self._set_include_retracted(True)
         try:
-            # Single pass: group by source AND build content_id → source_ids map
             by_source: dict[str, list[Claim]] = {}
             content_id_sources: dict[str, set[str]] = {}
-            for c in self.iter_claims():
-                by_source.setdefault(c.provenance.source_id, []).append(c)
-                content_id_sources.setdefault(c.content_id, set()).add(c.provenance.source_id)
+            if source_id is not None:
+                # Fast path: only scan claims for the requested source
+                for c in self.claims_by_source_id(source_id):
+                    by_source.setdefault(c.provenance.source_id, []).append(c)
+                # Check corroboration: for each unique content_id, look up all sources
+                unique_cids = {c.content_id for claims in by_source.values() for c in claims}
+                for cid in unique_cids:
+                    for c in self.claims_by_content_id(cid):
+                        content_id_sources.setdefault(cid, set()).add(c.provenance.source_id)
+            else:
+                # Full scan: group by source AND build content_id → source_ids map
+                for c in self.iter_claims():
+                    by_source.setdefault(c.provenance.source_id, []).append(c)
+                    content_id_sources.setdefault(c.content_id, set()).add(c.provenance.source_id)
         finally:
             self._set_include_retracted(False)
 
@@ -4161,6 +4828,419 @@ class AttestDB:
             content_id=content_id,
             related_entities=sorted(related)[:20],
         )
+
+    def what_if(self, subject: tuple, predicate: tuple, object: tuple,
+                confidence: float = 0.6):
+        """One-call hypothetical reasoning — queries the knowledge graph directly.
+
+        No sandbox creation. Directly analyzes whether a hypothetical claim
+        is supported, contradicted, or plausible based on:
+        - Direct contradictions (opposing predicates on same entity pair)
+        - Direct corroborations (existing claims with same content_id)
+        - Multi-hop causal composition (2-hop BFS, causal edges first)
+        - Gap detection (does this bridge disconnected entities?)
+        - Follow-up suggestions (nearby unconnected entity pairs)
+
+        The causal-priority BFS follows edges with causal predicates
+        (activates, inhibits, upregulates, downregulates, etc.) first,
+        then weak edges only if causal paths are sparse. When both hops
+        are causal, the system composes them: inhibits + inhibits = activates
+        (double negative), upregulates + downregulates = downregulates, etc.
+
+        Works with read-only databases and scales to millions of claims.
+
+        Usage:
+            verdict = db.what_if(("BRCA1", "gene"), ("inhibits", "relation"), ("PD-L1", "protein"))
+        """
+        from attestdb.core.types import IndirectEvidence, SandboxVerdict
+        from attestdb.core.vocabulary import (
+            CAUSAL_PREDICATES,
+            OPPOSITE_PREDICATES,
+            compose_predicates,
+            predicates_agree,
+        )
+
+        subj_id = subject[0]
+        obj_id = object[0]
+        hyp_pred = predicate[0]
+        desc = f"{subj_id} {hyp_pred} {obj_id}"
+        n_subj_id = normalize_entity_id(subj_id)
+        n_obj_id = normalize_entity_id(obj_id)
+        opposite = OPPOSITE_PREDICATES.get(hyp_pred)
+
+        # Single pass over subject's claims — extract direct evidence + neighbors
+        subj_claims = self._store.claims_for(n_subj_id, None, None, 0.0)
+        direct_contradictions: list[tuple[str, str]] = []
+        causal_neighbors: dict[str, tuple[str, float]] = {}
+        weak_neighbors: dict[str, tuple[str, float]] = {}
+
+        for d in subj_claims:
+            c = claim_from_dict(d)
+            obj = c.object.id
+            pred = c.predicate.id
+            conf = c.confidence
+
+            # Direct contradiction check
+            if obj == n_obj_id and opposite and pred == opposite:
+                direct_contradictions.append((hyp_pred, pred))
+
+            # Collect neighbors for BFS
+            neighbor = obj if c.subject.id == n_subj_id else c.subject.id
+            if neighbor != n_subj_id and neighbor != n_obj_id:
+                if pred in CAUSAL_PREDICATES:
+                    if neighbor not in causal_neighbors or conf > causal_neighbors[neighbor][1]:
+                        causal_neighbors[neighbor] = (pred, conf)
+                else:
+                    if neighbor not in weak_neighbors or conf > weak_neighbors[neighbor][1]:
+                        weak_neighbors[neighbor] = (pred, conf)
+
+        # Direct corroborations — same content_id already exists
+        content_id = compute_content_id(n_subj_id, hyp_pred, n_obj_id)
+        corroborations = len(self.claims_by_content_id(content_id))
+
+        # 2-hop BFS with causal priority
+        all_indirect: list[IndirectEvidence] = []
+        checked = 0
+        max_intermediaries = 50
+
+        # Phase 1: follow causal neighbors — these give meaningful composition
+        for mid, (pred1, conf1) in sorted(
+            causal_neighbors.items(), key=lambda x: -x[1][1]
+        ):
+            if checked >= max_intermediaries:
+                break
+            mid_claims = self._store.claims_for(mid, None, None, 0.0)
+            checked += 1
+            for d in mid_claims:
+                mc = claim_from_dict(d)
+                if mc.object.id == n_obj_id:
+                    pred2 = mc.predicate.id
+                    composed = compose_predicates(pred1, pred2)
+                    if composed == hyp_pred or predicates_agree(composed, hyp_pred):
+                        direction = "supporting"
+                    elif (OPPOSITE_PREDICATES.get(composed) == hyp_pred
+                          or OPPOSITE_PREDICATES.get(hyp_pred) == composed
+                          or (composed != hyp_pred
+                              and not predicates_agree(composed, hyp_pred)
+                              and predicates_agree(composed, OPPOSITE_PREDICATES.get(hyp_pred, "")))):
+                        direction = "contradicting"
+                    else:
+                        direction = "neutral"
+                    all_indirect.append(IndirectEvidence(
+                        path=[n_subj_id, mid, n_obj_id],
+                        predicates=[pred1, pred2],
+                        predicted_predicate=composed,
+                        confidence=conf1 * mc.confidence,
+                        direction=direction,
+                    ))
+            if len(all_indirect) >= 20:
+                break
+
+        # Phase 2: weak neighbors (only if causal paths sparse)
+        if len(all_indirect) < 5:
+            for mid, (pred1, conf1) in sorted(
+                weak_neighbors.items(), key=lambda x: -x[1][1]
+            ):
+                if mid in causal_neighbors:
+                    continue
+                if checked >= max_intermediaries + 10:
+                    break
+                mid_claims = self._store.claims_for(mid, None, None, 0.0)[:100]
+                checked += 1
+                for d in mid_claims:
+                    mc = claim_from_dict(d)
+                    if mc.object.id == n_obj_id:
+                        composed = compose_predicates(pred1, mc.predicate.id)
+                        all_indirect.append(IndirectEvidence(
+                            path=[n_subj_id, mid, n_obj_id],
+                            predicates=[pred1, mc.predicate.id],
+                            predicted_predicate=composed,
+                            confidence=conf1 * mc.confidence,
+                            direction="neutral",
+                        ))
+                if len(all_indirect) >= 10:
+                    break
+
+        # Gap detection — does this bridge disconnected entities?
+        gaps_closed = 0
+        gap_descs: list[str] = []
+        subj_exists = self._store.get_entity(n_subj_id) is not None
+        obj_exists = self._store.get_entity(n_obj_id) is not None
+        if subj_exists and obj_exists:
+            if not self.path_exists(subj_id, obj_id, max_depth=2):
+                gaps_closed = 1
+                gap_descs.append(
+                    f"{subj_id} and {obj_id} exist but are not connected within 2 hops"
+                )
+
+        # Follow-up suggestions — nearby unconnected pairs
+        follow_ups: list[str] = []
+        subj_neighbor_set = set(causal_neighbors.keys()) | set(
+            list(weak_neighbors.keys())[:50]
+        )
+        obj_neighbors: set[str] = set()
+        for d in self._store.claims_for(n_obj_id, None, None, 0.0)[:200]:
+            c = claim_from_dict(d)
+            neighbor = c.object.id if c.subject.id == n_obj_id else c.subject.id
+            obj_neighbors.add(neighbor)
+        for sn in list(subj_neighbor_set)[:30]:
+            if sn == n_obj_id or sn == n_subj_id:
+                continue
+            for on in list(obj_neighbors)[:30]:
+                if on == n_subj_id or on == n_obj_id or on == sn:
+                    continue
+                if not self.path_exists(sn, on, max_depth=1):
+                    follow_ups.append(f"{sn} may relate to {on}")
+                    if len(follow_ups) >= 5:
+                        break
+            if len(follow_ups) >= 5:
+                break
+
+        # Score and verdict
+        supporting = [ie for ie in all_indirect if ie.direction == "supporting"]
+        contradicting = [ie for ie in all_indirect if ie.direction == "contradicting"]
+
+        score = 0.5
+        score += min(corroborations * 0.15, 0.3)
+        score += min(len(supporting) * 0.08, 0.3)
+        score -= min(len(direct_contradictions) * 0.25, 0.5)
+        score -= min(len(contradicting) * 0.08, 0.2)
+        score += min(gaps_closed * 0.05, 0.1)
+        score = max(0.0, min(1.0, score))
+
+        if direct_contradictions and not corroborations:
+            verdict = "contradicted"
+        elif corroborations > 0:
+            verdict = "supported"
+        elif supporting and len(supporting) > len(contradicting):
+            verdict = "plausible"
+        elif contradicting and len(contradicting) > len(supporting):
+            verdict = "contradicted"
+        elif supporting and contradicting:
+            verdict = "contested"
+        elif gaps_closed > 0:
+            verdict = "plausible"
+        else:
+            verdict = "insufficient_data"
+
+        # Best predicted predicate
+        if supporting:
+            predicted = supporting[0].predicted_predicate
+        elif all_indirect:
+            predicted = all_indirect[0].predicted_predicate
+        else:
+            predicted = ""
+
+        # Build explanation
+        parts = []
+        if direct_contradictions:
+            parts.append(f"{len(direct_contradictions)} direct contradiction(s)")
+        if corroborations:
+            parts.append(f"{corroborations} existing corroboration(s)")
+        if supporting:
+            parts.append(f"{len(supporting)} causal path(s) supporting")
+        if contradicting:
+            parts.append(f"{len(contradicting)} causal path(s) contradicting")
+        neutral = [ie for ie in all_indirect if ie.direction == "neutral"]
+        if neutral and not supporting and not contradicting:
+            parts.append(f"{len(neutral)} indirect path(s) (neutral)")
+        if gaps_closed:
+            parts.append(f"closes {gaps_closed} gap(s)")
+        explanation = "; ".join(parts) if parts else "No evidence found in graph."
+
+        return SandboxVerdict(
+            hypothesis=desc,
+            verdict=verdict,
+            direct_contradictions=direct_contradictions,
+            direct_corroborations=corroborations,
+            indirect_evidence=all_indirect,
+            predicted_predicate=predicted,
+            gaps_closed=gaps_closed,
+            gap_descriptions=gap_descs,
+            follow_up_hypotheses=follow_ups,
+            confidence_score=score,
+            explanation=explanation,
+        )
+
+    def predict(
+        self,
+        entity_id: str,
+        max_intermediaries: int = 100,
+        min_paths: int = 3,
+        min_consensus: float = 0.65,
+    ) -> list["Prediction"]:
+        """Discover novel regulatory predictions via causal composition.
+
+        Follows causal edges (activates, inhibits, upregulates, downregulates)
+        from the entity through chemical/gene intermediaries, then composes
+        predicates at each 2-hop path. Filters for convergent predictions
+        where multiple independent intermediaries agree on direction.
+
+        Returns predictions ranked by number of supporting intermediaries,
+        with genuine gaps (no existing connection) sorted first.
+
+        Works with read-only databases and scales to millions of claims.
+
+        Usage:
+            predictions = db.predict("gene_7157")  # TP53
+            for p in predictions[:10]:
+                print(f"{entity_id} --[{p.predicted_predicate}]--> {p.target}")
+                print(f"  {p.supporting_paths} supporting, {p.opposing_paths} opposing")
+        """
+        from attestdb.core.types import IndirectEvidence, Prediction
+        from attestdb.core.vocabulary import (
+            CAUSAL_PREDICATES,
+            OPPOSITE_PREDICATES,
+            PREDICATE_EQUIVALENCE,
+            compose_predicates,
+            predicates_agree,
+        )
+
+        n_eid = normalize_entity_id(entity_id)
+        claims = self._store.claims_for(n_eid, None, None, 0.0)
+
+        # Single pass: collect direct neighbors and causal neighbors
+        direct_neighbors: dict[str, set[str]] = {}  # neighbor -> set of predicates
+        causal_neighbors: dict[str, tuple[str, float]] = {}
+        neighbor_causal_preds: dict[str, set[str]] = {}  # all causal preds per neighbor
+
+        # outgoing_causal: source IS subject (true causal: source acts on intermediary)
+        # incoming_causal: source IS object (co-regulation: intermediary acts on source)
+        outgoing_causal: dict[str, tuple[str, float]] = {}
+        incoming_causal: dict[str, tuple[str, float]] = {}
+
+        for d in claims:
+            c = claim_from_dict(d)
+            if c.predicate.id not in CAUSAL_PREDICATES:
+                neighbor = c.object.id if c.subject.id == n_eid else c.subject.id
+                if neighbor != n_eid:
+                    direct_neighbors.setdefault(neighbor, set()).add(c.predicate.id)
+                continue
+            if c.subject.id == n_eid:
+                # Outgoing: source causally affects intermediary
+                mid = c.object.id
+                if mid == n_eid:
+                    continue
+                direct_neighbors.setdefault(mid, set()).add(c.predicate.id)
+                neighbor_causal_preds.setdefault(mid, set()).add(c.predicate.id)
+                if mid not in outgoing_causal or c.confidence > outgoing_causal[mid][1]:
+                    outgoing_causal[mid] = (c.predicate.id, c.confidence)
+            else:
+                # Incoming: intermediary causally affects source (co-regulation signal)
+                mid = c.subject.id
+                if mid == n_eid:
+                    continue
+                direct_neighbors.setdefault(mid, set()).add(c.predicate.id)
+                neighbor_causal_preds.setdefault(mid, set()).add(c.predicate.id)
+                if mid not in incoming_causal or c.confidence > incoming_causal[mid][1]:
+                    incoming_causal[mid] = (c.predicate.id, c.confidence)
+
+        # Merge: outgoing neighbors preferred, incoming as fallback
+        causal_neighbors = {**incoming_causal, **outgoing_causal}
+        outgoing_set = set(outgoing_causal.keys())
+
+        # Filter: skip intermediaries with contradictory source legs
+        clean_neighbors: dict[str, tuple[str, float]] = {}
+        for mid, (pred1, conf1) in causal_neighbors.items():
+            preds = neighbor_causal_preds.get(mid, set())
+            has_contradiction = any(
+                OPPOSITE_PREDICATES.get(p, "") in preds for p in preds
+            )
+            if not has_contradiction:
+                clean_neighbors[mid] = (pred1, conf1)
+
+        # 2-hop BFS through clean causal neighbors
+        # target -> {composed_pred -> [IndirectEvidence]}
+        target_preds: dict[str, dict[str, list[IndirectEvidence]]] = {}
+        checked = 0
+
+        for mid, (pred1, conf1) in sorted(
+            clean_neighbors.items(), key=lambda x: -x[1][1]
+        ):
+            if checked >= max_intermediaries:
+                break
+            mid_claims = self._store.claims_for(mid, None, None, 0.0)
+            checked += 1
+            for d in mid_claims:
+                mc = claim_from_dict(d)
+                # Second hop: intermediary must be subject (outgoing to target)
+                if mc.subject.id != mid:
+                    continue
+                target = mc.object.id
+                if target == n_eid or target == mid:
+                    continue
+                if mc.predicate.id not in CAUSAL_PREDICATES:
+                    continue
+                composed = compose_predicates(pred1, mc.predicate.id)
+                if composed == "associated_with":
+                    continue
+                # Skip if this exact predicate already exists directly
+                if composed in direct_neighbors.get(target, set()):
+                    continue
+                # Co-regulation (incoming first hop) gets reduced confidence
+                is_causal = mid in outgoing_set
+                path_conf = conf1 * mc.confidence
+                if not is_causal:
+                    path_conf *= 0.5  # co-regulation discount
+
+                target_preds.setdefault(target, {}).setdefault(composed, []).append(
+                    IndirectEvidence(
+                        path=[n_eid, mid, target],
+                        predicates=[pred1, mc.predicate.id],
+                        predicted_predicate=composed,
+                        confidence=path_conf,
+                        direction="supporting" if is_causal else "co-regulation",
+                    )
+                )
+
+        # Score and filter
+        results: list[Prediction] = []
+        for target, pred_map in target_preds.items():
+            for pred, paths in pred_map.items():
+                unique_mids = set(ie.path[1] for ie in paths)
+                if len(unique_mids) < min_paths:
+                    continue
+
+                # Count opposing paths (any predicate in the opposite equivalence class)
+                pred_class = PREDICATE_EQUIVALENCE.get(pred)
+                opp_count = 0
+                for other_pred, other_paths in pred_map.items():
+                    if other_pred == pred:
+                        continue
+                    other_class = PREDICATE_EQUIVALENCE.get(other_pred)
+                    if pred_class and other_class and pred_class != other_class:
+                        opp_count += len(other_paths)
+                    elif OPPOSITE_PREDICATES.get(pred) == other_pred:
+                        opp_count += len(other_paths)
+                total = len(paths) + opp_count
+                consensus = len(paths) / total if total > 0 else 0
+
+                if consensus < min_consensus:
+                    continue
+                if len(paths) <= opp_count:
+                    continue
+
+                is_gap = target not in direct_neighbors
+                existing = sorted(direct_neighbors.get(target, set()))
+
+                # Keep top evidence paths by confidence
+                top_evidence = sorted(paths, key=lambda ie: -ie.confidence)[:10]
+
+                results.append(Prediction(
+                    target=target,
+                    predicted_predicate=pred,
+                    supporting_paths=len(paths),
+                    opposing_paths=opp_count,
+                    consensus=consensus,
+                    intermediaries=len(unique_mids),
+                    is_gap=is_gap,
+                    existing_predicates=existing,
+                    evidence=top_evidence,
+                ))
+
+        # Sort: gaps first, then by intermediary count
+        results.sort(key=lambda p: (not p.is_gap, -p.intermediaries, p.opposing_paths))
+        return results
 
     # --- Knowledge-Intelligence APIs ---
 

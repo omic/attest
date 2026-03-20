@@ -330,11 +330,21 @@ def cmd_chat(args):
     else:
         # Browser mode (default)
         from attestdb.core.browser_chat import run_browser_chat
+        # Parse --models flag: "chatgpt=o3,claude=opus" → dict
+        models = None
+        if getattr(args, "models", None):
+            models = {}
+            for spec in args.models.split(","):
+                if "=" in spec:
+                    prov, model = spec.split("=", 1)
+                    models[prov.strip().lower()] = model.strip().lower()
         try:
             run_browser_chat(
                 db=db,
                 providers=providers,
                 cwd=os.getcwd(),
+                models=models,
+                auto_followup=getattr(args, "auto_followup", False),
             )
         finally:
             db.close()
@@ -391,6 +401,14 @@ def main():
     p_chat.add_argument(
         "--db", default="attest.db",
         help="Database path (default: attest.db)",
+    )
+    p_chat.add_argument(
+        "--models", default=None,
+        help="Model tiers per provider: chatgpt=o3,claude=opus,gemini=pro",
+    )
+    p_chat.add_argument(
+        "--auto-followup", action="store_true", default=False,
+        help="Route provider follow-up questions to other providers before asking you",
     )
 
     # --- ingest ---
@@ -465,6 +483,28 @@ def main():
     p_serve.add_argument("--port", type=int, default=8892, help="Bind port (default: 8892)")
     p_serve.add_argument("--db", default="attest.db", help="Database path (default: attest.db)")
 
+    # --- extension ---
+    p_ext = sub.add_parser(
+        "extension",
+        help="Launch browser with AttestDB capture extension (meta-chat across ChatGPT/Claude/Gemini)",
+    )
+    p_ext.add_argument(
+        "--providers", default=None,
+        help="Comma-separated providers to open (default: chatgpt,claude,gemini)",
+    )
+    p_ext.add_argument(
+        "--port", type=int, default=8893,
+        help="Ingest server port (default: 8893)",
+    )
+    p_ext.add_argument(
+        "--db", default="attest.db",
+        help="Database path (default: attest.db)",
+    )
+    p_ext.add_argument(
+        "--headless", action="store_true",
+        help="Server only — use with your own Chrome (prints manual install steps)",
+    )
+
     # --- login ---
     p_login = sub.add_parser("login", help="Connect to AttestDB Cloud")
     p_login.add_argument("--endpoint", default="https://api.attestdb.com", help="API endpoint URL")
@@ -505,6 +545,15 @@ def main():
     elif args.command == "install":
         from attestdb.mcp_install import install
         install(tools=args.tools, scope=args.scope)
+    elif args.command == "extension":
+        from attestdb.extension_launcher import run as run_extension
+        providers = args.providers.split(",") if args.providers else None
+        run_extension(
+            providers=providers,
+            port=args.port,
+            db_path=args.db,
+            headless=args.headless,
+        )
     elif args.command == "serve":
         cmd_serve(args)
     elif args.command == "login":

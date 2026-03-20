@@ -26,6 +26,127 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Readline tab-completion for @ (providers, files) and / (commands)
+# ---------------------------------------------------------------------------
+
+_COMMANDS = [
+    "/tournament", "/share", "/consensus", "/new", "/model", "/auto",
+    "/web", "/screenshot", "/export", "/upload", "/output", "/downloads",
+    "/providers", "/save", "/load", "/artifacts", "/help", "/quit", "/exit",
+]
+
+_PROVIDER_NAMES = ["chatgpt", "claude", "gemini"]
+
+
+class _ChatCompleter:
+    """Tab-completion for the attest chat prompt.
+
+    Supports:
+    - /cmd     → command completion
+    - @prov    → @chatgpt, @claude, @gemini (selective send)
+    - @file    → files and directories in cwd
+    - @dir/    → files inside that directory
+    """
+
+    def __init__(self, cwd: str):
+        self.cwd = cwd
+        self._matches: list[str] = []
+
+    def update_cwd(self, cwd: str):
+        self.cwd = cwd
+
+    def complete(self, text: str, state: int) -> str | None:
+        if state == 0:
+            self._matches = self._get_matches(text)
+        return self._matches[state] if state < len(self._matches) else None
+
+    def _get_matches(self, text: str) -> list[str]:
+        """Build completion list based on current token."""
+        try:
+            import readline
+            line = readline.get_line_buffer()
+            begin = readline.get_begidx()
+
+            # If cursor is right after @, readline gives us the text after @
+            if begin > 0 and line[begin - 1:begin] == "@":
+                return self._complete_at(text)
+        except (ImportError, AttributeError):
+            pass
+
+        # Fallback: infer from the text itself
+        if text.startswith("@"):
+            return self._complete_at(text[1:], prefix="@")
+        if text.startswith("/"):
+            return self._complete_command(text)
+
+        return []
+
+    def _complete_command(self, text: str) -> list[str]:
+        return [c + " " for c in _COMMANDS if c.startswith(text)]
+
+    def _complete_at(self, partial: str, prefix: str = "") -> list[str]:
+        """Complete after @.
+
+        First offers provider names, then file/directory matches.
+        """
+        matches = []
+
+        # Provider names (for selective sending)
+        for p in _PROVIDER_NAMES:
+            if p.startswith(partial.lower()):
+                matches.append(f"{prefix}{p} ")
+
+        # File and directory completion
+        if "/" in partial:
+            # Completing inside a directory: @docs/rea → @docs/readme.md
+            dir_part, file_part = partial.rsplit("/", 1)
+            search_dir = os.path.join(self.cwd, dir_part)
+        else:
+            dir_part = ""
+            file_part = partial
+            search_dir = self.cwd
+
+        try:
+            entries = os.listdir(search_dir)
+        except OSError:
+            entries = []
+
+        for entry in sorted(entries):
+            if entry.startswith("."):
+                continue  # Skip hidden files
+            if entry.lower().startswith(file_part.lower()):
+                full_path = os.path.join(search_dir, entry)
+                if dir_part:
+                    display = f"{dir_part}/{entry}"
+                else:
+                    display = entry
+
+                if os.path.isdir(full_path):
+                    matches.append(f"{prefix}{display}/")
+                else:
+                    matches.append(f"{prefix}{display} ")
+
+        return matches
+
+
+def _setup_readline(cwd: str) -> _ChatCompleter:
+    """Configure readline for tab-completion in the chat prompt."""
+    try:
+        import readline
+    except ImportError:
+        return _ChatCompleter(cwd)
+
+    completer = _ChatCompleter(cwd)
+
+    readline.set_completer(completer.complete)
+    # Treat @ and / as word-break characters so completion triggers properly
+    readline.set_completer_delims(" \t\n")
+    readline.parse_and_bind("tab: complete")
+
+    return completer
+
+
 # Terminal colors
 _COLORS = {
     "chatgpt": "\033[32m",     # green
@@ -117,6 +238,12 @@ PROVIDER_SELECTORS = {
             'button[data-testid="stop-button"]',
         ],
         "new_chat": 'a[data-testid="create-new-chat-button"]',
+        # ChatGPT canvas / code blocks
+        "artifact_selectors": [
+            'div[class*="code-block"] pre code',
+            'pre code',
+            'div[data-testid="canvas-content"]',
+        ],
     },
     "gemini": {
         "url": "https://gemini.google.com/app",
@@ -141,6 +268,10 @@ PROVIDER_SELECTORS = {
         "streaming_indicator": 'button[aria-label="Stop response"]',
         "streaming_fallbacks": [
             'mat-icon[data-mat-icon-name="stop_circle"]',
+        ],
+        "artifact_selectors": [
+            'code-block pre code',
+            'pre code',
         ],
     },
     "claude": {
@@ -167,13 +298,106 @@ PROVIDER_SELECTORS = {
             'button[aria-label="Stop response"]',
             'div[data-is-streaming="true"]',
         ],
+        # Claude artifacts appear in a separate panel
+        "artifact_selectors": [
+            'div[data-testid="artifact-content"]',
+            'div[class*="artifact"] pre code',
+            'div[class*="code-block"] pre code',
+            'pre code',
+        ],
     },
 }
+
+# ---------------------------------------------------------------------------
+# Model / tier selectors for each provider's web UI
+# ---------------------------------------------------------------------------
+
+# Known models per provider — keys are what the user types, values are the
+# display text we look for in the model picker dropdown.
+PROVIDER_MODELS = {
+    "chatgpt": {
+        "4o": "GPT-4o",
+        "4o-mini": "GPT-4o mini",
+        "o1": "o1",
+        "o3": "o3",
+        "o4-mini": "o4-mini",
+        "deep-research": "Deep Research",
+    },
+    "claude": {
+        "haiku": "Haiku",
+        "sonnet": "Sonnet",
+        "opus": "Opus",
+    },
+    "gemini": {
+        "flash": "Flash",
+        "pro": "Pro",
+        "deep-research": "Deep Research",
+    },
+}
+
+# CSS selectors for the model picker button and dropdown items.
+# These WILL break when UIs change — keep them here for easy updates.
+MODEL_SELECTORS = {
+    "chatgpt": {
+        # The model picker is a button/dropdown at the top of the chat
+        "picker_button": [
+            'button[data-testid="model-switcher-dropdown-button"]',
+            'button[class*="model"]',
+            'div[class*="model-selector"] button',
+        ],
+        # Individual model options in the dropdown
+        "option_selector": 'div[role="option"], div[role="menuitem"], li[role="option"]',
+    },
+    "claude": {
+        "picker_button": [
+            'button[data-testid="model-selector"]',
+            'button[class*="model"]',
+            'fieldset button[class*="selector"]',
+        ],
+        "option_selector": 'div[role="option"], div[role="menuitem"], button[role="menuitem"]',
+    },
+    "gemini": {
+        "picker_button": [
+            'button[data-test-id="model-selector"]',
+            'mat-select[aria-label*="model" i]',
+            'button[aria-label*="model" i]',
+        ],
+        "option_selector": 'mat-option, div[role="option"], div[role="menuitem"]',
+    },
+}
+
+# Classify follow-up questions: context questions need human input,
+# knowledge questions can be routed to other providers.
+_CONTEXT_QUESTION_PATTERNS = re.compile(
+    r"(which (file|part|section|version|option|approach|language|framework)|"
+    r"what (language|framework|version|format|style|tone)|"
+    r"your (preference|goal|use case|requirement|deadline|budget)|"
+    r"do you (prefer|want|need|mean|have|use)|"
+    r"are you (using|looking|trying|working)|"
+    r"can you (provide|share|specify|clarify|confirm)|"
+    r"what (do you|would you|should I)|"
+    r"how (do you want|would you like|should I))",
+    re.IGNORECASE,
+)
 
 
 def _color(provider: str, text: str) -> str:
     c = _COLORS.get(provider, "")
     return f"{c}{text}{_RESET}" if c else text
+
+
+def _open_path(path: Path) -> None:
+    """Open a file or directory in the OS default handler (cross-platform)."""
+    import subprocess
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", str(path)])
+        elif sys.platform == "win32":
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
+    except Exception:
+        pass  # non-critical — user can open manually
 
 
 def _resolve_file_refs(text: str, cwd: str) -> str:
@@ -404,6 +628,11 @@ class BrowserSession:
     last_response: str = ""
     call_count: int = 0
     logged_in: bool = False
+    # Rate limiting: track last send time and consecutive rate-limit signals
+    _last_send_time: float = 0.0
+    _rate_limit_hits: int = 0
+    # Artifacts extracted from this provider's responses
+    artifacts: list[dict] = field(default_factory=list)
 
 
 def _init_judge_client():
@@ -452,6 +681,8 @@ class BrowserChat:
         cwd: str | None = None,
         profile_dir: str | None = None,
         headless: bool = False,
+        models: dict[str, str] | None = None,
+        auto_followup: bool = False,
     ):
         self.db = db
         self.cwd = cwd or os.getcwd()
@@ -462,6 +693,13 @@ class BrowserChat:
         self._context = None
         self._playwright = None
         self._round_num = 0  # Tracks tournament rounds for output dir naming
+
+        # Model selection: {"chatgpt": "o3", "claude": "opus", "gemini": "pro"}
+        self._requested_models = models or {}
+        self._active_models: dict[str, str] = {}  # Tracks what's actually selected
+
+        # Auto follow-up: route provider questions to other providers before human
+        self.auto_followup = auto_followup
 
         # Output directory for saving responses
         self._output_dir: Path | None = None
@@ -516,7 +754,11 @@ class BrowserChat:
         print(_color("system", f"  Final output saved to: {final_dir}/best.md"))
 
     async def _start_browser(self):
-        """Launch persistent Chromium context with saved logins."""
+        """Launch persistent Chromium context with saved logins.
+
+        Opens all provider tabs in parallel for faster startup.
+        Only prompts for login if needed; minimizes the window when all are ready.
+        """
         try:
             from playwright.async_api import async_playwright
         except ImportError:
@@ -535,69 +777,99 @@ class BrowserChat:
             args=["--disable-blink-features=AutomationControlled"],
         )
 
-        # Open tabs for each provider
-        for provider in self.requested_providers:
-            if provider not in PROVIDER_SELECTORS:
-                print(_color("system", f"Unknown provider '{provider}', skipping"))
-                continue
+        # Close the default blank tab immediately
+        for p in self._context.pages:
+            if p.url in ("about:blank", "chrome://newtab/"):
+                await p.close()
 
+        # Open ALL tabs in parallel
+        valid_providers = [p for p in self.requested_providers if p in PROVIDER_SELECTORS]
+        print(_color("system", f"Opening {len(valid_providers)} providers in parallel..."))
+
+        async def _open_tab(provider: str):
             selectors = PROVIDER_SELECTORS[provider]
             page = await self._context.new_page()
-
-            print(_color("system", f"Opening {provider}..."))
             try:
                 await page.goto(selectors["url"], wait_until="domcontentloaded", timeout=30000)
-                # Wait for page to fully settle (handle redirects, consent screens)
-                await asyncio.sleep(3)
-
-                # Some providers redirect — wait for final URL
-                for _ in range(5):
-                    try:
-                        await page.wait_for_load_state("domcontentloaded", timeout=5000)
-                        break
-                    except Exception:
-                        await asyncio.sleep(1)
-
+                # Wait for redirects / consent screens to settle
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    await asyncio.sleep(2)
             except Exception as exc:
                 print(_color("system", f"  Failed to load {provider}: {exc}"))
-                continue
-
-            session = BrowserSession(
-                provider=provider,
-                page=page,
-                selectors=selectors,
+                return None
+            return BrowserSession(
+                provider=provider, page=page, selectors=selectors,
             )
 
-            # Check if we need to log in
+        results = await asyncio.gather(
+            *[_open_tab(p) for p in valid_providers],
+            return_exceptions=True,
+        )
+
+        # Collect successful sessions, track which need login
+        needs_login = []
+        for provider, result in zip(valid_providers, results):
+            if isinstance(result, Exception) or result is None:
+                print(_color("system", f"  {provider}: failed to open"))
+                continue
+            session = result
             logged_in = await self._check_login(session)
-            if not logged_in:
+            if logged_in:
+                session.logged_in = True
+                self.sessions[provider] = session
+                print(_color("system", f"  {provider} ✓"))
+            else:
+                needs_login.append(session)
+
+        # Handle logins one at a time — bring each tab to front
+        if needs_login:
+            print()
+            print(_color("system", f"{len(needs_login)} provider(s) need login:"))
+            for session in needs_login:
+                provider = session.provider
+                try:
+                    await session.page.bring_to_front()
+                except Exception:
+                    pass
                 print(f"\n  {_BOLD}Log into {provider} in the browser window, then press Enter here.{_RESET}")
                 await asyncio.get_event_loop().run_in_executor(None, input, "  Press Enter when logged in... ")
-                # Wait for the page to settle after login + potential redirects
-                await asyncio.sleep(3)
+                await asyncio.sleep(2)
 
-                # Re-navigate to ensure we're on the right page
+                # Re-navigate to ensure we're on the chat page
                 try:
-                    await page.goto(selectors["url"], wait_until="domcontentloaded", timeout=15000)
-                    await asyncio.sleep(2)
+                    await session.page.goto(
+                        session.selectors["url"],
+                        wait_until="domcontentloaded", timeout=15000,
+                    )
+                    await asyncio.sleep(1)
                 except Exception:
                     pass
 
-            session.logged_in = True
-            self.sessions[provider] = session
-            print(_color("system", f"  {provider} ready (url: {page.url})"))
+                session.logged_in = True
+                self.sessions[provider] = session
+                print(_color("system", f"  {provider} ✓"))
 
-        # Register download handlers for all sessions
-        for provider, session in self.sessions.items():
+        # Register download handlers
+        for session in self.sessions.values():
             await self._setup_download_handler(session)
 
-        # Close the default blank tab
-        pages = self._context.pages
-        if len(pages) > len(self.sessions):
-            for p in pages:
-                if p.url in ("about:blank", "chrome://newtab/"):
-                    await p.close()
-                    break
+        # Select requested models (if any)
+        if self._requested_models:
+            print(_color("system", "Selecting models..."))
+            for provider, model_key in self._requested_models.items():
+                if provider in self.sessions:
+                    await self._select_model(self.sessions[provider], model_key)
+
+        # Minimize the browser window — work happens in the terminal.
+        # Tabs will be brought to front only when follow-up input is needed.
+        if self.sessions and not needs_login:
+            try:
+                first_page = next(iter(self.sessions.values())).page
+                await first_page.evaluate("() => window.blur()")
+            except Exception:
+                pass
 
     async def _check_login(self, session: BrowserSession) -> bool:
         """Heuristic check if the user is logged into this provider."""
@@ -619,6 +891,232 @@ class BrowserChat:
             pass
         return False
 
+    async def _select_model(self, session: BrowserSession, model_key: str) -> bool:
+        """Select a specific model/tier in a provider's web UI.
+
+        model_key: short name like "opus", "o3", "pro", "deep-research"
+        Returns True if selection succeeded (or was already active).
+        """
+        provider = session.provider
+        page = session.page
+
+        models = PROVIDER_MODELS.get(provider, {})
+        if model_key not in models:
+            available = ", ".join(models.keys()) if models else "none"
+            print(_color("system", f"  Unknown model '{model_key}' for {provider}. Available: {available}"))
+            return False
+
+        display_text = models[model_key]
+        selectors = MODEL_SELECTORS.get(provider, {})
+        picker_selectors = selectors.get("picker_button", [])
+        option_selector = selectors.get("option_selector", 'div[role="option"]')
+
+        # Step 1: Click the model picker to open dropdown
+        picker = None
+        for sel in picker_selectors:
+            try:
+                picker = await page.query_selector(sel)
+                if picker:
+                    break
+            except Exception:
+                continue
+
+        if not picker:
+            # Try a broader search — look for any button containing current model text
+            try:
+                picker = await page.evaluate("""() => {
+                    const buttons = document.querySelectorAll('button');
+                    for (const btn of buttons) {
+                        const text = btn.innerText || btn.textContent || '';
+                        if (/GPT|Claude|Sonnet|Opus|Haiku|Gemini|Flash|Pro|model/i.test(text)) {
+                            return true;  // found it
+                        }
+                    }
+                    return false;
+                }""")
+                if picker:
+                    # Click it via JS
+                    await page.evaluate("""() => {
+                        const buttons = document.querySelectorAll('button');
+                        for (const btn of buttons) {
+                            const text = btn.innerText || btn.textContent || '';
+                            if (/GPT|Claude|Sonnet|Opus|Haiku|Gemini|Flash|Pro|model/i.test(text)) {
+                                btn.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }""")
+            except Exception:
+                pass
+
+        if not picker:
+            print(_color("system", f"  Could not find model picker for {provider}"))
+            return False
+
+        if isinstance(picker, bool):
+            # JS-based click already happened
+            pass
+        else:
+            try:
+                await picker.click()
+            except Exception as exc:
+                print(_color("system", f"  Could not click model picker for {provider}: {exc}"))
+                return False
+
+        await asyncio.sleep(1.0)  # Wait for dropdown to open
+
+        # Step 2: Find and click the target model option
+        try:
+            clicked = await page.evaluate(f"""(targetText) => {{
+                const options = document.querySelectorAll('{option_selector}');
+                for (const opt of options) {{
+                    const text = opt.innerText || opt.textContent || '';
+                    if (text.includes(targetText)) {{
+                        opt.click();
+                        return text.trim();
+                    }}
+                }}
+                // Broader fallback: any clickable element containing the text
+                const all = document.querySelectorAll('div, span, button, li');
+                for (const el of all) {{
+                    const text = el.innerText || el.textContent || '';
+                    if (text.includes(targetText) && el.offsetParent !== null) {{
+                        el.click();
+                        return text.trim();
+                    }}
+                }}
+                return null;
+            }}""", display_text)
+
+            if clicked:
+                self._active_models[provider] = model_key
+                print(_color("system", f"  {provider}: selected {clicked}"))
+                await asyncio.sleep(1.0)  # Wait for model switch to take effect
+                return True
+            else:
+                print(_color("system", f"  Could not find '{display_text}' option in {provider} dropdown"))
+                # Close the dropdown by pressing Escape
+                await page.keyboard.press("Escape")
+                return False
+        except Exception as exc:
+            print(_color("system", f"  Model selection failed for {provider}: {exc}"))
+            await page.keyboard.press("Escape")
+            return False
+
+    def _is_context_question(self, response: str) -> bool:
+        """Check if a follow-up question is about the user's specific context
+        (needs human input) vs a knowledge question (other LLMs can answer)."""
+        # Extract the question portion (last part of response)
+        tail = response[-1000:] if len(response) > 1000 else response
+        return bool(_CONTEXT_QUESTION_PATTERNS.search(tail))
+
+    async def _route_to_other_providers(
+        self, asking_provider: str, question_text: str,
+    ) -> str | None:
+        """Send a provider's follow-up question to the other providers.
+
+        Returns a synthesized answer, or None if no useful responses.
+        """
+        other_sessions = {
+            name: session for name, session in self.sessions.items()
+            if name != asking_provider and session.logged_in
+        }
+        if not other_sessions:
+            return None
+
+        # Frame the question clearly
+        routed_msg = (
+            f"Another AI assistant ({asking_provider}) asked this question while "
+            f"working on the same task. Please answer briefly:\n\n"
+            f"{question_text}"
+        )
+
+        print(_color("system", f"  Routing {asking_provider}'s question to: {', '.join(other_sessions.keys())}"))
+
+        # Send to all other providers in parallel
+        task_to_provider = {}
+        pending = set()
+        for name, session in other_sessions.items():
+            task = asyncio.create_task(self._send_message(session, routed_msg))
+            task_to_provider[task] = name
+            pending.add(task)
+
+        answers = {}
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for done_task in done:
+                name = task_to_provider[done_task]
+                try:
+                    resp = done_task.result()
+                    if resp and len(resp.strip()) > 10:
+                        answers[name] = resp
+                except Exception:
+                    pass
+
+        if not answers:
+            return None
+
+        # If only one answer, use it directly
+        if len(answers) == 1:
+            provider, answer = next(iter(answers.items()))
+            print(_color("system", f"  {provider} answered {asking_provider}'s question"))
+            return f"[Answer from {provider}]: {answer}"
+
+        # Multiple answers — synthesize
+        parts = [f"Here are answers from other AI assistants to your question:"]
+        for name, answer in answers.items():
+            # Truncate individual answers to keep context manageable
+            truncated = answer[:1500] if len(answer) > 1500 else answer
+            parts.append(f"\n[{name}]: {truncated}")
+
+        parts.append(
+            "\nBased on these answers, please continue with your original task."
+        )
+        return "\n".join(parts)
+
+    async def _check_page_health(self, session: BrowserSession) -> bool:
+        """Check if a provider's page is still alive and on the right site.
+
+        If the page has crashed or navigated away (session expired, etc.),
+        attempt to recover by navigating back to the provider's URL.
+        """
+        page = session.page
+        provider = session.provider
+
+        try:
+            url = page.url
+            if not url or url == "about:blank" or url.startswith("chrome-error"):
+                raise Exception("Page crashed or blank")
+            # Check the page is on the right domain
+            expected_domain = PROVIDER_SELECTORS[provider]["url"].split("//")[1].split("/")[0]
+            if expected_domain not in url:
+                raise Exception(f"Wrong domain: {url}")
+            return True
+        except Exception as exc:
+            logger.warning("%s page unhealthy: %s — attempting recovery", provider, exc)
+            print(_color("system", f"  {provider}: page issue detected, recovering..."))
+            try:
+                await page.goto(
+                    session.selectors["url"],
+                    wait_until="domcontentloaded", timeout=15000,
+                )
+                await asyncio.sleep(3)
+                # Verify input is available
+                el = await self._find_element(
+                    page, session.selectors["input"],
+                    session.selectors.get("input_fallbacks"), timeout=5000,
+                )
+                if el:
+                    print(_color("system", f"  {provider}: recovered"))
+                    return True
+                else:
+                    print(_color("system", f"  {provider}: recovered page but can't find input — may need re-login"))
+                    return False
+            except Exception as exc2:
+                print(_color("system", f"  {provider}: recovery failed: {exc2}"))
+                return False
+
     async def _find_element(self, page, primary: str, fallbacks: list[str] | None = None, timeout: int = 10000) -> object | None:
         """Find an element using primary selector with fallbacks."""
         try:
@@ -638,58 +1136,132 @@ class BrowserChat:
         return None
 
     async def _insert_text(self, page, element, text: str, provider: str):
-        """Insert text into a chat input. Provider-specific strategies."""
-        await element.click()
-        await asyncio.sleep(0.2)
+        """Insert text into a chat input as a single atomic paste.
 
-        # Select all existing text first
+        All providers use the same approach: focus the element, write to the
+        system clipboard via JS, then trigger a real paste event via Ctrl/Cmd+V.
+        This is the most reliable method because it's exactly what a human does
+        and every editor framework handles paste as a single atomic operation.
+        """
+        await element.click()
+        await asyncio.sleep(0.3)
+
+        # Clear any existing text
         await page.keyboard.press("Meta+a")
         await asyncio.sleep(0.1)
+        await page.keyboard.press("Backspace")
+        await asyncio.sleep(0.1)
 
+        # Strategy 1: Clipboard API paste (works for all providers)
+        try:
+            # Write text to clipboard via the Clipboard API
+            await page.evaluate("""(text) => {
+                // Use a synthetic paste event with DataTransfer
+                // This works even without clipboard permissions
+                const el = document.activeElement;
+                if (el) {
+                    const dt = new DataTransfer();
+                    dt.setData('text/plain', text);
+                    const event = new ClipboardEvent('paste', {
+                        clipboardData: dt,
+                        bubbles: true,
+                        cancelable: true,
+                    });
+                    el.dispatchEvent(event);
+                }
+            }""", text)
+            await asyncio.sleep(0.5)
+
+            # Check if the text actually landed
+            content = await self._get_input_content(page, provider)
+            if content and len(content) > min(20, len(text) // 2):
+                return
+        except Exception:
+            pass
+
+        # Strategy 2: Clipboard write + real Cmd+V keypress
+        try:
+            # Grant clipboard permissions and write
+            await page.context.grant_permissions(["clipboard-read", "clipboard-write"])
+        except Exception:
+            pass
+
+        try:
+            await page.evaluate("(text) => navigator.clipboard.writeText(text)", text)
+            await asyncio.sleep(0.2)
+            await page.keyboard.press("Meta+v")
+            await asyncio.sleep(0.5)
+
+            content = await self._get_input_content(page, provider)
+            if content and len(content) > min(20, len(text) // 2):
+                return
+        except Exception:
+            pass
+
+        # Strategy 3: Provider-specific innerHTML (fast but less reliable)
         if provider == "chatgpt":
-            # ChatGPT's ProseMirror editor: set innerHTML via JS
             try:
-                # Convert newlines to <p> tags for ProseMirror
                 paragraphs = text.split("\n")
                 html = "".join(f"<p>{p}</p>" if p.strip() else "<p><br></p>" for p in paragraphs)
                 await page.evaluate("""([selector, html]) => {
                     const el = document.querySelector(selector);
                     if (el) {
                         el.innerHTML = html;
-                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        // Trigger React's synthetic event system
+                        const inputEvent = new InputEvent('input', { bubbles: true, inputType: 'insertFromPaste' });
+                        el.dispatchEvent(inputEvent);
                     }
                 }""", ['div[id="prompt-textarea"]', html])
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.5)
                 return
             except Exception:
                 pass
-
-        if provider == "gemini":
-            # Gemini's Quill editor: set via JS
+        elif provider == "gemini":
             try:
                 await page.evaluate("""([selector, text]) => {
                     const el = document.querySelector(selector);
                     if (el) {
                         el.innerHTML = '<p>' + text.replace(/\\n/g, '</p><p>') + '</p>';
-                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        const inputEvent = new InputEvent('input', { bubbles: true, inputType: 'insertFromPaste' });
+                        el.dispatchEvent(inputEvent);
                     }
                 }""", ['div.ql-editor', text])
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.5)
                 return
             except Exception:
                 pass
 
-        # Claude and fallback: use keyboard.insert_text (inserts all at once, no key events)
+        # Strategy 4: keyboard.insert_text (Playwright's built-in, inserts all at once)
         try:
+            await element.click()
+            await asyncio.sleep(0.1)
             await page.keyboard.insert_text(text)
             await asyncio.sleep(0.3)
             return
         except Exception:
             pass
 
-        # Final fallback: type character by character (slow but reliable)
+        # Strategy 5: Last resort — type it (slow but guaranteed)
+        logger.warning("All paste strategies failed for %s, falling back to typing", provider)
         truncated = text[:5000] if len(text) > 5000 else text
-        await page.keyboard.type(truncated, delay=2)
+        await page.keyboard.type(truncated, delay=1)
+
+    async def _get_input_content(self, page, provider: str) -> str | None:
+        """Check what text is currently in the input element."""
+        try:
+            selectors = {
+                "chatgpt": 'div[id="prompt-textarea"]',
+                "gemini": 'div.ql-editor',
+                "claude": 'div[contenteditable="true"]',
+            }
+            sel = selectors.get(provider, 'div[contenteditable="true"]')
+            content = await page.evaluate(f"""() => {{
+                const el = document.querySelector('{sel}');
+                return el ? el.innerText : null;
+            }}""")
+            return content
+        except Exception:
+            return None
 
     async def _upload_files(self, session: BrowserSession, file_paths: list[str]) -> int:
         """Upload files to a provider's chat UI using the hidden file input.
@@ -785,10 +1357,58 @@ class BrowserChat:
                 continue
         return 0
 
-    async def _send_message(self, session: BrowserSession, text: str) -> str | None:
-        """Type and send a message, wait for response. Returns response text."""
+    # Rate-limit detection patterns (provider shows a "slow down" or "try again" message)
+    _RATE_LIMIT_PATTERNS = re.compile(
+        r"(rate limit|too many (requests|messages)|slow down|try again (later|in)|"
+        r"wait a (moment|few|bit)|usage cap|limit reached|you.ve sent too many)",
+        re.IGNORECASE,
+    )
+
+    async def _rate_limit_delay(self, session: BrowserSession):
+        """Enforce per-provider cooldown between sends.
+
+        Base delay: 2s between messages. If rate-limit signals detected,
+        exponential backoff up to 60s.
+        """
+        now = time.monotonic()
+        base_delay = 2.0
+        if session._rate_limit_hits > 0:
+            # Exponential backoff: 5s, 10s, 20s, 40s, 60s cap
+            delay = min(5.0 * (2 ** (session._rate_limit_hits - 1)), 60.0)
+            print(_color("system", f"  {session.provider}: rate-limit backoff {delay:.0f}s"))
+        else:
+            delay = base_delay
+
+        elapsed = now - session._last_send_time
+        if elapsed < delay:
+            wait = delay - elapsed
+            await asyncio.sleep(wait)
+
+        session._last_send_time = time.monotonic()
+
+    def _check_rate_limit_response(self, session: BrowserSession, response: str | None):
+        """Check if a response indicates rate limiting and update the session."""
+        if not response:
+            return
+        if self._RATE_LIMIT_PATTERNS.search(response) and len(response) < 500:
+            session._rate_limit_hits = min(session._rate_limit_hits + 1, 5)
+            logger.warning("%s: rate limit detected (hit #%d)", session.provider, session._rate_limit_hits)
+        else:
+            # Successful response — decay rate limit counter
+            if session._rate_limit_hits > 0:
+                session._rate_limit_hits = max(0, session._rate_limit_hits - 1)
+
+    async def _send_message(self, session: BrowserSession, text: str, stream_display: bool = False) -> str | None:
+        """Type and send a message, wait for response. Returns response text.
+
+        If stream_display=True, prints the response incrementally as it streams.
+        Only use for single-provider sends to avoid interleaving output.
+        """
         page = session.page
         sel = session.selectors
+
+        # Rate limit delay before sending
+        await self._rate_limit_delay(session)
 
         try:
             # Snapshot response count before sending
@@ -805,30 +1425,82 @@ class BrowserChat:
 
             # Insert text (provider-specific strategy)
             await self._insert_text(page, input_el, text, session.provider)
-            await asyncio.sleep(1.0)  # Let the editor process the content
+            await asyncio.sleep(2.0)  # Let the editor framework fully process
+
+            # Verify text landed before sending
+            content = await self._get_input_content(page, session.provider)
+            if not content or len(content.strip()) < min(10, len(text) // 4):
+                logger.warning("%s: text may not have landed (got %d chars), retrying",
+                               session.provider, len(content or ""))
+                # Retry with a different strategy — click and insert_text
+                await input_el.click()
+                await asyncio.sleep(0.2)
+                await page.keyboard.press("Meta+a")
+                await asyncio.sleep(0.1)
+                await page.keyboard.insert_text(text)
+                await asyncio.sleep(1.0)
 
             # Click send button (with fallbacks), or press Enter
             send_btn = await self._find_element(
                 page, sel["send"], sel.get("send_fallbacks"), timeout=5000,
             )
+            sent = False
             if send_btn:
                 try:
                     await send_btn.click()
+                    sent = True
                 except Exception:
-                    await page.keyboard.press("Enter")
-            else:
+                    pass
+
+            if not sent:
+                # Try Enter key, then Ctrl+Enter (some UIs use this)
                 await page.keyboard.press("Enter")
 
-            # Wait for streaming to start
-            await asyncio.sleep(3)
+            # Wait for streaming to start — longer for big messages
+            start_wait = 5 if len(text) > 2000 else 3
+            await asyncio.sleep(start_wait)
+
+            # Verify the message was sent: check if a new user message appeared
+            # or if streaming started. If neither, try re-sending via Enter.
+            streaming = await self._is_streaming(session)
+            new_count = await self._count_responses(session)
+            if not streaming and new_count <= pre_count:
+                logger.info("%s: message may not have sent, retrying Enter", session.provider)
+                # Focus the input again and try Enter
+                try:
+                    input_el2 = await self._find_element(
+                        page, sel["input"], sel.get("input_fallbacks"), timeout=3000,
+                    )
+                    if input_el2:
+                        await input_el2.click()
+                        await asyncio.sleep(0.3)
+                except Exception:
+                    pass
+                await page.keyboard.press("Enter")
+                await asyncio.sleep(3)
 
             # Wait for streaming to finish
-            response = await self._wait_for_response(session, pre_count=pre_count)
+            response = await self._wait_for_response(session, pre_count=pre_count, stream_display=stream_display)
+
+            # Check for rate-limiting in the response
+            self._check_rate_limit_response(session, response)
+
             if response:
                 session.last_response = response
                 session.call_count += 1
                 session.messages.append({"role": "user", "content": text})
                 session.messages.append({"role": "assistant", "content": response})
+
+                # Extract artifacts (code blocks, canvas, etc.)
+                try:
+                    artifacts = await self._extract_artifacts(session)
+                    if artifacts:
+                        # Store on session and save to disk
+                        session.artifacts.extend(artifacts)
+                        self._save_artifacts(session.provider, artifacts)
+                except Exception:
+                    pass  # Artifact extraction is best-effort
+
             return response
 
         except Exception as exc:
@@ -851,7 +1523,11 @@ class BrowserChat:
         return False
 
     async def _extract_last_response(self, session: BrowserSession, pre_count: int = 0) -> str | None:
-        """Extract the last assistant response using primary + fallback selectors."""
+        """Extract the last assistant response using primary + fallback selectors.
+
+        Uses pre_count to only consider NEW response elements — prevents picking
+        up stale responses from earlier rounds during tournaments.
+        """
         page = session.page
         sel = session.selectors
         all_selectors = [sel["response"]] + sel.get("response_fallbacks", [])
@@ -862,53 +1538,211 @@ class BrowserChat:
                 if not response_els:
                     continue
 
-                # Get the last element (most recent response)
-                last = response_els[-1]
-                text = await last.inner_text()
-                if text and text.strip() and len(text.strip()) > 5:
-                    return text.strip()
+                # Only look at elements added AFTER the pre_count snapshot.
+                # If pre_count > 0 and we have more elements now, skip old ones.
+                if pre_count > 0 and len(response_els) > pre_count:
+                    candidates = response_els[pre_count:]
+                else:
+                    candidates = [response_els[-1]]
+
+                # Get the last NEW element
+                for el in reversed(candidates):
+                    text = await el.inner_text()
+                    if text and text.strip() and len(text.strip()) > 5:
+                        return text.strip()
             except Exception:
                 continue
 
         return None
 
-    async def _wait_for_response(self, session: BrowserSession, timeout: float = 120.0, pre_count: int = 0) -> str | None:
-        """Poll until the assistant finishes responding."""
+    async def _extract_artifacts(self, session: BrowserSession) -> list[dict]:
+        """Extract code blocks and artifacts from the provider's latest response.
+
+        Returns a list of dicts with keys: type, content, language (optional).
+        """
+        page = session.page
+        sel = session.selectors
+        artifact_selectors = sel.get("artifact_selectors", [])
+        artifacts = []
+
+        for selector in artifact_selectors:
+            try:
+                elements = await page.query_selector_all(selector)
+                for el in elements:
+                    text = await el.inner_text()
+                    if not text or len(text.strip()) < 10:
+                        continue
+
+                    # Try to detect the language from class attributes
+                    lang = ""
+                    try:
+                        class_attr = await el.get_attribute("class") or ""
+                        # Common patterns: "language-python", "hljs python", "code-python"
+                        for cls in class_attr.split():
+                            if cls.startswith("language-"):
+                                lang = cls[9:]
+                                break
+                            elif cls in ("python", "javascript", "typescript", "rust",
+                                         "go", "java", "cpp", "c", "html", "css", "sql",
+                                         "bash", "shell", "json", "yaml", "xml", "markdown"):
+                                lang = cls
+                                break
+                    except Exception:
+                        pass
+
+                    artifact = {
+                        "type": "code" if selector.endswith("code") else "artifact",
+                        "content": text.strip(),
+                        "language": lang,
+                        "provider": session.provider,
+                    }
+
+                    # Deduplicate — don't add if we already have this exact content
+                    if not any(a["content"] == artifact["content"] for a in artifacts):
+                        artifacts.append(artifact)
+
+            except Exception:
+                continue
+
+        return artifacts
+
+    def _save_artifacts(self, provider: str, artifacts: list[dict], stage: str = "initial"):
+        """Save extracted artifacts to the output directory."""
+        if not self._output_dir or not artifacts:
+            return
+        art_dir = self._output_dir / "artifacts" / provider
+        art_dir.mkdir(parents=True, exist_ok=True)
+        for i, art in enumerate(artifacts):
+            ext = art.get("language") or "txt"
+            # Map common language names to file extensions
+            ext_map = {
+                "python": "py", "javascript": "js", "typescript": "ts",
+                "rust": "rs", "bash": "sh", "shell": "sh", "markdown": "md",
+                "cpp": "cpp", "c": "c", "yaml": "yml",
+            }
+            ext = ext_map.get(ext, ext)
+            filename = f"{stage}_{i+1}.{ext}"
+            (art_dir / filename).write_text(art["content"], encoding="utf-8")
+        print(_color("system", f"  {provider}: saved {len(artifacts)} artifact(s) to artifacts/{provider}/"))
+
+    def _is_deep_research(self, provider: str) -> bool:
+        """Check if a provider is in a deep-research / extended mode."""
+        model = self._active_models.get(provider, "")
+        return model in ("deep-research", "o1", "o3")
+
+    async def _wait_for_response(self, session: BrowserSession, timeout: float = 180.0, pre_count: int = 0, stream_display: bool = True) -> str | None:
+        """Poll until the assistant finishes responding.
+
+        Strategy: always try to extract text every cycle, whether streaming
+        or not. Text must stabilize (identical for 2 consecutive checks)
+        AND streaming must have stopped.
+
+        If stream_display=True, prints incremental text as it streams in
+        so the user can read the response in real-time.
+
+        Deep Research / reasoning models get a 15-minute timeout and periodic
+        progress updates in the terminal.
+        """
+        # Deep Research and reasoning models can take much longer
+        if self._is_deep_research(session.provider):
+            timeout = max(timeout, 900.0)  # 15 minutes
+            logger.info("%s is in deep research mode — timeout set to %ds", session.provider, timeout)
         start = time.monotonic()
         interval = 2.0
         last_text = ""
         stable_count = 0
+        found_any_text = False
+        last_progress_print = 0.0  # Track when we last printed a progress update
+        displayed_len = 0  # How much of the response we've already printed
+        stream_started = False  # Have we printed the streaming header?
 
         while (time.monotonic() - start) < timeout:
-            # Check if still streaming
-            if await self._is_streaming(session):
-                await asyncio.sleep(interval)
-                interval = min(interval * 1.2, 5.0)
-                continue
+            streaming = await self._is_streaming(session)
 
-            # Small delay to let final content render
-            await asyncio.sleep(1.5)
-
-            # Extract the last response
+            # Always try to extract, even while streaming
             text = await self._extract_last_response(session, pre_count)
+
             if text and len(text) > 5:
-                # Check if response has stabilized (not still changing)
-                if text == last_text:
-                    stable_count += 1
-                    if stable_count >= 2:
-                        return text
+                found_any_text = True
+
+                # Stream display: print new characters as they arrive
+                if stream_display and streaming and len(text) > displayed_len:
+                    if not stream_started:
+                        stream_started = True
+                        print(_color(session.provider, f"─── {session.provider} (streaming) ───"))
+                    new_text = text[displayed_len:]
+                    print(new_text, end="", flush=True)
+                    displayed_len = len(text)
+
+                if not streaming:
+                    # Only check stability when NOT streaming
+                    if text == last_text:
+                        stable_count += 1
+                        if stable_count >= 2:
+                            # Print any remaining text that wasn't streamed
+                            if stream_display and stream_started:
+                                remaining = text[displayed_len:]
+                                if remaining:
+                                    print(remaining, end="", flush=True)
+                                print()  # Newline after streaming
+                            return text
+                    else:
+                        last_text = text
+                        stable_count = 1
                 else:
+                    # Still streaming — track text but reset stability
                     last_text = text
-                    stable_count = 1
+                    stable_count = 0
+            elif not found_any_text and (time.monotonic() - start) > 30:
+                # 30s with zero text — try a JS-based extraction as last resort
+                try:
+                    js_text = await session.page.evaluate("""() => {
+                        // Try multiple strategies to find response text
+                        const selectors = [
+                            'div[data-message-author-role="assistant"]',
+                            'div.markdown.prose',
+                            'div.agent-turn',
+                            'article[data-testid] div.markdown',
+                            'div.font-claude-message',
+                            'message-content',
+                        ];
+                        for (const sel of selectors) {
+                            const els = document.querySelectorAll(sel);
+                            if (els.length > 0) {
+                                const last = els[els.length - 1];
+                                const text = last.innerText;
+                                if (text && text.trim().length > 10) return text.trim();
+                            }
+                        }
+                        return null;
+                    }""")
+                    if js_text:
+                        logger.info("JS fallback found text for %s (%d chars)", session.provider, len(js_text))
+                        found_any_text = True
+                        last_text = js_text
+                        stable_count = 1
+                except Exception:
+                    pass
+
+            # Print progress for deep research / long-running responses
+            elapsed = time.monotonic() - start
+            if self._is_deep_research(session.provider) and elapsed - last_progress_print > 30:
+                last_progress_print = elapsed
+                mins = int(elapsed // 60)
+                secs = int(elapsed % 60)
+                chars = len(last_text) if last_text else 0
+                status = "streaming" if streaming else ("waiting" if not found_any_text else "stabilizing")
+                print(_color("system", f"  {session.provider}: {status} ({mins}m{secs:02d}s, {chars} chars)"), end="\r")
 
             await asyncio.sleep(interval)
-            interval = min(interval * 1.2, 5.0)
+            interval = min(interval * 1.1, 4.0)
 
         # Return whatever we have even on timeout
         if last_text:
+            logger.warning("Timeout for %s but returning partial text (%d chars)", session.provider, len(last_text))
             return last_text
 
-        logger.warning("Timeout waiting for %s", session.provider)
+        logger.warning("Timeout waiting for %s — no text found", session.provider)
         return None
 
     def _is_stalled(self, response: str) -> bool:
@@ -933,12 +1767,35 @@ class BrowserChat:
     async def _handle_followup(self, provider: str, session: BrowserSession, response: str, _depth: int = 0) -> str | None:
         """Handle a provider asking follow-up questions.
 
-        Automatically brings the provider's browser tab to front so the user
-        can see the questions in context. The user can then:
-        - Answer in the terminal (typed here, sent to the provider)
-        - Answer directly in the browser tab (type 'done' when finished)
-        - Press Enter to auto-proceed
+        Modes:
+        - auto_followup: Knowledge questions go to other providers first.
+          Context questions still go to the human.
+        - Manual (default): Always ask the human, with option to type 'ask'
+          to route the question to other providers.
+
+        User options:
+        - Type answer    → sends it to the provider
+        - Type 'done'    → you already answered in the browser
+        - Type 'ask'     → route the question to other providers
+        - Press Enter    → tells provider to proceed with best judgment
         """
+        # Auto-followup mode: try other providers first for knowledge questions
+        if self.auto_followup and _depth == 0 and not self._is_context_question(response):
+            # Extract the question portion for routing
+            tail = response[-2000:] if len(response) > 2000 else response
+            print(_color("system", f"  {provider} has a question — routing to other providers (auto-followup)..."))
+            routed_answer = await self._route_to_other_providers(provider, tail)
+            if routed_answer:
+                new_response = await self._send_message(session, routed_answer)
+                if new_response:
+                    if _depth < 2 and self._needs_followup(new_response) and not self._is_stalled(new_response):
+                        # Still asking questions — fall through to human
+                        print(_color("system", f"  {provider} still has questions after auto-followup"))
+                    else:
+                        return new_response
+            else:
+                print(_color("system", f"  No other providers available — asking you"))
+
         # Bring the tab to front immediately so user sees the questions
         try:
             await session.page.bring_to_front()
@@ -954,6 +1811,7 @@ class BrowserChat:
         print()
         print(_color("system", f"  Type answer here  → sends it to {provider}"))
         print(_color("system", f"  Type 'done'       → if you already answered in the browser"))
+        print(_color("system", f"  Type 'ask'        → route question to other providers"))
         print(_color("system", f"  Press Enter       → tells {provider} to proceed with best judgment"))
         print()
 
@@ -976,8 +1834,22 @@ class BrowserChat:
                 return new_response
             return session.last_response
 
+        if user_answer.lower() == "ask":
+            # Route the question to other providers
+            tail = response[-2000:] if len(response) > 2000 else response
+            routed_answer = await self._route_to_other_providers(provider, tail)
+            if routed_answer:
+                new_response = await self._send_message(session, routed_answer)
+                if new_response:
+                    if _depth < 2 and self._needs_followup(new_response) and not self._is_stalled(new_response):
+                        print(_color("system", f"  {provider} has more questions..."))
+                        return await self._handle_followup(provider, session, new_response, _depth=_depth + 1)
+                    return new_response
+            else:
+                print(_color("system", f"  No other providers available"))
+
         # Send the answer (or default "proceed" message)
-        if not user_answer:
+        if not user_answer or user_answer.lower() == "ask":
             user_answer = (
                 "Proceed with your best judgment. Don't ask more questions — "
                 "just give me your complete, best answer based on what you have."
@@ -1000,14 +1872,14 @@ class BrowserChat:
         """
         print()
 
-        # Check for closed pages and skip them
+        # Check page health and attempt recovery for any broken tabs
         active_sessions = {}
         for provider, session in self.sessions.items():
-            try:
-                _ = session.page.url
+            healthy = await self._check_page_health(session)
+            if healthy:
                 active_sessions[provider] = session
-            except Exception:
-                print(_color("system", f"  {provider}: page closed, skipping"))
+            else:
+                print(_color("system", f"  {provider}: unavailable, skipping"))
 
         # Upload files to all providers first (if any)
         if upload_files:
@@ -1022,50 +1894,50 @@ class BrowserChat:
                     print(_color("system", f"  {provider}: upload error: {exc}"))
 
         # Send to all active providers concurrently
-        tasks = {
-            provider: asyncio.create_task(self._send_message(session, message))
-            for provider, session in active_sessions.items()
-        }
-        # Map task objects back to provider names for as_completed
-        task_to_provider = {task: provider for provider, task in tasks.items()}
+        task_to_provider = {}
+        pending = set()
+        for provider, session in active_sessions.items():
+            task = asyncio.create_task(self._send_message(session, message))
+            task_to_provider[task] = provider
+            pending.add(task)
 
         # Process responses as they arrive (fastest first) — follow-ups
         # get handled immediately instead of waiting for all providers
         stalled_providers = []
-        for done_task in asyncio.as_completed(list(tasks.values())):
-            try:
-                response = await done_task
-            except Exception as exc:
-                provider = task_to_provider.get(done_task, "unknown")
-                print(_color("system", f"  {provider} error: {exc}"))
-                continue
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for done_task in done:
+                provider = task_to_provider[done_task]
+                try:
+                    response = done_task.result()
+                except Exception as exc:
+                    print(_color("system", f"  {provider} error: {exc}"))
+                    continue
 
-            provider = task_to_provider.get(done_task, "unknown")
-
-            if response:
-                if files_included and self._is_stalled(response):
-                    print(_color("system", f"─── {provider} ── STALLED (asking for files) — auto-nudging... ───"))
-                    stalled_providers.append(provider)
-                elif self._needs_followup(response):
-                    # Handle follow-up immediately — brings tab to front
-                    new_response = await self._handle_followup(
-                        provider, self.sessions[provider], response,
-                    )
-                    if new_response:
+                if response:
+                    if files_included and self._is_stalled(response):
+                        print(_color("system", f"─── {provider} ── STALLED (asking for files) — auto-nudging... ───"))
+                        stalled_providers.append(provider)
+                    elif self._needs_followup(response):
+                        # Handle follow-up immediately — brings tab to front
+                        new_response = await self._handle_followup(
+                            provider, self.sessions[provider], response,
+                        )
+                        if new_response:
+                            header = f"─── {provider} ───"
+                            print(_color(provider, header))
+                            print(new_response)
+                            print()
+                            self._save_response(provider, new_response, "initial")
+                    else:
                         header = f"─── {provider} ───"
                         print(_color(provider, header))
-                        print(new_response)
+                        print(response)
                         print()
-                        self._save_response(provider, new_response, "initial")
+                        self._save_response(provider, response, "initial")
                 else:
-                    header = f"─── {provider} ───"
-                    print(_color(provider, header))
-                    print(response)
+                    print(_color(provider, f"─── {provider} ── NO RESPONSE ───"))
                     print()
-                    self._save_response(provider, response, "initial")
-            else:
-                print(_color(provider, f"─── {provider} ── NO RESPONSE ───"))
-                print()
 
         # Auto-nudge stalled providers (asking for file uploads)
         if stalled_providers:
@@ -1506,6 +2378,239 @@ class BrowserChat:
         except Exception:
             pass
 
+    async def _new_chat(self):
+        """Navigate all providers to a fresh/new chat page."""
+        new_chat_selectors = {
+            "chatgpt": [
+                'a[data-testid="create-new-chat-button"]',
+                'a[href="/"]',
+                'nav a[class*="new"]',
+            ],
+            "claude": [
+                'a[href="/new"]',
+                'a[data-testid="new-chat"]',
+                'button[aria-label="New chat"]',
+            ],
+            "gemini": [
+                'a[href="/app"]',
+                'button[aria-label="New chat"]',
+                'a[class*="new-chat"]',
+            ],
+        }
+
+        async def _reset_provider(provider: str, session: BrowserSession):
+            page = session.page
+            # Try clicking "new chat" button first
+            for sel in new_chat_selectors.get(provider, []):
+                try:
+                    btn = await page.query_selector(sel)
+                    if btn:
+                        await btn.click()
+                        await asyncio.sleep(2)
+                        session.last_response = ""
+                        session.messages.clear()
+                        return True
+                except Exception:
+                    continue
+            # Fallback: navigate directly to the provider's URL
+            try:
+                url = session.selectors["url"]
+                await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                await asyncio.sleep(2)
+                session.last_response = ""
+                session.messages.clear()
+                return True
+            except Exception as exc:
+                print(_color("system", f"  {provider}: could not start new chat: {exc}"))
+                return False
+
+        tasks = [_reset_provider(p, s) for p, s in self.sessions.items()]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        success = sum(1 for r in results if r is True)
+        print(_color("system", f"  New chat started on {success}/{len(self.sessions)} providers"))
+
+        # Reset output directory for the new topic
+        self._init_output_dir()
+
+    async def _send_to_one(self, provider: str, message: str):
+        """Send a message to a single provider and show the response."""
+        if provider not in self.sessions:
+            print(_color("system", f"  Provider '{provider}' not active. Active: {', '.join(self.sessions.keys())}"))
+            return
+
+        session = self.sessions[provider]
+        print(_color("system", f"  Sending to {provider} only..."))
+        response = await self._send_message(session, message, stream_display=True)
+
+        if response:
+            if self._needs_followup(response):
+                response = await self._handle_followup(provider, session, response)
+            if response:
+                # Response was already streamed to terminal — just save it
+                # Print a completion line
+                print(_color("system", f"  ─── {provider}: {len(response)} chars ───"))
+                print()
+                self._save_response(provider, response, "targeted")
+        else:
+            print(_color(provider, f"─── {provider} ── NO RESPONSE ───"))
+
+    async def _screenshot_all(self):
+        """Take screenshots of all provider tabs and save to output directory."""
+        if not self._output_dir:
+            self._init_output_dir()
+
+        ss_dir = self._output_dir / "screenshots"
+        ss_dir.mkdir(parents=True, exist_ok=True)
+
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%H-%M-%S")
+
+        for provider, session in self.sessions.items():
+            try:
+                path = ss_dir / f"{provider}_{timestamp}.png"
+                await session.page.screenshot(path=str(path), full_page=True)
+                print(_color("system", f"  {provider}: saved → {path.name}"))
+            except Exception as exc:
+                print(_color("system", f"  {provider}: screenshot failed: {exc}"))
+
+        print(_color("system", f"  Screenshots saved to: {ss_dir}/"))
+
+    def _export_session(self):
+        """Export the full session as a single markdown document."""
+        if not self._output_dir:
+            print(_color("system", "No session output to export"))
+            return
+
+        from datetime import datetime
+
+        lines = [
+            f"# Multi-LLM Chat Session",
+            f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            f"**Providers:** {', '.join(self.sessions.keys())}",
+            "",
+        ]
+
+        if self._active_models:
+            models_str = ", ".join(f"{p}={m}" for p, m in self._active_models.items())
+            lines.append(f"**Models:** {models_str}")
+            lines.append("")
+
+        # Include conversation history from each provider
+        for provider, session in self.sessions.items():
+            if not session.messages:
+                continue
+            lines.append(f"## {provider.title()}")
+            lines.append("")
+            for msg in session.messages:
+                role = msg["role"].title()
+                content = msg["content"]
+                if role == "User" and len(content) > 500:
+                    # Truncate long user messages (file includes)
+                    content = content[:500] + "\n\n... (truncated)"
+                lines.append(f"### {role}")
+                lines.append(content)
+                lines.append("")
+
+        # Include final consensus if available
+        final_dir = self._output_dir / "final"
+        if final_dir.exists():
+            best_file = final_dir / "best.md"
+            if best_file.exists():
+                lines.append("## Final Consensus")
+                lines.append(best_file.read_text(encoding="utf-8"))
+                lines.append("")
+
+            meta_file = final_dir / "metadata.json"
+            if meta_file.exists():
+                lines.append("### Tournament Metadata")
+                lines.append(f"```json\n{meta_file.read_text(encoding='utf-8')}\n```")
+                lines.append("")
+
+        export_path = self._output_dir / "session_report.md"
+        export_path.write_text("\n".join(lines), encoding="utf-8")
+        print(_color("system", f"  Session exported to: {export_path}"))
+
+        # Open in default editor
+        try:
+            _open_path(export_path)
+        except Exception:
+            pass
+
+    def _save_session_state(self, path: Path | None = None):
+        """Save session state to JSON for later resumption.
+
+        Saves: messages per provider, active models, auto-followup setting,
+        output directory, artifacts.
+        """
+        if not path:
+            path = Path(self.cwd) / ".attest_chat_session.json"
+
+        state = {
+            "cwd": self.cwd,
+            "providers": list(self.sessions.keys()),
+            "active_models": self._active_models,
+            "auto_followup": self.auto_followup,
+            "output_dir": str(self._output_dir) if self._output_dir else None,
+            "sessions": {},
+        }
+        for name, session in self.sessions.items():
+            state["sessions"][name] = {
+                "messages": session.messages,
+                "last_response": session.last_response[:5000] if session.last_response else "",
+                "call_count": session.call_count,
+                "artifacts": session.artifacts,
+                "rate_limit_hits": session._rate_limit_hits,
+            }
+
+        path.write_text(json.dumps(state, indent=2, default=str), encoding="utf-8")
+        print(_color("system", f"  Session saved to: {path}"))
+
+    def _load_session_state(self, path: Path | None = None) -> bool:
+        """Load session state from JSON.
+
+        Restores messages, models, settings. Does NOT restore browser tabs
+        (those need to be re-opened). Returns True if loaded successfully.
+        """
+        if not path:
+            path = Path(self.cwd) / ".attest_chat_session.json"
+
+        if not path.exists():
+            print(_color("system", f"  No saved session found at: {path}"))
+            return False
+
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(_color("system", f"  Failed to load session: {exc}"))
+            return False
+
+        # Restore settings
+        self._active_models = state.get("active_models", {})
+        self.auto_followup = state.get("auto_followup", False)
+
+        saved_output = state.get("output_dir")
+        if saved_output and Path(saved_output).exists():
+            self._output_dir = Path(saved_output)
+
+        # Restore per-provider state
+        for name, sess_state in state.get("sessions", {}).items():
+            if name in self.sessions:
+                session = self.sessions[name]
+                session.messages = sess_state.get("messages", [])
+                session.last_response = sess_state.get("last_response", "")
+                session.call_count = sess_state.get("call_count", 0)
+                session.artifacts = sess_state.get("artifacts", [])
+                session._rate_limit_hits = sess_state.get("rate_limit_hits", 0)
+
+        n_restored = sum(
+            1 for n in state.get("sessions", {}) if n in self.sessions
+        )
+        total_msgs = sum(
+            len(s.get("messages", [])) for s in state.get("sessions", {}).values()
+        )
+        print(_color("system", f"  Restored {n_restored} provider(s), {total_msgs} messages"))
+        return True
+
     def _handle_command(self, cmd: str) -> str | None:
         """Parse a / command. Returns command name or None for regular message."""
         parts = cmd.split(maxsplit=1)
@@ -1519,6 +2624,9 @@ class BrowserChat:
             print("No providers available. Check your browser logins.")
             return
 
+        # Setup readline tab-completion for @ and /
+        self._completer = _setup_readline(self.cwd)
+
         # Init output directory
         self._init_output_dir()
 
@@ -1529,9 +2637,19 @@ class BrowserChat:
             self._judge_client, self._judge_model, self._judge_name = _init_judge_client()
             judge_info = f" | Judge: {self._judge_name} API (free)" if self._judge_name else " | Judge: browser fallback"
         print(f"Working directory: {self.cwd}{judge_info}")
-        print(f"Use @filename to include files (images/PDFs are uploaded directly)")
-        print(f"Commands: /tournament /share /consensus /upload /output /downloads /quit /help")
+        print(f"Use @<tab> to pick files/providers | /help for commands")
+        models_str = ""
+        if self._active_models:
+            models_str = " | Models: " + ", ".join(f"{p}={m}" for p, m in self._active_models.items())
+        auto_str = " | auto-followup ON" if self.auto_followup else ""
+        print(f"Commands: /tournament /new /model /web /export /help{models_str}{auto_str}")
         print()
+
+        # Offer to resume previous session
+        session_file = Path(self.cwd) / ".attest_chat_session.json"
+        if session_file.exists():
+            print(_color("system", "  Previous session found. Type /load to resume, or start fresh."))
+            print()
 
         try:
             while True:
@@ -1544,6 +2662,25 @@ class BrowserChat:
 
                 if not user_input:
                     continue
+
+                # Multiline input: start with """ or ``` to enter multi-line mode
+                if user_input in ('"""', "```"):
+                    delimiter = user_input
+                    print(_color("system", f"  Multi-line mode (type {delimiter} on a new line to send)"))
+                    lines = []
+                    while True:
+                        try:
+                            line = await asyncio.get_event_loop().run_in_executor(
+                                None, lambda: input(f"{_color('system', '...')} ")
+                            )
+                        except EOFError:
+                            break
+                        if line.strip() == delimiter:
+                            break
+                        lines.append(line)
+                    user_input = "\n".join(lines).strip()
+                    if not user_input:
+                        continue
 
                 if user_input.startswith("/"):
                     cmd = self._handle_command(user_input)
@@ -1566,9 +2703,7 @@ class BrowserChat:
                     elif cmd == "/output":
                         if self._output_dir:
                             print(_color("system", f"Output directory: {self._output_dir}"))
-                            # Open in Finder (macOS)
-                            import subprocess
-                            subprocess.Popen(["open", str(self._output_dir)])
+                            _open_path(self._output_dir)
                         else:
                             print(_color("system", "No output directory yet"))
                     elif cmd == "/downloads":
@@ -1576,8 +2711,7 @@ class BrowserChat:
                             dl_dir = self._output_dir / "downloads"
                             if dl_dir.exists() and any(dl_dir.iterdir()):
                                 print(_color("system", f"Downloads directory: {dl_dir}"))
-                                import subprocess
-                                subprocess.Popen(["open", str(dl_dir)])
+                                _open_path(dl_dir)
                             else:
                                 print(_color("system", "No downloads yet"))
                         else:
@@ -1598,19 +2732,122 @@ class BrowserChat:
                             if paths:
                                 for provider, session in self.sessions.items():
                                     await self._upload_files(session, paths)
+                    elif cmd == "/model":
+                        # /model chatgpt=o3 claude=opus gemini=pro
+                        # /model (no args) — show current models and available options
+                        parts = user_input.split()[1:]
+                        if not parts:
+                            # Show current state and options
+                            for p in self.sessions:
+                                current = self._active_models.get(p, "default")
+                                available = PROVIDER_MODELS.get(p, {})
+                                opts = ", ".join(available.keys()) if available else "none"
+                                print(f"  {_color(p, p)}: {current} (available: {opts})")
+                        else:
+                            for spec in parts:
+                                if "=" in spec:
+                                    prov, model = spec.split("=", 1)
+                                    prov = prov.strip().lower()
+                                    model = model.strip().lower()
+                                    if prov in self.sessions:
+                                        await self._select_model(self.sessions[prov], model)
+                                    else:
+                                        print(_color("system", f"  Provider '{prov}' not active"))
+                                else:
+                                    print(_color("system", f"  Format: /model provider=model (e.g., /model claude=opus)"))
+                    elif cmd == "/new":
+                        await self._new_chat()
+                    elif cmd == "/screenshot":
+                        await self._screenshot_all()
+                    elif cmd == "/export":
+                        self._export_session()
+                    elif cmd == "/web":
+                        # Send with web search instruction
+                        parts = user_input.split(maxsplit=1)
+                        if len(parts) < 2:
+                            print(_color("system", "Usage: /web <question>"))
+                        else:
+                            query = parts[1]
+                            web_msg = (
+                                "IMPORTANT: Please search the web / use your internet access "
+                                "to find the most current information before answering.\n\n"
+                                f"{query}"
+                            )
+                            await self._send_to_all(web_msg)
+                    elif cmd == "/auto":
+                        # Toggle auto-followup mode
+                        self.auto_followup = not self.auto_followup
+                        state = "ON" if self.auto_followup else "OFF"
+                        print(_color("system", f"  Auto-followup: {state}"))
+                        if self.auto_followup:
+                            print(_color("system", "  Provider questions will be routed to other providers first"))
+                    elif cmd == "/save":
+                        parts = user_input.split(maxsplit=1)
+                        path = Path(parts[1]) if len(parts) > 1 else None
+                        self._save_session_state(path)
+                    elif cmd == "/load":
+                        parts = user_input.split(maxsplit=1)
+                        path = Path(parts[1]) if len(parts) > 1 else None
+                        if self._load_session_state(path):
+                            print(_color("system", "  Session restored (message history loaded, send a message to continue)"))
+                        else:
+                            print(_color("system", "  No saved session found"))
+                    elif cmd == "/artifacts":
+                        total = 0
+                        for name, session in self.sessions.items():
+                            if session.artifacts:
+                                print(_color(name, f"  {name}: {len(session.artifacts)} artifact(s)"))
+                                for i, art in enumerate(session.artifacts):
+                                    lang = art.get("language", "text")
+                                    preview = art.get("content", "")[:80].replace("\n", " ")
+                                    print(f"    [{i+1}] {lang}: {preview}...")
+                                total += len(session.artifacts)
+                            else:
+                                print(_color(name, f"  {name}: no artifacts"))
+                        if total:
+                            print(_color("system", f"  Total: {total} artifact(s). Saved in {self._output_dir}/artifacts/"))
                     elif cmd == "/help":
                         print("Commands:")
                         print("  /share       — One round: share responses cross-provider for revision")
                         print("  /tournament  — Loop: providers improve + score each other until they agree")
                         print("  /tournament N — Same, with max N rounds (default: 5)")
                         print("  /consensus   — Quick judge via free API (Gemini/Groq)")
+                        print("  /new         — Start fresh conversations on all providers")
+                        print("  /model       — Show/set model tiers (e.g., /model claude=opus chatgpt=o3)")
+                        print("  /auto        — Toggle auto-followup (route questions to other providers)")
+                        print("  /web <query> — Send with web search instruction")
+                        print("  /screenshot  — Screenshot all provider tabs")
+                        print("  /export      — Export session as markdown report")
                         print("  /upload FILE — Upload file(s) to all providers")
                         print("  /output      — Open output folder in Finder")
                         print("  /downloads   — Open downloads folder in Finder")
+                        print("  /save [path] — Save session state (default: .attest_chat_session.json)")
+                        print("  /load [path] — Load a saved session")
+                        print("  /artifacts   — List extracted code artifacts")
                         print("  /providers   — List active providers")
                         print("  /quit        — Exit")
+                        print()
+                        print("Selective sending:")
+                        print("  @claude <msg>  — Send to Claude only")
+                        print("  @chatgpt <msg> — Send to ChatGPT only")
+                        print("  @gemini <msg>  — Send to Gemini only")
+                        print()
+                        print("Multi-line input:")
+                        print('  Type \"\"\" or ``` to start, same delimiter on new line to send')
                     else:
                         print(_color("system", f"Unknown command: {cmd}. Type /help"))
+                    continue
+
+                # Check for @provider selective sending (only at start of message)
+                selective_match = re.match(
+                    r"^@(chatgpt|claude|gemini)\s+(.+)", user_input, re.DOTALL | re.IGNORECASE,
+                )
+                if selective_match:
+                    target_provider = selective_match.group(1).lower()
+                    target_msg = selective_match.group(2)
+                    resolved = _resolve_file_refs(target_msg, self.cwd)
+                    resolved = _auto_include_files(resolved, self.cwd)
+                    await self._send_to_one(target_provider, resolved)
                     continue
 
                 # Collect files that need direct upload (images, PDFs, etc.)
@@ -1664,10 +2901,20 @@ class BrowserChat:
         except KeyboardInterrupt:
             print(f"\n{_color('system', 'Shutting down...')}")
         finally:
-            if self._output_dir and any(self._output_dir.iterdir()):
-                print(_color("system", f"Outputs saved to: {self._output_dir}/"))
-                import subprocess
-                subprocess.Popen(["open", str(self._output_dir)])
+            # Auto-save session on exit
+            has_messages = any(s.messages for s in self.sessions.values())
+            if has_messages:
+                try:
+                    self._save_session_state()
+                    print(_color("system", "Session auto-saved. Resume with: attest chat then /load"))
+                except Exception as exc:
+                    print(_color("system", f"  Warning: failed to auto-save session: {exc}"))
+            try:
+                if self._output_dir and self._output_dir.exists() and any(self._output_dir.iterdir()):
+                    print(_color("system", f"Outputs saved to: {self._output_dir}/"))
+                    _open_path(self._output_dir)
+            except Exception:
+                pass
             await self._stop()
 
     async def _stop(self):
@@ -1702,9 +2949,14 @@ def run_browser_chat(
     providers: list[str] | None = None,
     cwd: str | None = None,
     headless: bool = False,
+    models: dict[str, str] | None = None,
+    auto_followup: bool = False,
 ):
     """Entry point for browser-based chat. Called from __main__.py."""
-    chat = BrowserChat(db=db, providers=providers, cwd=cwd, headless=headless)
+    chat = BrowserChat(
+        db=db, providers=providers, cwd=cwd, headless=headless,
+        models=models, auto_followup=auto_followup,
+    )
     try:
         asyncio.run(chat.run())
     except KeyboardInterrupt:

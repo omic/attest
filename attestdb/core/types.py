@@ -404,6 +404,51 @@ class HypotheticalReport:
     related_entities: list[str] = field(default_factory=list)
 
 
+@dataclass
+class IndirectEvidence:
+    """Multi-hop evidence for/against a hypothesis found in the sandbox."""
+    path: list[str]           # entity IDs along the path
+    predicates: list[str]     # predicates at each hop
+    predicted_predicate: str  # composed result from PREDICATE_COMPOSITION
+    confidence: float         # product of hop confidences
+    direction: str = "neutral"  # "supporting" | "contradicting" | "neutral"
+
+
+@dataclass
+class SandboxVerdict:
+    """Rich analysis result from HypotheticalContext.analyze()."""
+    hypothesis: str
+    verdict: str = "insufficient_data"  # "supported" | "contradicted" | "plausible" | "insufficient_data"
+    # Direct evidence
+    direct_contradictions: list[tuple[str, str]] = field(default_factory=list)
+    direct_corroborations: int = 0
+    # Multi-hop evidence
+    indirect_evidence: list[IndirectEvidence] = field(default_factory=list)
+    predicted_predicate: str = ""
+    # Gap analysis
+    gaps_closed: int = 0
+    gap_descriptions: list[str] = field(default_factory=list)
+    # Suggestions
+    follow_up_hypotheses: list[str] = field(default_factory=list)
+    # Summary
+    confidence_score: float = 0.0
+    explanation: str = ""
+
+
+@dataclass
+class Prediction:
+    """A novel predicted relationship from causal composition."""
+    target: str                  # target entity ID
+    predicted_predicate: str     # composed causal predicate
+    supporting_paths: int        # number of supporting causal paths
+    opposing_paths: int          # number of opposing causal paths
+    consensus: float             # supporting / total ratio
+    intermediaries: int          # unique intermediary entities
+    is_gap: bool                 # True if no direct connection exists at all
+    existing_predicates: list[str] = field(default_factory=list)  # existing non-causal preds
+    evidence: list[IndirectEvidence] = field(default_factory=list)  # top paths
+
+
 # --- Autonomous research types ---
 
 
@@ -983,6 +1028,17 @@ class AgentConsensusResult:
     total_tokens: int = 0
     total_cost: float = 0.0
     converged: bool = False
+
+
+@dataclass
+class TrustRule:
+    """One rule in a trust policy. First matching rule wins."""
+    action: str = "include"  # "include" or "exclude"
+    source_types: list[str] | None = None
+    source_ids: list[str] | None = None
+    predicates: list[str] | None = None
+    min_confidence: float | None = None
+    min_corroboration: int | None = None
 
 
 @dataclass
