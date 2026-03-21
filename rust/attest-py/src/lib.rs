@@ -845,6 +845,15 @@ impl PyRustStore {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
+    /// Physically delete all claims from a source_id from all indexes.
+    /// Unlike retract_source() which tombstones (preserving append-only),
+    /// this removes data permanently. Returns the number of claims deleted.
+    /// Call compact() afterwards to reclaim disk space.
+    fn purge_source(&mut self, source_id: &str) -> PyResult<usize> {
+        self.inner.purge_source(source_id)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
     /// Update the status of a claim by string name.
     /// Accepted values: "active", "archived", "tombstoned"/"retracted", "provenance_degraded"/"degraded".
     fn update_claim_status(&mut self, claim_id: &str, status: &str) -> PyResult<bool> {

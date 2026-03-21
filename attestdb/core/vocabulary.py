@@ -175,6 +175,67 @@ def predicates_agree(pred_a: str, pred_b: str) -> bool:
     return pred_a == pred_b
 
 
+def directional_confidence(
+    supporting: int,
+    opposing: int,
+    min_evidence: int = 3,
+    source_weights: list[float] | None = None,
+) -> tuple[float, str]:
+    """Score how much to trust a directional prediction.
+
+    Based on evidence count, agreement ratio, and source reliability.
+    NLP-extracted predications have ~30% directional error rate per claim —
+    with 1-2 claims, errors dominate. With 10+, signal overwhelms noise.
+
+    Args:
+        supporting: Number of claims supporting this direction.
+        opposing: Number of claims supporting the opposite direction.
+        min_evidence: Minimum total claims before trusting any direction.
+        source_weights: Optional reliability weights for each supporting
+            claim (from confidence.source_reliability). If provided,
+            weighted_supporting replaces raw count for agreement scoring.
+            One curated claim (weight 1.0) counts more than one NLP claim
+            (weight 0.5).
+
+    Returns (confidence, verdict):
+    - confidence: 0.0-1.0 score
+    - verdict: "strong", "moderate", "weak", or "insufficient"
+
+    Usage:
+        conf, verdict = directional_confidence(supporting=124, opposing=10)
+        # → (0.92, "strong") — 92% agreement, 134 total claims
+
+        # With source weights: 5 curated claims > 10 NLP claims
+        conf, verdict = directional_confidence(5, 1,
+            source_weights=[1.0, 1.0, 0.95, 0.9, 0.85])
+    """
+    total = supporting + opposing
+    if total < min_evidence:
+        return (0.0, "insufficient")
+
+    if source_weights:
+        weighted_support = sum(source_weights)
+        weighted_total = weighted_support + opposing * 0.5  # opposing claims get default weight
+        agreement = weighted_support / weighted_total if weighted_total > 0 else 0
+    else:
+        agreement = supporting / total if total > 0 else 0
+    # Evidence strength: log scale, saturates around 50 claims
+    import math
+    evidence_factor = min(1.0, math.log(total + 1) / math.log(50))
+    confidence = agreement * evidence_factor
+
+    if confidence >= 0.7 and total >= 10:
+        verdict = "strong"
+    elif confidence >= 0.5 and total >= min_evidence:
+        verdict = "moderate"
+    elif agreement > 0.5:
+        verdict = "weak"
+    else:
+        verdict = "insufficient"
+
+    return (round(confidence, 3), verdict)
+
+
 def compose_predicates(pred_ac: str, pred_cb: str) -> str:
     """Compose two predicates along A→C→B into predicted A→B predicate.
 
@@ -549,6 +610,140 @@ def normalize_entity_name(name: str, extra_aliases: dict[str, str] | None = None
         return canonical
 
     return normalized
+
+
+# ---------------------------------------------------------------------------
+# Regex-based triple extraction from prose
+# ---------------------------------------------------------------------------
+
+import re
+
+# Verbs recognized by the regex extractor (base + optional 's' suffix).
+# Ordered by specificity — more specific verbs first.
+_VERB_STEMS: list[str] = [
+    "downregulate", "upregulate", "dephosphorylate", "phosphorylate",
+    "demethylate", "methylate", "destabilize", "stabilize",
+    "inhibit", "activate", "suppress", "promote",
+    "increase", "decrease", "enhance", "reduce",
+    "cause", "prevent", "enable", "block",
+    "treat", "target", "bind", "induce",
+    "modulate", "mediate", "encode", "regulate",
+]
+
+# Build alternation: each stem matches with optional trailing 's' or 'es'
+_VERB_ALT = "|".join(
+    rf"{stem}(?:e?s)?" for stem in _VERB_STEMS
+)
+
+# Trailing clause patterns to strip from the object
+_TRAILING_CLAUSE_RE = re.compile(
+    r"\s+(?:in vitro|in vivo|via\b|through\b|by\b|leading to\b|resulting in\b"
+    r"|which\b|that\b|, which\b|, leading\b|, resulting\b|, via\b|, through\b"
+    r"|, by\b).*$",
+    re.IGNORECASE,
+)
+
+# Pattern 1: "X <verb> Y"
+_PAT_VERB = re.compile(
+    rf"^([\w][\w\s/()-]{{1,60}}?)\s+({_VERB_ALT})\s+(.{{2,80}})$",
+    re.IGNORECASE,
+)
+
+# Pattern 2: "X is associated/linked/correlated with Y"
+_PAT_ASSOC = re.compile(
+    r"^([\w][\w\s/()-]{1,60}?)\s+(?:is\s+)?"
+    r"(?:associated|linked|correlated)\s+with\s+(.{2,80})$",
+    re.IGNORECASE,
+)
+
+# Pattern 3: "X is expressed/found/detected/located in Y"
+_PAT_EXPRESSED = re.compile(
+    r"^([\w][\w\s/()-]{1,60}?)\s+(?:is\s+)?"
+    r"(?:expressed|found|detected|located)\s+in\s+(.{2,80})$",
+    re.IGNORECASE,
+)
+
+
+def _clean_entity(s: str) -> str:
+    """Strip leading articles and trailing whitespace/punctuation from an entity."""
+    s = s.strip().rstrip(".")
+    # Strip leading article
+    s = re.sub(r"^(?:the|a|an)\s+", "", s, flags=re.IGNORECASE)
+    return s.strip()
+
+
+def extract_triples_from_prose(text: str) -> list[dict]:
+    """Extract (subject, predicate, object) triples from a prose sentence.
+
+    Uses regex patterns to identify simple declarative sentences containing
+    known biological/scientific predicates. No LLM call required.
+
+    Returns a list of dicts with keys: subject, predicate, object.
+    All predicates are normalized via normalize_predicate().
+    Subjects and objects are lowercased and stripped of articles.
+
+    Returns an empty list if no patterns match.
+    """
+    text = text.strip()
+    if not text:
+        return []
+
+    # Skip questions
+    if text.endswith("?") or re.match(
+        r"^(?:does|do|is|are|was|were|can|could|would|should|how|what|why|which|who)\s",
+        text,
+        re.IGNORECASE,
+    ):
+        return []
+
+    results: list[dict] = []
+
+    # Try Pattern 1: "X <verb> Y"
+    m = _PAT_VERB.match(text)
+    if m:
+        subj = _clean_entity(m.group(1))
+        pred_raw = m.group(2).strip().lower()
+        obj_raw = m.group(3)
+        # Strip trailing clauses from object
+        obj_raw = _TRAILING_CLAUSE_RE.sub("", obj_raw)
+        obj = _clean_entity(obj_raw)
+        pred = normalize_predicate(pred_raw)
+        results.append({
+            "subject": subj.lower(),
+            "predicate": pred,
+            "object": obj.lower(),
+        })
+        return results
+
+    # Try Pattern 2: "X is associated/linked/correlated with Y"
+    m = _PAT_ASSOC.match(text)
+    if m:
+        subj = _clean_entity(m.group(1))
+        obj_raw = m.group(2)
+        obj_raw = _TRAILING_CLAUSE_RE.sub("", obj_raw)
+        obj = _clean_entity(obj_raw)
+        results.append({
+            "subject": subj.lower(),
+            "predicate": "associated_with",
+            "object": obj.lower(),
+        })
+        return results
+
+    # Try Pattern 3: "X is expressed/found/detected in Y"
+    m = _PAT_EXPRESSED.match(text)
+    if m:
+        subj = _clean_entity(m.group(1))
+        obj_raw = m.group(2)
+        obj_raw = _TRAILING_CLAUSE_RE.sub("", obj_raw)
+        obj = _clean_entity(obj_raw)
+        results.append({
+            "subject": subj.lower(),
+            "predicate": "expressed_in",
+            "object": obj.lower(),
+        })
+        return results
+
+    return results
 
 
 QUANTITATIVE_SCHEMAS: set[str] = {

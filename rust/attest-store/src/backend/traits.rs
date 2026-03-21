@@ -25,6 +25,12 @@ pub trait StorageBackend {
     /// Write a full checkpoint without releasing the lock.
     fn checkpoint(&mut self) -> Result<(), AttestError>;
 
+    /// Physically delete all claims from a source_id.
+    /// Default: returns `Ok(0)` (no-op).
+    fn purge_source(&mut self, _source_id: &str) -> Result<usize, AttestError> {
+        Ok(0)
+    }
+
     /// Compact the database file, reclaiming free pages.
     /// Returns `true` if compaction freed any space.
     /// Default: returns `Ok(false)` (no-op).

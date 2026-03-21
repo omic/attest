@@ -38,6 +38,41 @@ SOURCE_TYPE_WEIGHTS: dict[str, float] = {
 
 DEFAULT_WEIGHT = 0.50
 
+# Source reliability — rates individual data sources by curation quality.
+# Applied as a weight multiplier when aggregating evidence across sources.
+# Higher = more reliable directional claims. Used by directional_confidence.
+SOURCE_RELIABILITY: dict[str, float] = {
+    # Expert-curated databases (directional claims are reviewed)
+    "reactome": 1.0,        # manually curated pathways
+    "drugbank": 0.95,       # expert-reviewed drug-target
+    "ctd": 0.85,            # curated chemical-gene interactions
+    "pharmgkb": 0.90,       # pharmacogenomic expert curation
+    "dgidb": 0.85,          # drug-gene interaction aggregator
+    "clinvar": 0.90,        # clinical variant significance
+    # Computationally derived (high-throughput, less curation)
+    "string_ppi": 0.70,     # text-mining + experimental combined score
+    "biogrid": 0.75,        # curated interactions but no directionality
+    "intact": 0.75,         # molecular interaction data
+    "hetionet": 0.70,       # integrated hetnet (mixed quality)
+    "primekg": 0.70,        # composite KG
+    "pharmebinet": 0.65,    # composite KG
+    # NLP-extracted (directional accuracy ~70%)
+    "semmeddb": 0.50,       # SemRep NLP extraction from PubMed
+    "kg2c": 0.55,           # RTX-KG2 (mixed NLP + curated)
+    # Low-confidence
+    "monarch_kg": 0.60,     # mixed provenance
+}
+
+
+def source_reliability(source_id: str) -> float:
+    """Get reliability weight for a source.
+
+    Extracts the database name from source_id (e.g., "semmeddb:12345" → "semmeddb")
+    and looks up its reliability score.
+    """
+    db_name = source_id.split(":")[0] if ":" in source_id else source_id
+    return SOURCE_RELIABILITY.get(db_name, DEFAULT_WEIGHT)
+
 # Tier 2 parameters
 HALF_LIFE_DAYS = 365
 CORROBORATION_CAP = 1.7
@@ -201,3 +236,61 @@ def effective_confidence(
         return tier2_confidence(claim, corroborating_claims)
     hl = decay_config.half_life_for(claim.predicate.id)
     return tier2_confidence(claim, corroborating_claims, half_life_days=hl)
+
+
+# ---------------------------------------------------------------------------
+# LLM confidence calibration
+# ---------------------------------------------------------------------------
+
+LLM_CONFIDENCE_MAP: dict[str, float] = {
+    "high": 0.85,
+    "very high": 0.90,
+    "medium": 0.60,
+    "moderate": 0.60,
+    "low": 0.35,
+    "very low": 0.20,
+    "uncertain": 0.30,
+}
+
+
+def calibrate_llm_confidence(
+    value: str | float | int,
+    source_type: str = "llm_inference",
+) -> float:
+    """Convert LLM confidence to calibrated numeric score.
+
+    Handles:
+    - Categorical: "high" → 0.85, "medium" → 0.60, "low" → 0.35
+    - Numeric strings: "0.9" → 0.72 (compressed toward center)
+    - Already numeric: 0.9 → 0.72 (compressed toward center)
+
+    LLMs are overconfident — they cluster at 0.85-0.95.  Compression
+    maps the LLM's [0.5, 1.0] range to a more useful [0.35, 0.85] range.
+
+    Args:
+        value: Raw confidence from an LLM (string label, numeric string,
+            or float/int).
+        source_type: Unused today but reserved for per-provider calibration.
+
+    Returns:
+        Calibrated confidence in [0.1, 0.95].
+    """
+    # Categorical lookup (case-insensitive, stripped)
+    if isinstance(value, str):
+        key = value.strip().lower()
+        if key in LLM_CONFIDENCE_MAP:
+            return LLM_CONFIDENCE_MAP[key]
+        # Try parsing as a number
+        try:
+            value = float(key)
+        except ValueError:
+            # Unknown label — return a neutral default
+            return 0.5
+
+    raw = float(value)
+
+    # Compress: map [0.5, 1.0] → [0.35, 0.85]
+    calibrated = 0.35 + (raw - 0.5) * (0.85 - 0.35) / (1.0 - 0.5)
+
+    # Clamp to [0.1, 0.95]
+    return max(0.1, min(0.95, calibrated))

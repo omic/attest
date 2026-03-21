@@ -324,3 +324,37 @@ def test_entity_alias_corroboration():
     assert len(claims) == 2
     assert all(c.subject.id == "tp53" for c in claims)
     db.close()
+
+
+# --- Directional confidence tests ---
+
+def test_directional_confidence_strong():
+    """High evidence count + high agreement = strong."""
+    from attestdb.core.vocabulary import directional_confidence
+    conf, verdict = directional_confidence(124, 10)
+    assert verdict == "strong"
+    assert conf > 0.7
+
+
+def test_directional_confidence_insufficient():
+    """Below min_evidence = insufficient."""
+    from attestdb.core.vocabulary import directional_confidence
+    conf, verdict = directional_confidence(2, 0)
+    assert verdict == "insufficient"
+    assert conf == 0.0
+
+
+def test_directional_confidence_moderate():
+    """Moderate evidence count."""
+    from attestdb.core.vocabulary import directional_confidence
+    conf, verdict = directional_confidence(15, 3)
+    assert verdict in ("moderate", "strong")
+    assert conf > 0.5
+
+
+def test_directional_confidence_contested():
+    """Nearly equal for/against = weak or insufficient."""
+    from attestdb.core.vocabulary import directional_confidence
+    conf, verdict = directional_confidence(5, 4)
+    assert verdict in ("weak", "insufficient")
+    assert conf < 0.6

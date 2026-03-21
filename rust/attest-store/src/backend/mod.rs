@@ -47,6 +47,13 @@ impl StorageBackend for Backend {
         }
     }
 
+    fn purge_source(&mut self, source_id: &str) -> Result<usize, AttestError> {
+        match self {
+            Backend::InMemory(_) => Ok(0),
+            Backend::Lmdb(l) => l.purge_source(source_id),
+        }
+    }
+
     fn compact(&mut self) -> Result<bool, AttestError> {
         match self {
             Backend::InMemory(_) => Ok(false),

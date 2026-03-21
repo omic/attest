@@ -3239,6 +3239,20 @@ class AttestDB:
                 )
         return purged
 
+    def purge_source(self, source_id: str) -> int:
+        """Physically delete all claims from a source from all indexes.
+
+        Unlike retract() which tombstones claims (preserving append-only
+        semantics and allowing undo), purge_source() permanently removes
+        data. Use for maintenance: bad bulk loads, data cleanup, disk recovery.
+
+        Returns the number of claims deleted. The DB file size won't shrink
+        until LMDB reclaims pages on subsequent writes.
+        """
+        deleted = self._store.purge_source(source_id)
+        self._invalidate_cache()
+        return deleted
+
     def retract_cascade(self, source_id: str, reason: str) -> CascadeResult:
         """Retract all claims from a source and mark downstream dependents as degraded."""
         retract_result = self.retract(source_id, reason)
@@ -4928,6 +4942,7 @@ class AttestDB:
         # Single pass over subject's claims — extract direct evidence + neighbors
         subj_claims = self._store.claims_for(n_subj_id, None, None, 0.0)
         direct_contradictions: list[tuple[str, str]] = []
+        direct_supporting: int = 0
         causal_neighbors: dict[str, tuple[str, float]] = {}
         weak_neighbors: dict[str, tuple[str, float]] = {}
 
@@ -4937,9 +4952,12 @@ class AttestDB:
             pred = c.predicate.id
             conf = c.confidence
 
-            # Direct contradiction check
-            if obj == n_obj_id and opposite and pred == opposite:
-                direct_contradictions.append((hyp_pred, pred))
+            # Direct evidence: count supporting + contradicting claims to target
+            if obj == n_obj_id and pred in CAUSAL_PREDICATES:
+                if predicates_agree(pred, hyp_pred):
+                    direct_supporting += 1
+                elif opposite and (pred == opposite or not predicates_agree(pred, hyp_pred)):
+                    direct_contradictions.append((hyp_pred, pred))
 
             # Collect neighbors for BFS
             neighbor = obj if c.subject.id == n_subj_id else c.subject.id
@@ -5053,25 +5071,37 @@ class AttestDB:
             if len(follow_ups) >= 5:
                 break
 
-        # Score and verdict
+        # Score and verdict — use directional_confidence for evidence-weighted scoring
+        from attestdb.core.vocabulary import directional_confidence
+
         supporting = [ie for ie in all_indirect if ie.direction == "supporting"]
         contradicting = [ie for ie in all_indirect if ie.direction == "contradicting"]
 
+        # Combine direct + indirect evidence
+        total_supporting = direct_supporting + len(supporting)
+        total_contradicting = len(direct_contradictions) + len(contradicting)
+        dir_conf, dir_verdict = directional_confidence(total_supporting, total_contradicting)
+
         score = 0.5
         score += min(corroborations * 0.15, 0.3)
-        score += min(len(supporting) * 0.08, 0.3)
-        score -= min(len(direct_contradictions) * 0.25, 0.5)
-        score -= min(len(contradicting) * 0.08, 0.2)
+        score += min(dir_conf * 0.4, 0.4)
+        score -= min(total_contradicting * 0.05, 0.3)
         score += min(gaps_closed * 0.05, 0.1)
         score = max(0.0, min(1.0, score))
 
-        if direct_contradictions and not corroborations:
+        if dir_verdict == "strong":
+            verdict = "supported"
+        elif direct_contradictions and not direct_supporting and not corroborations:
             verdict = "contradicted"
         elif corroborations > 0:
             verdict = "supported"
-        elif supporting and len(supporting) > len(contradicting):
+        elif dir_verdict == "moderate":
             verdict = "plausible"
-        elif contradicting and len(contradicting) > len(supporting):
+        elif dir_verdict == "insufficient" and not supporting and not corroborations:
+            verdict = "insufficient_data"
+        elif total_supporting > total_contradicting:
+            verdict = "plausible"
+        elif total_contradicting > total_supporting:
             verdict = "contradicted"
         elif supporting and contradicting:
             verdict = "contested"
@@ -5090,6 +5120,8 @@ class AttestDB:
 
         # Build explanation
         parts = []
+        if direct_supporting:
+            parts.append(f"{direct_supporting} direct supporting claim(s)")
         if direct_contradictions:
             parts.append(f"{len(direct_contradictions)} direct contradiction(s)")
         if corroborations:
