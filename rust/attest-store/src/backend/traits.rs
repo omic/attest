@@ -25,6 +25,11 @@ pub trait StorageBackend {
     /// Write a full checkpoint without releasing the lock.
     fn checkpoint(&mut self) -> Result<(), AttestError>;
 
+    /// Reset the union-find alias table.
+    fn clear_aliases(&mut self) -> Result<(), AttestError> {
+        Ok(())
+    }
+
     /// Physically delete all claims from a source_id.
     /// Default: returns `Ok(0)` (no-op).
     fn purge_source(&mut self, _source_id: &str) -> Result<usize, AttestError> {

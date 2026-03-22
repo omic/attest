@@ -853,6 +853,13 @@ impl PyRustStore {
         self.inner.outgoing_causal_edges(entity_id, &predset)
     }
 
+    /// Reset the union-find alias table and rebuild from remaining same_as claims.
+    /// Call after purge_source() when same_as claims were purged.
+    fn clear_aliases(&mut self) -> PyResult<()> {
+        self.inner.clear_aliases()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
     /// Physically delete all claims from a source_id from all indexes.
     /// Unlike retract_source() which tombstones (preserving append-only),
     /// this removes data permanently. Returns the number of claims deleted.

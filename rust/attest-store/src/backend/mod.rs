@@ -47,6 +47,13 @@ impl StorageBackend for Backend {
         }
     }
 
+    fn clear_aliases(&mut self) -> Result<(), AttestError> {
+        match self {
+            Backend::InMemory(_) => Ok(()),
+            Backend::Lmdb(l) => l.clear_aliases(),
+        }
+    }
+
     fn purge_source(&mut self, source_id: &str) -> Result<usize, AttestError> {
         match self {
             Backend::InMemory(_) => Ok(0),

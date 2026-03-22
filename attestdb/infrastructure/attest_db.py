@@ -5151,12 +5151,81 @@ class AttestDB:
             explanation=explanation,
         )
 
+    def build_entity_aliases(self, entity_type: str = "gene", batch_size: int = 50000) -> dict[str, str]:
+        """Build an alias map by matching display names across entity ID formats.
+
+        For each entity of the given type, groups entities by display name and
+        maps non-NCBI IDs (gene_tp53, gene_pharmgkb:pa36679) to NCBI Gene IDs
+        (gene_7157). Also maps protein_NCBI to gene_NCBI.
+
+        Returns a dict mapping non-canonical IDs to canonical NCBI IDs.
+        Pass the result to predict(entity_aliases=...) for cross-database
+        entity resolution without the same_as performance penalty.
+        """
+        aliases: dict[str, str] = {}
+        from collections import defaultdict
+
+        # Paginate through all entities of this type
+        ncbi_by_name: dict[str, tuple[str, int]] = {}
+        non_ncbi: list[tuple[str, str, int]] = []
+        offset = 0
+
+        while True:
+            entities = self._store.list_entities(entity_type, 0, offset, batch_size)
+            if not entities:
+                break
+            for e in entities:
+                eid = e["id"]
+                name = e.get("name", "?")
+                cc = e.get("claim_count", 0)
+                if not eid.startswith(f"{entity_type}_") or name == "?" or len(name) < 2:
+                    continue
+                clean_name = name.split("|")[0].strip().lower()
+                rest = eid[len(entity_type) + 1:]
+                if rest.isdigit():
+                    if clean_name not in ncbi_by_name or cc > ncbi_by_name[clean_name][1]:
+                        ncbi_by_name[clean_name] = (eid, cc)
+                else:
+                    non_ncbi.append((eid, clean_name, cc))
+            offset += batch_size
+            if len(entities) < batch_size:
+                break
+
+        for eid, name, cc in non_ncbi:
+            if name in ncbi_by_name:
+                canonical = ncbi_by_name[name][0]
+                if eid != canonical:
+                    aliases[eid] = canonical
+
+        # Also map protein_NCBI → gene_NCBI
+        if entity_type == "gene":
+            offset = 0
+            while True:
+                entities = self._store.list_entities("protein", 0, offset, batch_size)
+                if not entities:
+                    break
+                for e in entities:
+                    eid = e["id"]
+                    if eid.startswith("protein_"):
+                        rest = eid[8:]
+                        if rest.isdigit():
+                            gene_id = f"gene_{rest}"
+                            if self._store.get_entity(gene_id):
+                                aliases[eid] = gene_id
+                offset += batch_size
+                if len(entities) < batch_size:
+                    break
+
+        return aliases
+
     def predict(
         self,
         entity_id: str,
         max_intermediaries: int = 100,
         min_paths: int = 3,
         min_consensus: float = 0.65,
+        directional_only: bool = False,
+        entity_aliases: dict[str, str] | None = None,
     ) -> list["Prediction"]:
         """Discover novel regulatory predictions via causal composition.
 
@@ -5187,6 +5256,15 @@ class AttestDB:
 
         n_eid = normalize_entity_id(entity_id)
 
+        # Entity alias resolution: map non-canonical IDs to canonical
+        # (e.g., gene_tp53 → gene_7157). Applied at Python level, not
+        # store level, to avoid the same_as union-find performance issue.
+        if entity_aliases:
+            _alias_set = set(entity_aliases.keys())
+            _resolve = lambda eid: entity_aliases[eid] if eid in _alias_set else eid
+        else:
+            _resolve = lambda eid: eid
+
         # Try fast path: Rust-native outgoing_causal_edges (no full claim deserialization)
         _has_fast_path = hasattr(self._store, "outgoing_causal_edges")
 
@@ -5197,35 +5275,63 @@ class AttestDB:
         outgoing_causal: dict[str, tuple[str, float]] = {}
         incoming_causal: dict[str, tuple[str, float]] = {}
 
+        # When directional_only=True, exclude "regulates" — it washes out
+        # directional signal from activates/inhibits/upregulates/downregulates
+        _causal_set = CAUSAL_PREDICATES - {"regulates"} if directional_only else CAUSAL_PREDICATES
+
         if _has_fast_path:
             # Fast path: use Rust-native lightweight edge query for causal edges
-            causal_pred_list = list(CAUSAL_PREDICATES)
+            causal_pred_list = list(_causal_set)
             edges = self._store.outgoing_causal_edges(n_eid, causal_pred_list)
-            for target, pred, conf in edges:
+            for raw_target, pred, conf in edges:
+                target = _resolve(raw_target)
                 if target == n_eid:
                     continue
                 direct_neighbors.setdefault(target, set()).add(pred)
                 neighbor_causal_preds.setdefault(target, set()).add(pred)
-                if target not in outgoing_causal or conf > outgoing_causal[target][1]:
+                # Prefer directional predicates over "regulates"
+                if target not in outgoing_causal:
                     outgoing_causal[target] = (pred, conf)
+                else:
+                    existing_pred = outgoing_causal[target][0]
+                    # Directional beats non-directional, even at lower confidence
+                    if existing_pred == "regulates" and pred != "regulates":
+                        outgoing_causal[target] = (pred, conf)
+                    elif pred != "regulates" and conf > outgoing_causal[target][1]:
+                        outgoing_causal[target] = (pred, conf)
+                    elif existing_pred != "regulates" and pred == "regulates":
+                        pass  # keep existing directional
+                    elif conf > outgoing_causal[target][1]:
+                        outgoing_causal[target] = (pred, conf)
         else:
             # Slow path: iterate all claims
             claims = self._store.claims_for(n_eid, None, None, 0.0)
             for d in claims:
                 c = claim_from_dict(d)
-                if c.predicate.id not in CAUSAL_PREDICATES:
-                    neighbor = c.object.id if c.subject.id == n_eid else c.subject.id
+                if c.predicate.id not in _causal_set:
+                    raw_n = c.object.id if c.subject.id == n_eid else c.subject.id
+                    neighbor = _resolve(raw_n)
                     if neighbor != n_eid:
                         direct_neighbors.setdefault(neighbor, set()).add(c.predicate.id)
                     continue
                 if c.subject.id == n_eid:
-                    mid = c.object.id
+                    mid = _resolve(c.object.id)
                     if mid == n_eid:
                         continue
                     direct_neighbors.setdefault(mid, set()).add(c.predicate.id)
                     neighbor_causal_preds.setdefault(mid, set()).add(c.predicate.id)
-                    if mid not in outgoing_causal or c.confidence > outgoing_causal[mid][1]:
+                    if mid not in outgoing_causal:
                         outgoing_causal[mid] = (c.predicate.id, c.confidence)
+                    else:
+                        ep = outgoing_causal[mid][0]
+                        if ep == "regulates" and c.predicate.id != "regulates":
+                            outgoing_causal[mid] = (c.predicate.id, c.confidence)
+                        elif c.predicate.id != "regulates" and c.confidence > outgoing_causal[mid][1]:
+                            outgoing_causal[mid] = (c.predicate.id, c.confidence)
+                        elif ep != "regulates" and c.predicate.id == "regulates":
+                            pass
+                        elif c.confidence > outgoing_causal[mid][1]:
+                            outgoing_causal[mid] = (c.predicate.id, c.confidence)
                 else:
                     mid = c.subject.id
                     if mid == n_eid:
@@ -5269,12 +5375,12 @@ class AttestDB:
             # Second hop: get outgoing causal edges from intermediary
             if _has_fast_path:
                 mid_edges = self._store.outgoing_causal_edges(
-                    mid, list(CAUSAL_PREDICATES)
+                    mid, list(_causal_set)
                 )
                 hop2_iter = [
-                    (target, pred2, conf2)
-                    for target, pred2, conf2 in mid_edges
-                    if target != n_eid and target != mid
+                    (_resolve(t), pred2, conf2)
+                    for t, pred2, conf2 in mid_edges
+                    if _resolve(t) != n_eid and t != mid
                 ]
             else:
                 mid_claims = self._store.claims_for(mid, None, None, 0.0)
@@ -5282,10 +5388,10 @@ class AttestDB:
                 for d in mid_claims:
                     mc = claim_from_dict(d)
                     if (mc.subject.id == mid
-                            and mc.object.id != n_eid
-                            and mc.object.id != mid
-                            and mc.predicate.id in CAUSAL_PREDICATES):
-                        hop2_iter.append((mc.object.id, mc.predicate.id, mc.confidence))
+                            and mc.predicate.id in _causal_set):
+                        resolved = _resolve(mc.object.id)
+                        if resolved != n_eid and mc.object.id != mid:
+                            hop2_iter.append((resolved, mc.predicate.id, mc.confidence))
 
             for target, pred2, conf2 in hop2_iter:
                 composed = compose_predicates(pred1, pred2)

@@ -136,6 +136,12 @@ impl RustStore {
         self.backend.outgoing_causal_edges(entity_id, causal_predicates)
     }
 
+    /// Reset the union-find alias table and rebuild from remaining same_as claims.
+    pub fn clear_aliases(&mut self) -> Result<(), AttestError> {
+        if self.read_only { return Err(AttestError::ReadOnly); }
+        self.backend.clear_aliases()
+    }
+
     pub fn purge_source(&mut self, source_id: &str) -> Result<usize, AttestError> {
         if self.read_only { return Err(AttestError::ReadOnly); }
         self.backend.purge_source(source_id)

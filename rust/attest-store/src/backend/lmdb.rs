@@ -942,6 +942,34 @@ impl LmdbBackend {
         self.flush_in_memory_state()
     }
 
+    /// Reset the union-find alias table. Clears all entity aliases and persists
+    /// the empty state. Use after purging same_as claims to fix the performance
+    /// regression caused by stale alias groups.
+    pub fn clear_aliases(&mut self) -> Result<(), AttestError> {
+        if self.read_only { return Err(AttestError::ReadOnly); }
+        self.aliases = UnionFind::new();
+        self.aliases_dirty = true;
+        self.flush_in_memory_state()?;
+
+        // Rebuild from any remaining same_as claims in the DB
+        let rtxn = self.env().read_txn()
+            .map_err(|e| lmdb_err("clear_aliases read", e))?;
+        let seqs = LmdbBackend::collect_seqs_for_key(
+            &rtxn, &self.dbs.predicate_idx, "same_as",
+        );
+        let claims = self.load_claims_by_seqs(&rtxn, &seqs);
+        drop(rtxn);
+
+        for claim in &claims {
+            self.aliases.union(&claim.subject.id, &claim.object.id);
+        }
+        if !claims.is_empty() {
+            self.aliases_dirty = true;
+        }
+        self.flush_in_memory_state()?;
+        Ok(())
+    }
+
     /// Physically delete all claims from a source. Unlike retract_source() which
     /// tombstones claims (preserving append-only semantics), purge_source() removes
     /// data from all indexes. Use for maintenance (bad loads, data cleanup).
@@ -969,8 +997,8 @@ impl LmdbBackend {
 
         // 2. Delete in chunks to avoid huge transactions
         const CHUNK: usize = 10_000;
-        let total = seqs.len();
         let mut deleted = 0usize;
+        let mut has_aliases = false;
 
         for chunk in seqs.chunks(CHUNK) {
             let mut wtxn = self.env().write_txn()
@@ -1001,10 +1029,20 @@ impl LmdbBackend {
                 // are filtered at read time (claims.get returns None → skip).
                 // This is acceptable for a maintenance operation.
 
+                // Track if we're purging same_as claims
+                if claim.predicate.id == "same_as" {
+                    has_aliases = true;
+                }
                 deleted += 1;
             }
 
             wtxn.commit().map_err(|e| lmdb_err("purge commit", e))?;
+        }
+
+        // If same_as claims were purged, rebuild the alias table
+        if has_aliases {
+            log::info!("purge_source: same_as claims purged, rebuilding aliases");
+            self.clear_aliases()?;
         }
 
         Ok(deleted)
