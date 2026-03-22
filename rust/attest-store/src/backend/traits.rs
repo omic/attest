@@ -31,6 +31,15 @@ pub trait StorageBackend {
         Ok(0)
     }
 
+    /// Get outgoing causal edges (lightweight — no full claim deserialization on fast path).
+    fn outgoing_causal_edges(
+        &self,
+        _entity_id: &str,
+        _causal_predicates: &std::collections::HashSet<String>,
+    ) -> Vec<(String, String, f64)> {
+        Vec::new()
+    }
+
     /// Compact the database file, reclaiming free pages.
     /// Returns `true` if compaction freed any space.
     /// Default: returns `Ok(false)` (no-op).

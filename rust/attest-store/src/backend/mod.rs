@@ -54,6 +54,17 @@ impl StorageBackend for Backend {
         }
     }
 
+    fn outgoing_causal_edges(
+        &self,
+        entity_id: &str,
+        causal_predicates: &std::collections::HashSet<String>,
+    ) -> Vec<(String, String, f64)> {
+        match self {
+            Backend::InMemory(_) => Vec::new(),
+            Backend::Lmdb(l) => l.outgoing_causal_edges(entity_id, causal_predicates),
+        }
+    }
+
     fn compact(&mut self) -> Result<bool, AttestError> {
         match self {
             Backend::InMemory(_) => Ok(false),

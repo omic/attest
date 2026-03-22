@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "attest-py"
-version = "0.1.23"
+version = "0.1.24"
 description = "Rust storage engine for AttestDB (PyO3 bindings)"
 requires-python = ">=3.11"
 license = {text = "BSL-1.1"}

@@ -1162,8 +1162,17 @@ impl LmdbBackend {
 
         if let Some(mut entity) = existing {
             entity.display_name = new_display.to_string();
-            if let Ok(bytes) = bincode::serialize(&entity) {
-                let _ = self.dbs.entities.put(&mut wtxn, entity_id, &bytes);
+            match bincode::serialize(&entity) {
+                Ok(bytes) => {
+                    if let Err(e) = self.dbs.entities.put(&mut wtxn, entity_id, &bytes) {
+                        log::warn!("update_display_name put failed for {}: {}", entity_id, e);
+                        return false;
+                    }
+                }
+                Err(e) => {
+                    log::warn!("update_display_name serialize failed: {}", e);
+                    return false;
+                }
             }
 
             // Add new display name tokens to TEXT_IDX
@@ -1175,8 +1184,13 @@ impl LmdbBackend {
                 }
             }
 
-            let _ = wtxn.commit();
-            true
+            match wtxn.commit() {
+                Ok(_) => true,
+                Err(e) => {
+                    log::warn!("update_display_name commit failed for {}: {}", entity_id, e);
+                    false
+                }
+            }
         } else {
             let _ = wtxn.commit();
             false
@@ -1652,6 +1666,43 @@ impl LmdbBackend {
         }
 
         false
+    }
+
+    /// Get outgoing causal edges for an entity — lightweight, no full claim deserialization.
+    /// Returns Vec<(target_entity_id, predicate_id, confidence)> for claims where entity_id
+    /// is the SUBJECT and predicate_id is in the provided set.
+    pub fn outgoing_causal_edges(
+        &self,
+        entity_id: &str,
+        causal_predicates: &HashSet<String>,
+    ) -> Vec<(String, String, f64)> {
+        let rtxn = match self.env().read_txn() {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+
+        let seqs = LmdbBackend::collect_seqs_for_key(&rtxn, &self.dbs.entity_claims_idx, entity_id);
+        let mut results = Vec::new();
+
+        for seq in seqs {
+            let claim_bytes = match self.dbs.claims.get(&rtxn, &seq) {
+                Ok(Some(b)) => b.to_vec(),
+                _ => continue,
+            };
+            let claim = match Self::decompress_claim(&claim_bytes) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            // Only outgoing edges with causal predicates
+            if claim.subject.id != entity_id { continue; }
+            if !causal_predicates.contains(&claim.predicate.id) { continue; }
+            if !self.should_include_claim(&claim.claim_id) { continue; }
+
+            results.push((claim.object.id, claim.predicate.id, claim.confidence));
+        }
+
+        results
     }
 
     pub fn get_adjacency_list(&self) -> HashMap<String, HashSet<String>> {

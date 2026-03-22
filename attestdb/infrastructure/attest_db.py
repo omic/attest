@@ -5186,43 +5186,54 @@ class AttestDB:
         )
 
         n_eid = normalize_entity_id(entity_id)
-        claims = self._store.claims_for(n_eid, None, None, 0.0)
 
-        # Single pass: collect direct neighbors and causal neighbors
-        direct_neighbors: dict[str, set[str]] = {}  # neighbor -> set of predicates
+        # Try fast path: Rust-native outgoing_causal_edges (no full claim deserialization)
+        _has_fast_path = hasattr(self._store, "outgoing_causal_edges")
+
+        # Collect direct neighbors and causal neighbors
+        direct_neighbors: dict[str, set[str]] = {}
         causal_neighbors: dict[str, tuple[str, float]] = {}
-        neighbor_causal_preds: dict[str, set[str]] = {}  # all causal preds per neighbor
-
-        # outgoing_causal: source IS subject (true causal: source acts on intermediary)
-        # incoming_causal: source IS object (co-regulation: intermediary acts on source)
+        neighbor_causal_preds: dict[str, set[str]] = {}
         outgoing_causal: dict[str, tuple[str, float]] = {}
         incoming_causal: dict[str, tuple[str, float]] = {}
 
-        for d in claims:
-            c = claim_from_dict(d)
-            if c.predicate.id not in CAUSAL_PREDICATES:
-                neighbor = c.object.id if c.subject.id == n_eid else c.subject.id
-                if neighbor != n_eid:
-                    direct_neighbors.setdefault(neighbor, set()).add(c.predicate.id)
-                continue
-            if c.subject.id == n_eid:
-                # Outgoing: source causally affects intermediary
-                mid = c.object.id
-                if mid == n_eid:
+        if _has_fast_path:
+            # Fast path: use Rust-native lightweight edge query for causal edges
+            causal_pred_list = list(CAUSAL_PREDICATES)
+            edges = self._store.outgoing_causal_edges(n_eid, causal_pred_list)
+            for target, pred, conf in edges:
+                if target == n_eid:
                     continue
-                direct_neighbors.setdefault(mid, set()).add(c.predicate.id)
-                neighbor_causal_preds.setdefault(mid, set()).add(c.predicate.id)
-                if mid not in outgoing_causal or c.confidence > outgoing_causal[mid][1]:
-                    outgoing_causal[mid] = (c.predicate.id, c.confidence)
-            else:
-                # Incoming: intermediary causally affects source (co-regulation signal)
-                mid = c.subject.id
-                if mid == n_eid:
+                direct_neighbors.setdefault(target, set()).add(pred)
+                neighbor_causal_preds.setdefault(target, set()).add(pred)
+                if target not in outgoing_causal or conf > outgoing_causal[target][1]:
+                    outgoing_causal[target] = (pred, conf)
+        else:
+            # Slow path: iterate all claims
+            claims = self._store.claims_for(n_eid, None, None, 0.0)
+            for d in claims:
+                c = claim_from_dict(d)
+                if c.predicate.id not in CAUSAL_PREDICATES:
+                    neighbor = c.object.id if c.subject.id == n_eid else c.subject.id
+                    if neighbor != n_eid:
+                        direct_neighbors.setdefault(neighbor, set()).add(c.predicate.id)
                     continue
-                direct_neighbors.setdefault(mid, set()).add(c.predicate.id)
-                neighbor_causal_preds.setdefault(mid, set()).add(c.predicate.id)
-                if mid not in incoming_causal or c.confidence > incoming_causal[mid][1]:
-                    incoming_causal[mid] = (c.predicate.id, c.confidence)
+                if c.subject.id == n_eid:
+                    mid = c.object.id
+                    if mid == n_eid:
+                        continue
+                    direct_neighbors.setdefault(mid, set()).add(c.predicate.id)
+                    neighbor_causal_preds.setdefault(mid, set()).add(c.predicate.id)
+                    if mid not in outgoing_causal or c.confidence > outgoing_causal[mid][1]:
+                        outgoing_causal[mid] = (c.predicate.id, c.confidence)
+                else:
+                    mid = c.subject.id
+                    if mid == n_eid:
+                        continue
+                    direct_neighbors.setdefault(mid, set()).add(c.predicate.id)
+                    neighbor_causal_preds.setdefault(mid, set()).add(c.predicate.id)
+                    if mid not in incoming_causal or c.confidence > incoming_causal[mid][1]:
+                        incoming_causal[mid] = (c.predicate.id, c.confidence)
 
         # Merge: outgoing neighbors preferred, incoming as fallback
         causal_neighbors = {**incoming_causal, **outgoing_causal}
@@ -5248,19 +5259,36 @@ class AttestDB:
         ):
             if checked >= max_intermediaries:
                 break
-            mid_claims = self._store.claims_for(mid, None, None, 0.0)
+            # Skip mega-hub intermediaries (>20K claims = common compounds/genes
+            # that connect to everything — add noise, not signal)
+            mid_entity = self._store.get_entity(mid)
+            if mid_entity and mid_entity.get("claim_count", 0) > 20_000:
+                continue
             checked += 1
-            for d in mid_claims:
-                mc = claim_from_dict(d)
-                # Second hop: intermediary must be subject (outgoing to target)
-                if mc.subject.id != mid:
-                    continue
-                target = mc.object.id
-                if target == n_eid or target == mid:
-                    continue
-                if mc.predicate.id not in CAUSAL_PREDICATES:
-                    continue
-                composed = compose_predicates(pred1, mc.predicate.id)
+
+            # Second hop: get outgoing causal edges from intermediary
+            if _has_fast_path:
+                mid_edges = self._store.outgoing_causal_edges(
+                    mid, list(CAUSAL_PREDICATES)
+                )
+                hop2_iter = [
+                    (target, pred2, conf2)
+                    for target, pred2, conf2 in mid_edges
+                    if target != n_eid and target != mid
+                ]
+            else:
+                mid_claims = self._store.claims_for(mid, None, None, 0.0)
+                hop2_iter = []
+                for d in mid_claims:
+                    mc = claim_from_dict(d)
+                    if (mc.subject.id == mid
+                            and mc.object.id != n_eid
+                            and mc.object.id != mid
+                            and mc.predicate.id in CAUSAL_PREDICATES):
+                        hop2_iter.append((mc.object.id, mc.predicate.id, mc.confidence))
+
+            for target, pred2, conf2 in hop2_iter:
+                composed = compose_predicates(pred1, pred2)
                 if composed == "associated_with":
                     continue
                 # Skip if this exact predicate already exists directly
@@ -5268,14 +5296,14 @@ class AttestDB:
                     continue
                 # Co-regulation (incoming first hop) gets reduced confidence
                 is_causal = mid in outgoing_set
-                path_conf = conf1 * mc.confidence
+                path_conf = conf1 * conf2
                 if not is_causal:
                     path_conf *= 0.5  # co-regulation discount
 
                 target_preds.setdefault(target, {}).setdefault(composed, []).append(
                     IndirectEvidence(
                         path=[n_eid, mid, target],
-                        predicates=[pred1, mc.predicate.id],
+                        predicates=[pred1, pred2],
                         predicted_predicate=composed,
                         confidence=path_conf,
                         direction="supporting" if is_causal else "co-regulation",
@@ -5309,7 +5337,11 @@ class AttestDB:
                 if len(paths) <= opp_count:
                     continue
 
-                is_gap = target not in direct_neighbors
+                # Use adjacency index for gap detection (fast, no claim loading)
+                if _has_fast_path:
+                    is_gap = not self._store.path_exists(n_eid, target, 1)
+                else:
+                    is_gap = target not in direct_neighbors
                 existing = sorted(direct_neighbors.get(target, set()))
 
                 # Keep top evidence paths by confidence

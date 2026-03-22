@@ -126,6 +126,16 @@ impl RustStore {
     /// Physically delete all claims from a source_id. Unlike retract_source()
     /// which tombstones (preserving append-only), this removes data from all indexes.
     /// Returns the number of claims deleted. Call compact() afterwards to reclaim disk.
+    /// Get outgoing causal edges for an entity — lightweight projection.
+    /// Returns Vec<(target_id, predicate_id, confidence)>.
+    pub fn outgoing_causal_edges(
+        &self,
+        entity_id: &str,
+        causal_predicates: &std::collections::HashSet<String>,
+    ) -> Vec<(String, String, f64)> {
+        self.backend.outgoing_causal_edges(entity_id, causal_predicates)
+    }
+
     pub fn purge_source(&mut self, source_id: &str) -> Result<usize, AttestError> {
         if self.read_only { return Err(AttestError::ReadOnly); }
         self.backend.purge_source(source_id)

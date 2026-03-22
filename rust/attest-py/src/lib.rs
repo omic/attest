@@ -845,6 +845,14 @@ impl PyRustStore {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
+    /// Get outgoing causal edges for an entity — lightweight, returns
+    /// list of (target_entity_id, predicate_id, confidence) tuples.
+    /// Only returns claims where entity_id is the SUBJECT and predicate is causal.
+    fn outgoing_causal_edges(&self, entity_id: &str, causal_predicates: Vec<String>) -> Vec<(String, String, f64)> {
+        let predset: std::collections::HashSet<String> = causal_predicates.into_iter().collect();
+        self.inner.outgoing_causal_edges(entity_id, &predset)
+    }
+
     /// Physically delete all claims from a source_id from all indexes.
     /// Unlike retract_source() which tombstones (preserving append-only),
     /// this removes data permanently. Returns the number of claims deleted.
