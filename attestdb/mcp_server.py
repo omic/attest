@@ -168,6 +168,7 @@ def ingest_claim(
     payload: Optional[dict] = None,
     namespace: str = "",
     ttl_seconds: int = 0,
+    verify: bool = False,
 ) -> str:
     """Add a claim (subject-predicate-object triple) to the knowledge graph.
 
@@ -175,6 +176,9 @@ def ingest_claim(
     source_type or source_id will raise a ProvenanceError.
     Optional namespace for team isolation (empty = global).
     Optional ttl_seconds for automatic expiry (0 = never expires).
+    Optional verify=True to run verification pipeline after ingest.
+    Confidence is automatically calibrated for LLM sources and capped by
+    source type ceiling.
     """
     _track_tool_call("ingest_claim", f"{subject_id} {predicate_id} {object_id}")
     _track_claims_ingested(1)
@@ -188,6 +192,7 @@ def ingest_claim(
         payload=payload,
         namespace=namespace,
         ttl_seconds=ttl_seconds,
+        verify=verify,
     )
 
 

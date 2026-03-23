@@ -7,7 +7,12 @@ import time
 
 import jsonschema
 
-from attestdb.core.confidence import tier1_confidence
+from attestdb.core.confidence import (
+    tier1_confidence,
+    source_confidence_ceiling,
+    calibrate_llm_confidence,
+    LLM_SOURCE_TYPES,
+)
 from attestdb.core.errors import (
     CircularProvenanceError,
     DimensionalityError,
@@ -272,10 +277,18 @@ class IngestionPipeline:
                     f"Expected {self._embedding_dim}-dim embedding, got {len(embedding)}-dim"
                 )
 
-        # Compute confidence
+        # Compute confidence — calibrate LLM sources, cap by source ceiling
         confidence = claim_input.confidence
         if confidence is None:
             confidence = tier1_confidence(source_type)
+        else:
+            # Calibrate LLM source types (compresses overconfident values)
+            if source_type in LLM_SOURCE_TYPES:
+                confidence = calibrate_llm_confidence(confidence)
+            # Cap by source type ceiling
+            ceiling = source_confidence_ceiling(source_type)
+            if confidence > ceiling:
+                confidence = ceiling
 
         subj_display = claim_input.subject[0]
         obj_display = claim_input.object[0]

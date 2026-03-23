@@ -125,6 +125,22 @@ def tier1_confidence(source_type: str) -> float:
     return SOURCE_TYPE_WEIGHTS.get(source_type, DEFAULT_WEIGHT)
 
 
+def source_confidence_ceiling(source_type: str) -> float:
+    """Maximum confidence a source type is allowed to claim.
+
+    Prevents confidence inflation from agents that always submit high values.
+    Ceiling = min(tier1 * 1.5, 0.95). Unknown source types get 0.70.
+    """
+    base = tier1_confidence(source_type)
+    return min(base * 1.5, 0.95)
+
+
+LLM_SOURCE_TYPES: frozenset = frozenset({
+    "llm_inference", "claude_chat", "claude_code", "agent_session",
+    "literature_extraction",
+})
+
+
 def count_independent_sources(claims: list) -> int:
     """Count claims with independent provenance (no shared ancestors).
 

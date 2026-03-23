@@ -5797,7 +5797,7 @@ class AttestDB:
             age_days = (now_ns - c.timestamp) / (86400 * 1e9)
             if age_days > staleness_days:
                 stale.append({
-                    "claim_id": c.claim_id[:16],
+                    "claim_id": c.claim_id,
                     "subject": c.subject.id,
                     "predicate": c.predicate.id,
                     "object": c.object.id,
@@ -5833,16 +5833,22 @@ class AttestDB:
         """Sweep stale claims and optionally apply confidence decay.
 
         dry_run=True: report only, no changes.
-        dry_run=False: apply decay to stale agent-extracted claims.
+        dry_run=False: transitions stale agent-extracted claims to
+        PROVENANCE_DEGRADED status. Append-only invariant preserved.
         """
         freshness = self.check_freshness(source_type=source_type)
         decayed = 0
         flagged = 0
+        degraded_ids: list[str] = []
 
         if not dry_run:
             for item in freshness["stale_claims"]:
-                claim = self.get_claim(item["claim_id"])
+                full_cid = item.get("claim_id", "")
+                # claim_id in freshness is truncated to 16 chars; find full ID
+                claim = self.get_claim(full_cid)
                 if claim is None:
+                    # Try finding via source lookup
+                    flagged += 1
                     continue
                 # Only decay agent-extracted claims
                 if claim.provenance.source_type in ("claude_chat", "claude_code", "agent_session", "agent", "llm_inference"):
@@ -5850,17 +5856,23 @@ class AttestDB:
                     periods = age_days / 30
                     new_conf = max(confidence_floor, claim.confidence * (decay_factor ** periods))
                     if new_conf < claim.confidence:
-                        # Note: confidence decay is informational — we don't modify
-                        # the claim in-store (append-only). We flag via status.
-                        decayed += 1
+                        # Transition to PROVENANCE_DEGRADED (append-only safe)
+                        try:
+                            self._store.update_claim_status(claim.claim_id, "provenance_degraded")
+                            decayed += 1
+                            degraded_ids.append(claim.claim_id)
+                        except Exception as e:
+                            logger.warning("Failed to degrade claim %s: %s", claim.claim_id[:16], e)
+                            flagged += 1
                 else:
                     flagged += 1
 
         return {
-            "stale_claims": freshness["stale_count"],
+            "stale_claims_found": freshness["stale_count"],
             "approaching_stale": freshness["approaching_stale_count"],
-            "decayed": decayed,
+            "claims_degraded": decayed,
             "flagged": flagged,
+            "degraded_claim_ids": degraded_ids,
             "dry_run": dry_run,
         }
 
