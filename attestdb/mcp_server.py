@@ -940,6 +940,360 @@ def attest_predict(
 
 
 # ---------------------------------------------------------------------------
+# Verification tools (4)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def attest_verify_claim(
+    claim_id: str,
+    tier: Optional[int] = None,
+) -> str:
+    """Verify a claim through the tiered verification pipeline.
+
+    Runs structural checks (provenance, consistency, corroboration) and returns
+    a verdict: VERIFIED, FAILED, or DISPUTED. Tier controls depth:
+    - Tier 1 (free): provenance + consistency checks
+    - Tier 2: + corroboration search + statistical audit
+    - Tier 3: + reproducibility gate (future)
+
+    If tier is omitted, auto-assigns based on source trust and contradiction risk.
+    Updates the claim's status to the recommended verification status.
+    """
+    db = _get_db()
+    verdict = db.verify_claim(claim_id, tier=tier)
+    # Apply recommended status
+    if verdict.verdict != "FAILED" or verdict.verification_completeness > 0:
+        try:
+            db._store.update_claim_status(claim_id, verdict.recommended_status)
+        except Exception:
+            pass
+    return _serialize(verdict)
+
+
+@mcp.tool()
+def attest_verification_status(
+    entity_id: Optional[str] = None,
+    status_filter: Optional[str] = None,
+) -> str:
+    """Show verification status of claims, optionally filtered by entity or status.
+
+    status_filter: "verified", "verification_failed", "disputed", or "active".
+    Returns summary counts and up to 50 individual claim statuses.
+    """
+    db = _get_db()
+    if entity_id:
+        claims = db.claims_for(entity_id)
+    else:
+        from attestdb.core.types import claim_from_dict
+        claims = [claim_from_dict(d) for d in db._store.all_claims(0, 1000)]
+
+    if status_filter:
+        claims = [c for c in claims if c.status.value == status_filter]
+
+    summary = {}
+    for c in claims:
+        s = c.status.value
+        summary[s] = summary.get(s, 0) + 1
+
+    claim_details = []
+    for c in claims[:50]:
+        claim_details.append({
+            "claim_id": c.claim_id[:16],
+            "subject": c.subject.id,
+            "predicate": c.predicate.id,
+            "object": c.object.id,
+            "status": c.status.value,
+            "confidence": round(c.confidence, 3),
+        })
+
+    return json.dumps({
+        "total_claims": len(claims),
+        "status_summary": summary,
+        "claims": claim_details,
+    }, indent=2)
+
+
+@mcp.tool()
+def attest_challenge_claim(
+    claim_id: str,
+    reason: str,
+    evidence: Optional[str] = None,
+) -> str:
+    """Challenge a claim's verification status.
+
+    Re-runs verification at Tier 2 (deeper checks) and marks the claim as
+    DISPUTED if the challenge finds issues. Use this when you have reason to
+    doubt a verified claim.
+
+    reason: Why the claim is being challenged.
+    evidence: Optional supporting evidence for the challenge.
+    """
+    db = _get_db()
+    claim = db.get_claim(claim_id)
+    if claim is None:
+        return json.dumps({"error": f"Claim {claim_id} not found"})
+
+    # Re-verify at Tier 2 minimum
+    verdict = db.verify_claim(claim, tier=2)
+
+    # If the challenge re-verification finds issues, mark as disputed
+    if verdict.verdict != "VERIFIED":
+        try:
+            db._store.update_claim_status(claim_id, "disputed")
+        except Exception:
+            pass
+        return json.dumps({
+            "challenge_result": "upheld",
+            "reason": reason,
+            "new_status": "disputed",
+            "verdict": verdict.verdict,
+            "confidence": verdict.overall_confidence,
+            "evidence": verdict.check_results[0].evidence if verdict.check_results else [],
+        })
+    else:
+        return json.dumps({
+            "challenge_result": "rejected",
+            "reason": reason,
+            "status": "verified",
+            "verdict": "VERIFIED",
+            "confidence": verdict.overall_confidence,
+            "message": "Claim passed Tier 2 verification. Challenge rejected.",
+        })
+
+
+@mcp.tool()
+def attest_verification_budget(
+    max_usd: Optional[float] = None,
+) -> str:
+    """View or set the verification cost budget.
+
+    If max_usd is provided, sets the per-session budget cap.
+    Always returns current budget status (budget, spent, remaining).
+    """
+    db = _get_db()
+    if max_usd is not None:
+        db.configure_verification_budget(max_usd)
+    status = db.verification_budget_status()
+    return json.dumps(status)
+
+
+# ---------------------------------------------------------------------------
+# Topic Thread tools (5)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def attest_create_thread(
+    seed: str,
+    depth: int = 2,
+    min_confidence: float = 0.5,
+) -> str:
+    """Start a new topic thread from a seed entity or natural language query.
+
+    seed: entity ID (e.g., "KRAS") or NL query starting with ? (e.g., "?KRAS resistance").
+    Returns thread_id, summary, key findings, open questions, and claim count.
+    The thread is a live query — it auto-discovers new claims when resumed.
+    """
+    db = _get_db()
+    ctx = db.create_thread(seed=seed, depth=depth, min_confidence=min_confidence)
+    return json.dumps({
+        "thread_id": ctx.thread_id,
+        "summary": ctx.summary,
+        "key_findings": ctx.key_findings,
+        "open_questions": ctx.open_questions,
+        "claim_count": ctx.claim_count,
+        "entity_count": ctx.entity_count,
+        "seed_entities": ctx.seed_entities,
+        "frontier": [f.id for f in ctx.frontier[:10]],
+    }, indent=2)
+
+
+@mcp.tool()
+def attest_resume_thread(thread_id: str, max_tokens: int = 4000) -> str:
+    """Resume an existing thread. Returns updated context including any new claims
+    added to the graph since last access.
+
+    This is the primary tool for agents to "remember" a topic across sessions.
+    The thread re-executes its traversal, so new claims appear automatically.
+    """
+    db = _get_db()
+    ctx = db.resume_thread(thread_id)
+    result = {
+        "thread_id": ctx.thread_id,
+        "summary": ctx.summary,
+        "key_findings": ctx.key_findings,
+        "open_questions": ctx.open_questions,
+        "claim_count": ctx.claim_count,
+        "seed_entities": ctx.seed_entities,
+        "new_since_last": len(ctx.new_since_last),
+        "removed_since_last": len(ctx.removed_since_last),
+        "frontier": [f.id for f in ctx.frontier[:10]],
+    }
+    # Include thread context if requested
+    if max_tokens > 0:
+        result["context"] = db.thread_context(thread_id, max_tokens=max_tokens)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def attest_extend_thread(
+    thread_id: str,
+    direction: Optional[str] = None,
+    additional_depth: int = 1,
+) -> str:
+    """Extend a thread deeper into the graph.
+
+    direction: entity ID or NL query starting with ? to guide extension.
+    If omitted, extends all frontier entities by additional_depth hops.
+    """
+    db = _get_db()
+    ctx = db.extend_thread(thread_id, direction=direction, additional_depth=additional_depth)
+    return json.dumps({
+        "thread_id": ctx.thread_id,
+        "summary": ctx.summary,
+        "claim_count": ctx.claim_count,
+        "entity_count": ctx.entity_count,
+        "key_findings": ctx.key_findings,
+        "frontier": [f.id for f in ctx.frontier[:10]],
+    }, indent=2)
+
+
+@mcp.tool()
+def attest_list_threads(
+    entity_filter: Optional[str] = None,
+    limit: int = 20,
+) -> str:
+    """List existing threads, optionally filtered to threads touching a specific entity.
+
+    Returns thread_id, seed entities, summary, last accessed, and claim count.
+    """
+    db = _get_db()
+    threads = db.list_threads(entity_filter=entity_filter, limit=limit)
+    return json.dumps({"threads": threads, "count": len(threads)}, indent=2)
+
+
+@mcp.tool()
+def attest_thread_context(
+    thread_id: str,
+    max_tokens: int = 4000,
+    focus: Optional[str] = None,
+) -> str:
+    """Get a serialized context string from a thread, optimized for an agent's
+    context window. This is what agents use to stay on topic.
+
+    focus: optional entity to prioritize in the output.
+    Returns a structured research briefing with summary, key findings,
+    open questions, claims, and frontier entities.
+    """
+    db = _get_db()
+    return db.thread_context(thread_id, max_tokens=max_tokens, focus=focus)
+
+
+# ---------------------------------------------------------------------------
+# Paper Audit tools (2)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def attest_audit_paper(
+    source: str,
+    extraction_method: str = "llm",
+    create_thread: bool = True,
+    tier: Optional[int] = None,
+) -> str:
+    """Ingest and verify claims from a scientific paper.
+
+    source: DOI (e.g. "10.1038/..."), PubMed ID (e.g. "12345678"), URL, or file path.
+    extraction_method: "llm" for LLM-based claim extraction.
+    create_thread: create a topic thread for the paper's claims.
+    tier: optional verification tier override (1-3).
+
+    Returns JSON with paper audit report including per-claim verdicts,
+    overall score, total cost, and thread_id if created.
+    """
+    db = _get_db()
+    report = db.audit_paper(source, extraction_method, create_thread, tier)
+    return _serialize(report)
+
+
+@mcp.tool()
+def attest_bulk_audit(
+    sources: str,
+    create_threads: bool = True,
+    tier: Optional[int] = None,
+) -> str:
+    """Audit multiple papers. Budget-aware — stops if verification budget exhausted.
+
+    sources: comma-separated list of DOIs, PubMed IDs, URLs, or file paths.
+    create_threads: create a topic thread per paper.
+
+    Returns JSON with list of audit reports and aggregate statistics.
+    """
+    db = _get_db()
+    source_list = [s.strip() for s in sources.split(",") if s.strip()]
+    reports = db.bulk_audit(source_list, create_threads=create_threads, tier=tier)
+    total_claims = sum(r.claims_extracted for r in reports)
+    total_verified = sum(r.claims_verified for r in reports)
+    total_failed = sum(r.claims_failed for r in reports)
+    return json.dumps({
+        "papers_audited": len(reports),
+        "total_claims_extracted": total_claims,
+        "total_verified": total_verified,
+        "total_failed": total_failed,
+        "reports": [
+            {
+                "paper_id": r.paper_id,
+                "title": r.title,
+                "claims_extracted": r.claims_extracted,
+                "claims_verified": r.claims_verified,
+                "claims_failed": r.claims_failed,
+                "overall_score": r.overall_score,
+                "total_cost_usd": r.total_cost_usd,
+                "flagged_issues": r.flagged_issues[:5],
+                "thread_id": r.thread_id,
+            }
+            for r in reports
+        ],
+    }, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Enterprise Staleness tools (2)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def attest_check_freshness(
+    source_type: Optional[str] = None,
+    entity_filter: Optional[str] = None,
+) -> str:
+    """Check freshness of claims from enterprise sources.
+
+    Returns stale claims, broken sync pipelines, and claims approaching staleness.
+    Optionally filtered by source type (e.g. "salesforce", "slack") or entity.
+    """
+    db = _get_db()
+    result = db.check_freshness(source_type=source_type, entity_filter=entity_filter)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def attest_sweep_stale(
+    dry_run: bool = True,
+    source_type: Optional[str] = None,
+) -> str:
+    """Run staleness sweep. Identifies stale claims and optionally applies confidence decay.
+
+    dry_run=True (default): report only, no changes.
+    dry_run=False: apply decay to stale agent-extracted claims, flag others.
+    """
+    db = _get_db()
+    result = db.sweep_stale(dry_run=dry_run, source_type=source_type)
+    return json.dumps(result, indent=2)
+
+
+# ---------------------------------------------------------------------------
 # Research tools (2)
 # ---------------------------------------------------------------------------
 

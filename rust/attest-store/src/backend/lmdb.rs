@@ -810,6 +810,9 @@ impl LmdbBackend {
             ClaimStatus::Archived => 1,
             ClaimStatus::Tombstoned => 2,
             ClaimStatus::ProvenanceDegraded => 3,
+            ClaimStatus::Verified => 4,
+            ClaimStatus::VerificationFailed => 5,
+            ClaimStatus::Disputed => 6,
         }
     }
 
@@ -819,6 +822,9 @@ impl LmdbBackend {
             1 => ClaimStatus::Archived,
             2 => ClaimStatus::Tombstoned,
             3 => ClaimStatus::ProvenanceDegraded,
+            4 => ClaimStatus::Verified,
+            5 => ClaimStatus::VerificationFailed,
+            6 => ClaimStatus::Disputed,
             _ => ClaimStatus::Active,
         }
     }

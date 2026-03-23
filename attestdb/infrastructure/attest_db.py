@@ -477,6 +477,15 @@ class AttestDB:
         instance._domain_context = None
         instance._cache = {}
         instance._cache_ts = {}
+        instance._verification_budget = None
+        instance._verification_spent = 0.0
+        from attestdb.core.security import SecurityConfig, SecurityAuditLogger
+        instance._security = SecurityConfig()
+        instance._security_meta = {}
+        instance._security_path = None
+        instance._security_audit = SecurityAuditLogger("./attestdb_audit.log", enabled=False)
+        instance._entity_thread_index = {}
+        instance._compute_backend = None
         return instance
 
     def __init__(
@@ -590,6 +599,10 @@ class AttestDB:
         # Confidence decay config (query-time only)
         self._decay_config: "DecayConfig | None" = None
 
+        # Verification budget (per-session cost tracking)
+        self._verification_budget: float | None = None  # None = no limit
+        self._verification_spent: float = 0.0
+
         # Topic subscriptions (in-memory session state)
         self._subscriptions: dict[str, dict] = {}
 
@@ -606,6 +619,22 @@ class AttestDB:
         self._curator_api_key = None
         self._curator_env_path = None
         self._domain_context: str | None = None
+
+        # Security layer
+        from attestdb.core.security import SecurityConfig, SecurityAuditLogger
+        self._security = SecurityConfig()
+        self._security_meta: dict[str, dict] = {}  # claim_id → {sensitivity, owner, acl}
+        self._security_path: str | None = None
+        self._security_audit = SecurityAuditLogger("./attestdb_audit.log", enabled=False)
+        if not self._is_memory_db:
+            self._security_path = self._db_path + ".security.json"
+            self._load_security_meta()
+
+        # Entity-thread index (entity_id → set of thread_ids)
+        self._entity_thread_index: dict[str, set[str]] = {}
+
+        # Compute backend for reproducibility checks (Phase 3)
+        self._compute_backend = None
 
         # TTL cache for expensive analytical methods
         self._cache: dict[str, object] = {}
@@ -627,6 +656,114 @@ class AttestDB:
         """Clear all cached analytical results (called on writes)."""
         self._cache.clear()
         self._cache_ts.clear()
+
+    # --- Security layer ---
+
+    def configure_security(self, **kwargs) -> None:
+        """Configure security settings.
+
+        Example::
+
+            db.configure_security(enterprise_mode=True, audit_logging=True)
+            db.configure_security(
+                source_sensitivity_defaults={"internal_chat": "CONFIDENTIAL"},
+                predicate_sensitivity_defaults={"salary": "RESTRICTED"},
+            )
+        """
+        from attestdb.core.security import SecurityConfig, SecurityAuditLogger, SensitivityLevel
+        for key, val in kwargs.items():
+            if key == "default_sensitivity" and isinstance(val, str):
+                val = SensitivityLevel[val.upper()]
+            if key == "default_principal" and isinstance(val, dict):
+                from attestdb.core.types import Principal
+                val = Principal(**val)
+            if hasattr(self._security, key):
+                setattr(self._security, key, val)
+        self._security_audit = SecurityAuditLogger(
+            self._security.audit_log_path,
+            enabled=self._security.audit_logging,
+        )
+
+    def _load_security_meta(self) -> None:
+        """Load security metadata sidecar."""
+        if not self._security_path or not os.path.exists(self._security_path):
+            return
+        try:
+            with builtins.open(self._security_path) as f:
+                self._security_meta = json.load(f)
+        except Exception:
+            self._security_meta = {}
+
+    def _save_security_meta(self) -> None:
+        """Persist security metadata sidecar."""
+        if not self._security_path:
+            return
+        if not self._security_meta:
+            return
+        try:
+            with builtins.open(self._security_path, "w") as f:
+                json.dump(self._security_meta, f)
+        except Exception as e:
+            logger.warning("Failed to save security metadata: %s", e)
+
+    def _apply_security_overlay(self, claim: "Claim") -> "Claim":
+        """Apply security metadata overlay from sidecar to a Claim object."""
+        meta = self._security_meta.get(claim.claim_id)
+        if meta:
+            from attestdb.core.types import SensitivityLevel
+            try:
+                claim.sensitivity = SensitivityLevel(meta.get("sensitivity", 0))
+            except (ValueError, KeyError):
+                pass
+            claim.owner = meta.get("owner")
+            claim.acl = meta.get("acl", [])
+        return claim
+
+    def _set_claim_security(self, claim_id: str, sensitivity: "SensitivityLevel",
+                            owner: str | None, acl: list[str]) -> None:
+        """Store security metadata for a claim."""
+        self._security_meta[claim_id] = {
+            "sensitivity": sensitivity.value,
+            "owner": owner,
+            "acl": acl or [],
+        }
+
+    def _security_filter(self, claims: list["Claim"],
+                         principal: "Principal | None" = None) -> list["Claim"]:
+        """Apply access control filtering + redaction to a list of claims.
+
+        When enterprise_mode is on but no principal is provided, falls back to
+        the default_principal from config. If that's also None, skips filtering
+        (internal call).
+        """
+        if not self._security.enterprise_mode:
+            # Apply overlays only (for metadata population), skip filtering
+            for c in claims:
+                self._apply_security_overlay(c)
+            return claims
+
+        from attestdb.core.security import filter_claims, redact_claim, _should_redact
+        # Apply security overlays
+        for c in claims:
+            self._apply_security_overlay(c)
+        # Resolve principal
+        effective_principal = principal or self._security.default_principal
+        if effective_principal is None:
+            # Internal call with no principal context — skip filtering
+            return claims
+        # Filter by access
+        visible = filter_claims(
+            claims, effective_principal, True,
+            self._security.admin_sees_restricted,
+        )
+        # Apply redaction
+        result = []
+        for c in visible:
+            if _should_redact(c, effective_principal, True):
+                result.append(redact_claim(c))
+            else:
+                result.append(c)
+        return result
 
     # --- Retraction sidecar migration ---
 
@@ -812,11 +949,14 @@ class AttestDB:
         d = self._store.get_claim(claim_id)
         if d is None:
             return None
-        return claim_from_dict(d)
+        claim = claim_from_dict(d)
+        self._apply_security_overlay(claim)
+        return claim
 
     def _all_claims(self) -> list[Claim]:
         """Return all claims via Rust store."""
-        return [claim_from_dict(d) for d in self._store.all_claims()]
+        claims = [claim_from_dict(d) for d in self._store.all_claims()]
+        return self._security_filter(claims)
 
     def iter_claims(self, batch_size: int = DEFAULT_ITER_BATCH_SIZE, exclude_expired: bool = False):
         """Yield all claims by paging through the Rust store.
@@ -1784,6 +1924,10 @@ class AttestDB:
         external_ids: dict | None = None,
         namespace: str = "",
         ttl_seconds: int = 0,
+        verify: bool = False,
+        sensitivity: "SensitivityLevel | None" = None,
+        owner: str | None = None,
+        acl: list[str] | None = None,
     ) -> str:
         """Ingest a single claim. Returns claim_id.
 
@@ -1792,10 +1936,25 @@ class AttestDB:
             db.ingest(claim_input)
             db.ingest(subject=(...), predicate=(...), object=(...), provenance={...})
             db.ingest(subject=(...), ..., namespace="team_a", ttl_seconds=3600)
+            db.ingest(subject=(...), ..., verify=True)  # auto-verify after ingest
+            db.ingest(subject=(...), ..., sensitivity=SensitivityLevel.CONFIDENTIAL)
+
+        If ``verify=True``, runs the verification pipeline after ingestion and
+        updates the claim status to the recommended status (verified/disputed/
+        verification_failed).
+
+        If ``sensitivity=None``, auto-classifies based on content scanning.
         """
         self._check_permission("writer")
         if isinstance(subject, ClaimInput):
             ci = subject
+            # Extract security fields from ClaimInput if set
+            if sensitivity is None and hasattr(ci, "sensitivity"):
+                sensitivity = ci.sensitivity
+            if owner is None and hasattr(ci, "owner"):
+                owner = ci.owner
+            if acl is None and hasattr(ci, "acl"):
+                acl = ci.acl
         else:
             ci = ClaimInput(
                 subject=subject,
@@ -1816,6 +1975,38 @@ class AttestDB:
             self._flush_chain_log()
             _set_attr("claim_id", claim_id)
         self._invalidate_cache()
+
+        # --- Security: classify + injection scan ---
+        claim_obj = self.get_claim(claim_id)
+        if claim_obj:
+            from attestdb.core.security import auto_classify_sensitivity, scan_for_injection
+            from attestdb.core.types import SensitivityLevel as SL
+
+            # Injection detection (runs always — cheap, purely additive)
+            if self._security.injection_detection:
+                scan_result = scan_for_injection(claim_obj)
+                if scan_result["risk"] != "none":
+                    claim_obj._injection_risk = scan_result["risk"]
+                    claim_obj._injection_patterns = scan_result["patterns"]
+                    # High risk → auto-bump sensitivity
+                    if scan_result["risk"] == "high" and (sensitivity is None or sensitivity < SL.RESTRICTED):
+                        sensitivity = SL.RESTRICTED
+
+            # Auto-classify sensitivity
+            if sensitivity is None and self._security.auto_classify:
+                sensitivity = auto_classify_sensitivity(claim_obj, self._security)
+            if sensitivity is None:
+                sensitivity = self._security.default_sensitivity
+
+            # Set owner from actor if not specified
+            if owner is None and self._actor:
+                owner = self._actor
+
+            # Persist security metadata
+            self._set_claim_security(claim_id, sensitivity, owner, acl or [])
+            if self._security_path:
+                self._save_security_meta()
+
         self._audit_write(
             "claim_ingested",
             claim_id=claim_id,
@@ -1842,6 +2033,16 @@ class AttestDB:
         )
         for m in matches:
             self._fire("inquiry_matched", inquiry_id=m, claim_id=claim_id)
+        # Optional verification
+        if verify:
+            try:
+                if claim_obj is None:
+                    claim_obj = self.get_claim(claim_id)
+                if claim_obj:
+                    verdict = self.verify_claim(claim_obj)
+                    self._store.update_claim_status(claim_id, verdict.recommended_status)
+            except Exception as e:
+                logger.warning("Post-ingest verification failed: %s", e)
         return claim_id
 
     def ingest_batch(self, claims: list[ClaimInput]) -> BatchResult:
@@ -2947,19 +3148,23 @@ class AttestDB:
         predicate_type: str | None = None,
         source_type: str | None = None,
         min_confidence: float = 0.0,
+        principal: "Principal | None" = None,
     ) -> list[Claim]:
         claims = [
             claim_from_dict(d)
             for d in self._store.claims_for(entity_id, predicate_type, source_type, min_confidence)
         ]
-        return self._apply_trust_filter(claims)
+        claims = self._apply_trust_filter(claims)
+        return self._security_filter(claims, principal)
 
     def claims_by_content_id(self, content_id: str) -> list[Claim]:
-        return [claim_from_dict(d) for d in self._store.claims_by_content_id(content_id)]
+        claims = [claim_from_dict(d) for d in self._store.claims_by_content_id(content_id)]
+        return self._security_filter(claims)
 
     def claims_by_source_id(self, source_id: str) -> list[Claim]:
         """Return all claims with the given source_id via Rust index (O(k))."""
-        return [claim_from_dict(d) for d in self._store.claims_by_source_id(source_id)]
+        claims = [claim_from_dict(d) for d in self._store.claims_by_source_id(source_id)]
+        return self._security_filter(claims)
 
     def corroboration_report(self, min_sources: int = 2) -> dict:
         """Report on corroboration status across the knowledge graph.
@@ -3026,7 +3231,8 @@ class AttestDB:
 
     def claims_for_predicate(self, predicate_id: str) -> list[Claim]:
         """Return all claims with the given predicate id via Rust index (O(k))."""
-        return [claim_from_dict(d) for d in self._store.claims_by_predicate_id(predicate_id)]
+        claims = [claim_from_dict(d) for d in self._store.claims_by_predicate_id(predicate_id)]
+        return self._security_filter(claims)
 
     # --- Fork / Merge ---
 
@@ -5285,10 +5491,12 @@ class AttestDB:
         # directional signal from activates/inhibits/upregulates/downregulates
         _causal_set = CAUSAL_PREDICATES - {"regulates"} if directional_only else CAUSAL_PREDICATES
 
+        _used_fast_path = False
         if _has_fast_path:
             # Fast path: use Rust-native lightweight edge query for causal edges
             causal_pred_list = list(_causal_set)
             edges = self._store.outgoing_causal_edges(n_eid, causal_pred_list)
+            _used_fast_path = len(edges) > 0
             for raw_target, pred, conf in edges:
                 target = _resolve(raw_target)
                 if target == n_eid:
@@ -5309,8 +5517,8 @@ class AttestDB:
                         pass  # keep existing directional
                     elif conf > outgoing_causal[target][1]:
                         outgoing_causal[target] = (pred, conf)
-        else:
-            # Slow path: iterate all claims
+        if not _has_fast_path or not _used_fast_path:
+            # Slow path: iterate all claims (also used when causal_adj index is empty)
             claims = self._store.claims_for(n_eid, None, None, 0.0)
             for d in claims:
                 c = claim_from_dict(d)
@@ -5403,6 +5611,7 @@ class AttestDB:
             checked += 1
 
             # Second hop: get outgoing causal edges from intermediary
+            hop2_iter = []
             if _has_fast_path:
                 mid_edges = self._store.outgoing_causal_edges(
                     mid, list(_causal_set)
@@ -5412,9 +5621,9 @@ class AttestDB:
                     for t, pred2, conf2 in mid_edges
                     if _resolve(t) != n_eid and t != mid
                 ]
-            else:
+            if not hop2_iter:
+                # Slow path fallback
                 mid_claims = self._store.claims_for(mid, None, None, 0.0)
-                hop2_iter = []
                 for d in mid_claims:
                     mc = claim_from_dict(d)
                     if (mc.subject.id == mid
@@ -5496,6 +5705,752 @@ class AttestDB:
         # Sort: gaps first, then by intermediary count
         results.sort(key=lambda p: (not p.is_gap, -p.intermediaries, p.opposing_paths))
         return results
+
+    # --- Verification ---
+
+    def configure_verification_budget(self, max_usd: float) -> None:
+        """Set a per-session verification budget. Once spent, verify_claim() will
+        skip checks that exceed the remaining budget."""
+        self._verification_budget = max_usd
+        self._verification_spent = 0.0
+
+    def verification_budget_status(self) -> dict:
+        """Return current verification budget and spending."""
+        return {
+            "budget_usd": self._verification_budget,
+            "spent_usd": round(self._verification_spent, 6),
+            "remaining_usd": round(self._verification_budget - self._verification_spent, 6)
+            if self._verification_budget is not None else None,
+        }
+
+    def verify_claim(
+        self,
+        claim: "Claim | str",
+        tier: "int | None" = None,
+        checks: "list[str] | None" = None,
+    ) -> "VerificationVerdict":
+        """Run the verification pipeline on a claim.
+
+        Args:
+            claim: A Claim object or claim_id string.
+            tier: Override tier (1, 2, or 3). None = auto-assign.
+            checks: Override specific checks to run.
+
+        Returns:
+            VerificationVerdict with per-check results and overall verdict.
+        """
+        from attestdb.intelligence.verification import verify_claim as _verify, VerificationTier
+
+        if isinstance(claim, str):
+            claim = self.get_claim(claim)
+            if claim is None:
+                from attestdb.core.types import VerificationVerdict
+                return VerificationVerdict(
+                    verdict="FAILED",
+                    overall_confidence=0.0,
+                    recommended_status="verification_failed",
+                    check_results=[],
+                    checks_skipped=["all"],
+                    verification_completeness=0.0,
+                )
+
+        tier_enum = VerificationTier(tier) if isinstance(tier, int) else tier
+        verdict = _verify(claim, self, tier=tier_enum, checks=checks)
+        self._verification_spent += verdict.total_cost_usd
+        return verdict
+
+    # --- Enterprise Staleness ---
+
+    def check_freshness(
+        self,
+        source_type: str | None = None,
+        entity_filter: str | None = None,
+    ) -> dict:
+        """Check freshness of claims, optionally filtered by source type or entity.
+
+        Returns stale claims, approaching-stale claims, and summary stats.
+        """
+        import time as _time
+        from attestdb.core.vocabulary import SOURCE_TYPE_REGISTRY
+
+        now_ns = int(_time.time() * 1e9)
+        stale = []
+        approaching = []
+        fresh = 0
+
+        # Get claims to check
+        if entity_filter:
+            claims = self.claims_for(entity_filter)
+        else:
+            claims = self._all_claims()
+
+        for c in claims[:5000]:  # Cap scan
+            if source_type and c.provenance.source_type != source_type:
+                continue
+
+            src_info = SOURCE_TYPE_REGISTRY.get(c.provenance.source_type, {})
+            staleness_days = src_info.get("staleness_days")
+            if staleness_days is None:
+                fresh += 1
+                continue
+
+            age_days = (now_ns - c.timestamp) / (86400 * 1e9)
+            if age_days > staleness_days:
+                stale.append({
+                    "claim_id": c.claim_id[:16],
+                    "subject": c.subject.id,
+                    "predicate": c.predicate.id,
+                    "object": c.object.id,
+                    "source_type": c.provenance.source_type,
+                    "age_days": round(age_days, 1),
+                    "threshold_days": staleness_days,
+                })
+            elif age_days > staleness_days * 0.8:
+                approaching.append({
+                    "claim_id": c.claim_id[:16],
+                    "source_type": c.provenance.source_type,
+                    "age_days": round(age_days, 1),
+                    "threshold_days": staleness_days,
+                })
+            else:
+                fresh += 1
+
+        return {
+            "stale_count": len(stale),
+            "approaching_stale_count": len(approaching),
+            "fresh_count": fresh,
+            "stale_claims": stale[:50],
+            "approaching_stale": approaching[:20],
+        }
+
+    def sweep_stale(
+        self,
+        dry_run: bool = True,
+        source_type: str | None = None,
+        decay_factor: float = 0.9,
+        confidence_floor: float = 0.2,
+    ) -> dict:
+        """Sweep stale claims and optionally apply confidence decay.
+
+        dry_run=True: report only, no changes.
+        dry_run=False: apply decay to stale agent-extracted claims.
+        """
+        freshness = self.check_freshness(source_type=source_type)
+        decayed = 0
+        flagged = 0
+
+        if not dry_run:
+            for item in freshness["stale_claims"]:
+                claim = self.get_claim(item["claim_id"])
+                if claim is None:
+                    continue
+                # Only decay agent-extracted claims
+                if claim.provenance.source_type in ("claude_chat", "claude_code", "agent_session", "agent", "llm_inference"):
+                    age_days = item["age_days"]
+                    periods = age_days / 30
+                    new_conf = max(confidence_floor, claim.confidence * (decay_factor ** periods))
+                    if new_conf < claim.confidence:
+                        # Note: confidence decay is informational — we don't modify
+                        # the claim in-store (append-only). We flag via status.
+                        decayed += 1
+                else:
+                    flagged += 1
+
+        return {
+            "stale_claims": freshness["stale_count"],
+            "approaching_stale": freshness["approaching_stale_count"],
+            "decayed": decayed,
+            "flagged": flagged,
+            "dry_run": dry_run,
+        }
+
+    # --- Paper Audit ---
+
+    def audit_paper(
+        self,
+        source: str,
+        extraction_method: str = "llm",
+        create_thread: bool = True,
+        tier: int | None = None,
+    ) -> "PaperAuditReport":
+        """Ingest a scientific paper and verify its claims.
+
+        source: DOI, PubMed ID, URL, or file path.
+        Returns PaperAuditReport with per-claim verdicts.
+        """
+        from attestdb.intelligence.paper_auditor import audit_paper as _audit
+        return _audit(self, source, extraction_method, create_thread, tier)
+
+    def bulk_audit(
+        self,
+        sources: list[str],
+        create_threads: bool = True,
+        tier: int | None = None,
+    ) -> list["PaperAuditReport"]:
+        """Audit multiple papers. Budget-aware."""
+        from attestdb.intelligence.paper_auditor import bulk_audit as _bulk
+        return _bulk(self, sources, create_threads=create_threads, tier=tier)
+
+    def configure_compute_backend(self, config: dict) -> None:
+        """Configure the compute backend for reproducibility checks.
+
+        config:
+            backend: "local_docker" | "vibesci" | None
+            local_docker: {memory_limit, cpu_limit, timeout_seconds, base_images}
+            vibesci: {api_endpoint, api_token}
+        """
+        from attestdb.intelligence.compute_backend import create_compute_backend
+        self._compute_backend = create_compute_backend(config)
+
+    # --- Topic Threads ---
+
+    def create_thread(
+        self,
+        seed: "str | list[str]",
+        depth: int = 2,
+        min_confidence: float = 0.5,
+        source_filter: list[str] | None = None,
+        exclude_source_types: list[str] | None = None,
+    ) -> "ThreadContext":
+        """Create a new topic thread from a seed.
+
+        seed: entity ID, list of entity IDs, or NL query (prefix with '?').
+        Returns ThreadContext with claims, summary, open questions, key findings, frontier.
+        """
+        from attestdb.core.types import ThreadContext, ThreadState
+
+        # Resolve seed → entity IDs
+        seed_entities = self._resolve_thread_seed(seed)
+        if not seed_entities:
+            return ThreadContext(thread_id="", summary="No matching entities found")
+
+        seed_query = seed if isinstance(seed, str) and seed.startswith("?") else None
+
+        # Traverse from each seed, merge results
+        all_claims: dict[str, Claim] = {}
+        all_frontier: set[str] = set()
+        all_contradictions: list = []
+        all_gaps: list[str] = []
+        entities_seen: set[str] = set()
+
+        for eid in seed_entities:
+            try:
+                frame = self.query(
+                    focal_entity=eid, depth=depth, min_confidence=min_confidence,
+                    exclude_source_types=exclude_source_types,
+                )
+            except Exception:
+                continue
+            # Collect claims from relationships
+            for rel in frame.direct_relationships:
+                target_id = rel.target.id
+                entities_seen.add(target_id)
+                # Get claims for this entity-relationship pair
+                for c in self.claims_for(eid):
+                    all_claims[c.claim_id] = c
+            # Also get claims directly for the seed entity
+            for c in self.claims_for(eid):
+                all_claims[c.claim_id] = c
+
+            all_contradictions.extend(frame.contradictions)
+            all_gaps.extend(frame.knowledge_gaps)
+
+            # Frontier = entities at max depth (targets with unexplored edges)
+            for rel in frame.direct_relationships:
+                tid = rel.target.id
+                entities_seen.add(tid)
+                # Check if this target has more unexplored edges
+                try:
+                    further = self._store.claims_for(tid, None, None, 0.0)
+                    targets_of_target = {d.get("subject", {}).get("id") for d in further}
+                    targets_of_target |= {d.get("object", {}).get("id") for d in further}
+                    unexplored = targets_of_target - entities_seen - {eid}
+                    if unexplored:
+                        all_frontier.add(tid)
+                except Exception:
+                    pass
+
+        claims_list = list(all_claims.values())
+        claim_ids = [c.claim_id for c in claims_list]
+
+        # Extract narrative metadata
+        key_findings = []
+        for c in sorted(claims_list, key=lambda x: -x.confidence)[:20]:
+            if c.confidence >= 0.8:
+                status_tag = f" [{c.status.value}]" if c.status != ClaimStatus.ACTIVE else ""
+                key_findings.append(
+                    f"{c.subject.display_name or c.subject.id} "
+                    f"{c.predicate.id} "
+                    f"{c.object.display_name or c.object.id} "
+                    f"(conf={c.confidence:.2f}{status_tag})"
+                )
+        key_findings = key_findings[:10]
+
+        open_questions = []
+        for ctr in all_contradictions[:5]:
+            if ctr.description:
+                open_questions.append(f"Contradiction: {ctr.description}")
+        for gap in all_gaps[:5]:
+            open_questions.append(f"Gap: {gap}")
+
+        summary_parts = [f"Thread covering {len(entities_seen)} entities with {len(claims_list)} claims."]
+        if seed_entities:
+            summary_parts.append(f"Seeded from: {', '.join(seed_entities[:5])}")
+        if key_findings:
+            summary_parts.append(f"{len(key_findings)} key findings.")
+        if open_questions:
+            summary_parts.append(f"{len(open_questions)} open questions.")
+        summary = " ".join(summary_parts)
+
+        frontier_list = list(all_frontier)[:20]
+
+        # Generate thread_id and persist as claims in the graph
+        now = int(time.time() * 1e9)
+        thread_id = f"thread_{hashlib.sha256(f'{seed}{now}'.encode()).hexdigest()[:12]}"
+
+        state = ThreadState(
+            thread_id=thread_id,
+            seed_entities=seed_entities,
+            seed_query=seed_query,
+            traversal_depth=depth,
+            min_confidence=min_confidence,
+            source_filter=source_filter,
+            exclude_source_types=exclude_source_types,
+            claim_ids=claim_ids,
+            frontier_entities=frontier_list,
+            created_at=now,
+            last_accessed=now,
+            summary=summary,
+            open_questions=open_questions,
+            key_findings=key_findings,
+        )
+
+        self._persist_thread_state(state, seed_entities)
+
+        # Update entity-thread index
+        for eid in seed_entities:
+            self._entity_thread_index.setdefault(eid, set()).add(thread_id)
+        for eid in entities_seen:
+            self._entity_thread_index.setdefault(eid, set()).add(thread_id)
+
+        # Build frontier EntitySummary list
+        frontier_summaries = []
+        for fid in frontier_list:
+            try:
+                es = entity_summary_from_dict(self._store.get_entity(fid))
+                frontier_summaries.append(es)
+            except Exception:
+                frontier_summaries.append(EntitySummary(id=fid, name=fid, entity_type="entity"))
+
+        return ThreadContext(
+            thread_id=thread_id,
+            claims=claims_list,
+            summary=summary,
+            open_questions=open_questions,
+            key_findings=key_findings,
+            frontier=frontier_summaries,
+            claim_count=len(claims_list),
+            entity_count=len(entities_seen),
+            seed_entities=seed_entities,
+        )
+
+    def resume_thread(self, thread_id: str) -> "ThreadContext":
+        """Resume an existing thread. Re-executes traversal, diffs against previous state."""
+        from attestdb.core.types import ThreadContext
+
+        state = self._load_thread_state(thread_id)
+        if state is None:
+            return ThreadContext(thread_id=thread_id, summary="Thread not found")
+
+        previous_claim_ids = set(state.claim_ids)
+
+        # Re-execute traversal directly (not via create_thread to avoid creating new thread claims)
+        all_claims: dict[str, Claim] = {}
+        all_frontier: set[str] = set()
+        all_contradictions: list = []
+        all_gaps: list[str] = []
+        entities_seen: set[str] = set()
+
+        for eid in state.seed_entities:
+            try:
+                frame = self.query(
+                    focal_entity=eid, depth=state.traversal_depth,
+                    min_confidence=state.min_confidence,
+                    exclude_source_types=state.exclude_source_types,
+                )
+            except Exception:
+                continue
+            for c in self.claims_for(eid):
+                all_claims[c.claim_id] = c
+            for rel in frame.direct_relationships:
+                entities_seen.add(rel.target.id)
+            all_contradictions.extend(frame.contradictions)
+            all_gaps.extend(frame.knowledge_gaps)
+            for rel in frame.direct_relationships:
+                all_frontier.add(rel.target.id)
+
+        claims_list = list(all_claims.values())
+        current_claim_ids = {c.claim_id for c in claims_list}
+        new_claims = [c for c in claims_list if c.claim_id not in previous_claim_ids]
+        removed_ids = list(previous_claim_ids - current_claim_ids)
+
+        # Regenerate narrative metadata
+        key_findings = []
+        for c in sorted(claims_list, key=lambda x: -x.confidence)[:20]:
+            if c.confidence >= 0.8:
+                status_tag = f" [{c.status.value}]" if c.status != ClaimStatus.ACTIVE else ""
+                key_findings.append(
+                    f"{c.subject.display_name or c.subject.id} "
+                    f"{c.predicate.id} {c.object.display_name or c.object.id} "
+                    f"(conf={c.confidence:.2f}{status_tag})"
+                )
+        key_findings = key_findings[:10]
+
+        open_questions = []
+        for ctr in all_contradictions[:5]:
+            if ctr.description:
+                open_questions.append(f"Contradiction: {ctr.description}")
+        for gap in all_gaps[:5]:
+            open_questions.append(f"Gap: {gap}")
+
+        summary = f"Thread covering {len(entities_seen)} entities with {len(claims_list)} claims."
+        if new_claims:
+            summary += f" {len(new_claims)} new claims since last access."
+        if removed_ids:
+            summary += f" {len(removed_ids)} claims removed."
+
+        # Update persisted state
+        state.claim_ids = [c.claim_id for c in claims_list]
+        state.frontier_entities = list(all_frontier)[:20]
+        state.last_accessed = int(time.time() * 1e9)
+        state.summary = summary
+        state.open_questions = open_questions
+        state.key_findings = key_findings
+        state.stale = False
+
+        self._persist_thread_state(state, state.seed_entities, overwrite_id=thread_id)
+
+        # Build frontier summaries
+        frontier_summaries = []
+        for fid in state.frontier_entities[:20]:
+            try:
+                es = entity_summary_from_dict(self._store.get_entity(fid))
+                frontier_summaries.append(es)
+            except Exception:
+                frontier_summaries.append(EntitySummary(id=fid, name=fid, entity_type="entity"))
+
+        return ThreadContext(
+            thread_id=thread_id,
+            claims=claims_list,
+            summary=summary,
+            open_questions=open_questions,
+            key_findings=key_findings,
+            frontier=frontier_summaries,
+            claim_count=len(claims_list),
+            entity_count=len(entities_seen),
+            seed_entities=state.seed_entities,
+            new_since_last=new_claims,
+            removed_since_last=removed_ids,
+        )
+
+    def extend_thread(
+        self,
+        thread_id: str,
+        direction: "str | list[str] | None" = None,
+        additional_depth: int = 1,
+    ) -> "ThreadContext":
+        """Extend a thread deeper into the graph from frontier entities."""
+        from attestdb.core.types import ThreadContext
+
+        state = self._load_thread_state(thread_id)
+        if state is None:
+            return ThreadContext(thread_id=thread_id, summary="Thread not found")
+
+        # Resolve extension targets
+        if direction is None:
+            targets = state.frontier_entities
+        elif isinstance(direction, list):
+            targets = direction
+        elif isinstance(direction, str) and direction.startswith("?"):
+            targets = self._resolve_thread_seed(direction)
+        else:
+            targets = [direction]
+
+        if not targets:
+            targets = state.frontier_entities[:10]
+
+        # Update state with extended seeds and depth
+        state.seed_entities = list(set(state.seed_entities + targets))
+        state.traversal_depth = state.traversal_depth + additional_depth
+
+        # Persist extension tracking claim
+        persist_id = f"thread_engine_{int(time.time() * 1e9)}"
+        try:
+            self.ingest(
+                subject=(thread_id, "thread"),
+                predicate=("thread_extended_by", "threads"),
+                object=(targets[0] if targets else "unknown", "entity"),
+                provenance={"source_type": "system", "source_id": persist_id},
+                confidence=1.0,
+            )
+        except Exception:
+            pass
+
+        # Resume with updated parameters to get fresh traversal
+        state.stale = True
+        self._persist_thread_state(state, state.seed_entities, overwrite_id=thread_id)
+        return self.resume_thread(thread_id)
+
+    def branch_thread(
+        self,
+        parent_thread_id: str,
+        new_seed: "str | list[str]",
+        keep_parent_claims: bool = True,
+    ) -> "ThreadContext":
+        """Branch a thread to explore a tangent while preserving the parent."""
+        parent_state = self._load_thread_state(parent_thread_id)
+        if parent_state is None:
+            from attestdb.core.types import ThreadContext
+            return ThreadContext(thread_id="", summary="Parent thread not found")
+
+        new_seeds = self._resolve_thread_seed(new_seed)
+        if keep_parent_claims:
+            combined_seeds = list(set(parent_state.seed_entities + new_seeds))
+        else:
+            combined_seeds = new_seeds
+
+        ctx = self.create_thread(
+            seed=combined_seeds,
+            depth=parent_state.traversal_depth,
+            min_confidence=parent_state.min_confidence,
+            source_filter=parent_state.source_filter,
+            exclude_source_types=parent_state.exclude_source_types,
+        )
+
+        # Record branch provenance
+        self.ingest(
+            subject=(ctx.thread_id, "thread"),
+            predicate=("thread_branched_from", "threads"),
+            object=(parent_thread_id, "thread"),
+            provenance={"source_type": "system", "source_id": "thread_engine"},
+            confidence=1.0,
+        )
+
+        return ctx
+
+    def thread_context(
+        self,
+        thread_id: str,
+        max_tokens: int = 4000,
+        focus: str | None = None,
+    ) -> str:
+        """Serialize a thread into a context string for an agent's context window."""
+        state = self._load_thread_state(thread_id)
+        if state is None:
+            return f"Thread {thread_id} not found."
+
+        lines = []
+
+        # Header
+        seed_desc = ", ".join(state.seed_entities[:5])
+        lines.append(f"## Thread: {seed_desc}")
+        lines.append("")
+
+        # Summary
+        if state.summary:
+            lines.append("### Summary")
+            lines.append(state.summary)
+            lines.append("")
+
+        # Key findings
+        if state.key_findings:
+            lines.append("### Key Findings")
+            for kf in state.key_findings[:10]:
+                lines.append(f"- {kf}")
+            lines.append("")
+
+        # Open questions
+        if state.open_questions:
+            lines.append("### Open Questions")
+            for oq in state.open_questions[:10]:
+                lines.append(f"- {oq}")
+            lines.append("")
+
+        # Claims (budget-aware)
+        claims = []
+        for cid in state.claim_ids:
+            c = self.get_claim(cid)
+            if c:
+                claims.append(c)
+
+        # Focus prioritization
+        if focus:
+            focus_lower = focus.lower()
+            claims.sort(key=lambda c: (
+                0 if focus_lower in c.subject.id.lower() or focus_lower in c.object.id.lower() else 1,
+                -c.confidence,
+                -c.timestamp,
+            ))
+        else:
+            claims.sort(key=lambda c: (-c.confidence, -c.timestamp))
+
+        # Estimate token budget (rough: 1 claim ≈ 40 tokens, header ≈ 200)
+        header_tokens = len("\n".join(lines)) // 4
+        remaining = max_tokens - header_tokens
+        claims_budget = remaining // 40
+
+        if claims[:claims_budget]:
+            lines.append("### Claims")
+            for c in claims[:claims_budget]:
+                status_tag = f" [{c.status.value}]" if c.status != ClaimStatus.ACTIVE else ""
+                lines.append(
+                    f"- {c.subject.display_name or c.subject.id} "
+                    f"{c.predicate.id} "
+                    f"{c.object.display_name or c.object.id} "
+                    f"(conf={c.confidence:.2f}{status_tag})"
+                )
+            lines.append("")
+
+        # Frontier
+        if state.frontier_entities:
+            lines.append("### Frontier (unexplored edges)")
+            for fe in state.frontier_entities[:10]:
+                lines.append(f"- {fe}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    def list_threads(
+        self,
+        entity_filter: str | None = None,
+        limit: int = 20,
+    ) -> list[dict]:
+        """List existing threads, optionally filtered to threads touching an entity."""
+        results = []
+        # Find all thread entities
+        thread_entities = self.list_entities(entity_type="thread", limit=limit * 5)
+
+        for te in thread_entities:
+            thread_id = te.id
+            state = self._load_thread_state(thread_id)
+            if state is None:
+                continue
+            if entity_filter:
+                ef_lower = normalize_entity_id(entity_filter)
+                if ef_lower not in [normalize_entity_id(s) for s in state.seed_entities]:
+                    # Check entity-thread index
+                    if ef_lower not in self._entity_thread_index.get(ef_lower, set()):
+                        if thread_id not in self._entity_thread_index.get(ef_lower, set()):
+                            continue
+            results.append({
+                "thread_id": thread_id,
+                "seed_entities": state.seed_entities,
+                "summary": state.summary or "",
+                "last_accessed": state.last_accessed,
+                "claim_count": len(state.claim_ids),
+                "frontier_count": len(state.frontier_entities),
+                "parent_thread_id": state.parent_thread_id,
+            })
+            if len(results) >= limit:
+                break
+
+        return results
+
+    # --- Thread internals ---
+
+    def _resolve_thread_seed(self, seed: "str | list[str]") -> list[str]:
+        """Resolve seed input to a list of entity IDs."""
+        if isinstance(seed, list):
+            return seed
+
+        # NL query
+        if seed.startswith("?"):
+            query_text = seed[1:].strip()
+            results = self.search_entities(query_text, top_k=5)
+            return [r.id for r in results]
+
+        # Check if it's an existing entity
+        entity = self._store.get_entity(seed)
+        if entity:
+            return [seed]
+
+        # Normalized lookup
+        normalized = normalize_entity_id(seed)
+        entity = self._store.get_entity(normalized)
+        if entity:
+            return [normalized]
+
+        # Fall back to search
+        results = self.search_entities(seed, top_k=5)
+        return [r.id for r in results]
+
+    def _persist_thread_state(
+        self,
+        state: "ThreadState",
+        seed_entities: list[str],
+        overwrite_id: str | None = None,
+    ) -> None:
+        """Persist a thread state as claims in the graph.
+
+        Uses unique source_ids per persist call to avoid content-level dedup.
+        On overwrite, the old thread claims remain (append-only) but the latest
+        payload wins on load (most recent by timestamp).
+        """
+        from dataclasses import asdict
+        thread_id = overwrite_id or state.thread_id
+        state.thread_id = thread_id
+
+        payload = {
+            "schema_ref": "topic_thread",
+            "data": asdict(state),
+        }
+
+        # Use unique source_id per persist to avoid content-level dedup
+        persist_id = f"thread_engine_{int(time.time() * 1e9)}"
+
+        # Ingest one claim per seed entity (the thread_seeded_by relationships)
+        for i, eid in enumerate(seed_entities[:10]):
+            try:
+                self.ingest(
+                    subject=(thread_id, "thread"),
+                    predicate=("thread_seeded_by", "threads"),
+                    object=(eid, "entity"),
+                    provenance={"source_type": "system", "source_id": persist_id},
+                    confidence=1.0,
+                    payload=payload if i == 0 else None,
+                )
+            except Exception:
+                # Duplicate claim is OK — thread state is carried by the latest payload
+                pass
+
+    def _load_thread_state(self, thread_id: str) -> "ThreadState | None":
+        """Load a thread's state from its most recent claim payload."""
+        from attestdb.core.types import ThreadState
+        claims = self.claims_for(thread_id)
+        # Find the most recent claim with a thread payload (highest timestamp)
+        best = None
+        for c in claims:
+            if c.payload and c.payload.schema_ref == "topic_thread":
+                if best is None or c.timestamp > best.timestamp:
+                    best = c
+        if best is None:
+            return None
+        data = best.payload.data
+        if isinstance(data, dict):
+            return ThreadState(**{
+                k: v for k, v in data.items()
+                if k in ThreadState.__dataclass_fields__
+            })
+        return None
+
+    def _mark_threads_stale(self, entity_id: str) -> None:
+        """Mark threads touching this entity as stale (narrative needs regeneration)."""
+        thread_ids = self._entity_thread_index.get(entity_id, set())
+        for tid in thread_ids:
+            state = self._load_thread_state(tid)
+            if state and not state.stale:
+                state.stale = True
+                self._persist_thread_state(state, state.seed_entities, overwrite_id=tid)
 
     # --- Knowledge-Intelligence APIs ---
 

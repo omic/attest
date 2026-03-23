@@ -13,11 +13,24 @@ class Role(enum.Enum):
     READER = "reader"    # Query only
 
 
+class SensitivityLevel(enum.IntEnum):
+    """Claim sensitivity classification for access control."""
+    SHARED = -1         # Visible across all tenants (public knowledge)
+    PUBLIC = 0          # Visible to all principals with database access
+    INTERNAL = 1        # Visible within the owning org/tenant only
+    CONFIDENTIAL = 2    # Visible to claim owner + explicit ACL + org admins
+    RESTRICTED = 3      # Visible to claim owner + explicit ACL only
+    REDACTED = 4        # Structure visible, content replaced with "[REDACTED]"
+
+
 class ClaimStatus(enum.Enum):
     ACTIVE = "active"
     ARCHIVED = "archived"
     TOMBSTONED = "tombstoned"
     PROVENANCE_DEGRADED = "provenance_degraded"
+    VERIFIED = "verified"
+    VERIFICATION_FAILED = "verification_failed"
+    DISPUTED = "disputed"
 
 
 @dataclass
@@ -51,6 +64,16 @@ class Payload:
 
 
 @dataclass
+class Principal:
+    """Identity for access control decisions."""
+    principal_id: str
+    principal_type: str = "user"  # "user" | "agent" | "api_key" | "org" | "team"
+    org_id: str | None = None
+    roles: list[str] = field(default_factory=list)
+    clearance: SensitivityLevel = SensitivityLevel.PUBLIC
+
+
+@dataclass
 class Claim:
     claim_id: str
     content_id: str
@@ -65,6 +88,10 @@ class Claim:
     status: ClaimStatus = ClaimStatus.ACTIVE
     namespace: str = ""
     expires_at: int = 0  # Nanosecond timestamp. 0 = never expires.
+    # Security fields (Python-only, not persisted in Rust engine)
+    sensitivity: SensitivityLevel = SensitivityLevel.PUBLIC
+    owner: str | None = None
+    acl: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -81,6 +108,10 @@ class ClaimInput:
     external_ids: dict[str, dict[str, str]] | None = None
     namespace: str = ""
     ttl_seconds: int = 0  # Time-to-live in seconds. 0 = never expires.
+    # Security fields
+    sensitivity: SensitivityLevel | None = None  # None = auto-classify
+    owner: str | None = None
+    acl: list[str] | None = None
 
 
 @dataclass
@@ -148,6 +179,103 @@ class BatchResult:
     ingested: int = 0
     duplicates: int = 0
     errors: list[str] = field(default_factory=list)
+
+
+# --- Topic Thread types ---
+
+
+@dataclass
+class ThreadState:
+    """Persisted as a Payload on a thread claim."""
+    thread_id: str
+    seed_entities: list[str]
+    seed_query: str | None = None
+    traversal_depth: int = 2
+    min_confidence: float = 0.5
+    source_filter: list[str] | None = None
+    exclude_source_types: list[str] | None = None
+    claim_ids: list[str] = field(default_factory=list)
+    frontier_entities: list[str] = field(default_factory=list)
+    created_at: int = 0
+    last_accessed: int = 0
+    parent_thread_id: str | None = None
+    summary: str | None = None
+    open_questions: list[str] = field(default_factory=list)
+    key_findings: list[str] = field(default_factory=list)
+    stale: bool = False
+
+
+@dataclass
+class ThreadContext:
+    """Return type for thread operations."""
+    thread_id: str
+    claims: list["Claim"] = field(default_factory=list)
+    summary: str = ""
+    open_questions: list[str] = field(default_factory=list)
+    key_findings: list[str] = field(default_factory=list)
+    frontier: list[EntitySummary] = field(default_factory=list)
+    claim_count: int = 0
+    entity_count: int = 0
+    seed_entities: list[str] = field(default_factory=list)
+    # Diff fields (populated by resume_thread)
+    new_since_last: list["Claim"] = field(default_factory=list)
+    removed_since_last: list[str] = field(default_factory=list)
+
+
+# --- Paper Audit types ---
+
+
+@dataclass
+class PaperContent:
+    """Resolved content from a paper source."""
+    paper_id: str
+    title: str = ""
+    authors: list[str] = field(default_factory=list)
+    abstract: str = ""
+    full_text: str = ""
+    sections: dict[str, str] = field(default_factory=dict)
+    references: list[str] = field(default_factory=list)
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass
+class ClaimAuditDetail:
+    """Per-claim detail in a paper audit."""
+    claim_id: str
+    claim_summary: str = ""
+    verdict: str = ""
+    tier: int = 1
+    cost_usd: float = 0.0
+    section: str = ""
+
+
+@dataclass
+class PaperAuditReport:
+    """Result of auditing a scientific paper."""
+    paper_id: str
+    title: str = ""
+    source: str = ""
+    claims_extracted: int = 0
+    claims_verified: int = 0
+    claims_failed: int = 0
+    claims_disputed: int = 0
+    claims_pending: int = 0
+    overall_score: float = 0.0
+    total_cost_usd: float = 0.0
+    flagged_issues: list[str] = field(default_factory=list)
+    claim_details: list[ClaimAuditDetail] = field(default_factory=list)
+    thread_id: str | None = None
+
+
+@dataclass
+class PipelineResult:
+    """Result of executing a reproducibility pipeline."""
+    success: bool = False
+    output: dict = field(default_factory=dict)
+    execution_time_seconds: float = 0.0
+    environment_hash: str = ""
+    errors: list[str] = field(default_factory=list)
+    cost_usd: float = 0.0
 
 
 # --- Knowledge Topology types ---
@@ -447,6 +575,33 @@ class Prediction:
     is_gap: bool                 # True if no direct connection exists at all
     existing_predicates: list[str] = field(default_factory=list)  # existing non-causal preds
     evidence: list[IndirectEvidence] = field(default_factory=list)  # top paths
+
+
+# --- Verification types ---
+
+
+@dataclass
+class VerificationResult:
+    """Result of a single verification check."""
+    check_name: str           # e.g., "provenance_check", "consistency_check"
+    passed: bool
+    confidence: float         # 0.0–1.0 — how confident the check is
+    evidence: list[str] = field(default_factory=list)   # human-readable evidence
+    claim_ids: list[str] = field(default_factory=list)   # related claims found
+    metadata: dict = field(default_factory=dict)          # check-specific data
+
+
+@dataclass
+class VerificationVerdict:
+    """Aggregated result of the verification pipeline."""
+    verdict: str              # "VERIFIED" | "FAILED" | "DISPUTED"
+    overall_confidence: float
+    check_results: list[VerificationResult] = field(default_factory=list)
+    recommended_status: str = "verified"  # the claim status to transition to
+    tier_used: int = 1
+    total_cost_usd: float = 0.0
+    checks_skipped: list[str] = field(default_factory=list)
+    verification_completeness: float = 1.0  # 1.0 if all checks ran
 
 
 # --- Autonomous research types ---
@@ -1133,6 +1288,13 @@ def _claim_from_dict_inner(d: dict) -> Claim:
     except ValueError:
         status = ClaimStatus.ACTIVE
 
+    # Security fields (Python-only, not in Rust engine)
+    sens_raw = d.get("sensitivity", 0)
+    try:
+        sensitivity = SensitivityLevel(sens_raw) if isinstance(sens_raw, int) else SensitivityLevel[sens_raw.upper()]
+    except (ValueError, KeyError):
+        sensitivity = SensitivityLevel.PUBLIC
+
     return Claim(
         claim_id=d["claim_id"],
         content_id=d["content_id"],
@@ -1146,6 +1308,9 @@ def _claim_from_dict_inner(d: dict) -> Claim:
         status=status,
         namespace=d.get("namespace", ""),
         expires_at=d.get("expires_at", 0),
+        sensitivity=sensitivity,
+        owner=d.get("owner"),
+        acl=d.get("acl", []),
     )
 
 

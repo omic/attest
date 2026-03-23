@@ -2,12 +2,14 @@
 
 BUILT_IN_ENTITY_TYPES: set[str] = {
     "entity", "event", "metric", "document", "agent", "system",
+    "thread",
 }
 
 BUILT_IN_PREDICATE_TYPES: set[str] = {
     "relates_to", "caused", "observed", "derived_from", "contradicts",
     "same_as", "not_same_as", "retracted", "contradiction_resolved", "inquiry",
     "no_evidence_for", "superseded_by",
+    "thread_seeded_by", "thread_branched_from", "thread_extended_by",
 }
 
 # Research predicates — used by multi-agent collaborative research
@@ -25,7 +27,184 @@ OPPOSITE_RESEARCH_PREDICATES: dict[str, str] = {
 BUILT_IN_SOURCE_TYPES: set[str] = {
     "observation", "computation", "document_extraction",
     "llm_inference", "human_annotation", "chat_extraction",
-    "agent",
+    "agent", "system",
+    # Enterprise source types
+    "slack", "email", "meeting_transcript",
+    "claude_chat", "claude_code", "agent_session",
+    "salesforce", "sap", "oracle", "hr_system",
+    "confluence", "notion", "google_docs",
+    "git", "github_issues",
+    "pubmed", "preprint", "paper",
+    "literature_extraction",
+}
+
+
+# ---------------------------------------------------------------------------
+# Enterprise Source Type Registry
+# ---------------------------------------------------------------------------
+
+SOURCE_TYPE_REGISTRY: dict[str, dict] = {
+    # Communication sources
+    "slack": {
+        "trust_baseline": 0.5,
+        "staleness_days": 30,
+        "default_sensitivity": "INTERNAL",
+        "verification_profile": "conversational",
+    },
+    "email": {
+        "trust_baseline": 0.6,
+        "staleness_days": 60,
+        "default_sensitivity": "CONFIDENTIAL",
+        "verification_profile": "conversational",
+    },
+    "meeting_transcript": {
+        "trust_baseline": 0.5,
+        "staleness_days": 14,
+        "default_sensitivity": "INTERNAL",
+        "verification_profile": "conversational",
+    },
+    # AI agent sources
+    "claude_chat": {
+        "trust_baseline": 0.6,
+        "staleness_days": 90,
+        "default_sensitivity": "INTERNAL",
+        "verification_profile": "agent_extracted",
+    },
+    "claude_code": {
+        "trust_baseline": 0.7,
+        "staleness_days": 60,
+        "default_sensitivity": "INTERNAL",
+        "verification_profile": "agent_extracted",
+    },
+    "agent_session": {
+        "trust_baseline": 0.6,
+        "staleness_days": 90,
+        "default_sensitivity": "INTERNAL",
+        "verification_profile": "agent_extracted",
+    },
+    # System of record sources
+    "salesforce": {
+        "trust_baseline": 0.9,
+        "staleness_days": 1,
+        "default_sensitivity": "CONFIDENTIAL",
+        "verification_profile": "system_of_record",
+    },
+    "sap": {
+        "trust_baseline": 0.95,
+        "staleness_days": 1,
+        "default_sensitivity": "CONFIDENTIAL",
+        "verification_profile": "system_of_record",
+    },
+    "oracle": {
+        "trust_baseline": 0.95,
+        "staleness_days": 1,
+        "default_sensitivity": "CONFIDENTIAL",
+        "verification_profile": "system_of_record",
+    },
+    "hr_system": {
+        "trust_baseline": 0.95,
+        "staleness_days": 1,
+        "default_sensitivity": "RESTRICTED",
+        "verification_profile": "system_of_record",
+    },
+    # Documentation sources
+    "confluence": {
+        "trust_baseline": 0.6,
+        "staleness_days": 90,
+        "default_sensitivity": "INTERNAL",
+        "verification_profile": "document",
+    },
+    "notion": {
+        "trust_baseline": 0.6,
+        "staleness_days": 90,
+        "default_sensitivity": "INTERNAL",
+        "verification_profile": "document",
+    },
+    "google_docs": {
+        "trust_baseline": 0.6,
+        "staleness_days": 90,
+        "default_sensitivity": "INTERNAL",
+        "verification_profile": "document",
+    },
+    # Code sources
+    "git": {
+        "trust_baseline": 0.8,
+        "staleness_days": 30,
+        "default_sensitivity": "INTERNAL",
+        "verification_profile": "code",
+    },
+    "github_issues": {
+        "trust_baseline": 0.6,
+        "staleness_days": 30,
+        "default_sensitivity": "INTERNAL",
+        "verification_profile": "conversational",
+    },
+    # Scientific sources
+    "pubmed": {
+        "trust_baseline": 0.7,
+        "staleness_days": None,
+        "default_sensitivity": "PUBLIC",
+        "verification_profile": "scientific",
+    },
+    "preprint": {
+        "trust_baseline": 0.5,
+        "staleness_days": None,
+        "default_sensitivity": "PUBLIC",
+        "verification_profile": "scientific",
+    },
+    # Defaults for generic types
+    "observation": {
+        "trust_baseline": 0.6,
+        "staleness_days": 90,
+        "default_sensitivity": "PUBLIC",
+        "verification_profile": "document",
+    },
+}
+
+
+VERIFICATION_PROFILES: dict[str, dict] = {
+    "scientific": {
+        "tier_1_checks": ["provenance_check", "consistency_check"],
+        "tier_2_checks": ["corroboration_search", "statistical_audit"],
+        "tier_3_checks": ["reproducibility_gate"],
+        "staleness_check": False,
+        "max_tier": 3,
+    },
+    "conversational": {
+        "tier_1_checks": ["provenance_check", "consistency_check", "staleness_check"],
+        "tier_2_checks": ["corroboration_search", "contradiction_scan"],
+        "tier_3_checks": [],
+        "staleness_check": True,
+        "max_tier": 2,
+    },
+    "agent_extracted": {
+        "tier_1_checks": ["provenance_check", "consistency_check", "staleness_check"],
+        "tier_2_checks": ["corroboration_search", "confidence_decay_check"],
+        "tier_3_checks": [],
+        "staleness_check": True,
+        "max_tier": 2,
+    },
+    "system_of_record": {
+        "tier_1_checks": ["provenance_check", "freshness_check"],
+        "tier_2_checks": [],
+        "tier_3_checks": [],
+        "staleness_check": True,
+        "max_tier": 1,
+    },
+    "document": {
+        "tier_1_checks": ["provenance_check", "consistency_check", "staleness_check"],
+        "tier_2_checks": ["corroboration_search"],
+        "tier_3_checks": [],
+        "staleness_check": True,
+        "max_tier": 2,
+    },
+    "code": {
+        "tier_1_checks": ["provenance_check", "consistency_check", "staleness_check"],
+        "tier_2_checks": ["corroboration_search"],
+        "tier_3_checks": [],
+        "staleness_check": True,
+        "max_tier": 2,
+    },
 }
 
 # Predicates with special engine semantics

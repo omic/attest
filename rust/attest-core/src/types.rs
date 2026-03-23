@@ -11,6 +11,9 @@ pub enum ClaimStatus {
     Archived,
     Tombstoned,
     ProvenanceDegraded,
+    Verified,
+    VerificationFailed,
+    Disputed,
 }
 
 impl Default for ClaimStatus {
@@ -27,6 +30,9 @@ impl ClaimStatus {
             Self::Archived => "archived",
             Self::Tombstoned => "tombstoned",
             Self::ProvenanceDegraded => "provenance_degraded",
+            Self::Verified => "verified",
+            Self::VerificationFailed => "verification_failed",
+            Self::Disputed => "disputed",
         }
     }
 }
@@ -40,6 +46,9 @@ impl std::str::FromStr for ClaimStatus {
             "archived" => Ok(Self::Archived),
             "tombstoned" => Ok(Self::Tombstoned),
             "provenance_degraded" => Ok(Self::ProvenanceDegraded),
+            "verified" => Ok(Self::Verified),
+            "verification_failed" => Ok(Self::VerificationFailed),
+            "disputed" => Ok(Self::Disputed),
             _ => Err(format!("unknown ClaimStatus: {s}")),
         }
     }

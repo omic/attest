@@ -676,6 +676,9 @@ fn parse_status(s: &str) -> Result<ClaimStatus, AttestError> {
         "archived" => Ok(ClaimStatus::Archived),
         "tombstoned" | "retracted" => Ok(ClaimStatus::Tombstoned),
         "provenance_degraded" | "degraded" => Ok(ClaimStatus::ProvenanceDegraded),
+        "verified" => Ok(ClaimStatus::Verified),
+        "verification_failed" | "failed" => Ok(ClaimStatus::VerificationFailed),
+        "disputed" => Ok(ClaimStatus::Disputed),
         _ => Err(AttestError::Validation(format!("Unknown claim status: {}", s))),
     }
 }
