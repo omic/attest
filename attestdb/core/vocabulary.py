@@ -100,16 +100,34 @@ PREDICATE_COMPOSITION: dict[tuple[str, str], str] = {
     ("prevents", "inhibits"): "activates",
     ("prevents", "causes"): "prevents",
     ("prevents", "prevents"): "causes",
-    # increases / decreases
+    # increases / decreases (full cross with up/downregulates)
     ("increases", "activates"): "activates",
     ("increases", "inhibits"): "inhibits",
+    ("increases", "upregulates"): "upregulates",
+    ("increases", "downregulates"): "downregulates",
     ("decreases", "activates"): "inhibits",
     ("decreases", "inhibits"): "activates",
-    # enables / blocks
+    ("decreases", "upregulates"): "downregulates",
+    ("decreases", "downregulates"): "upregulates",
+    # enables / blocks (full cross)
     ("enables", "activates"): "activates",
     ("enables", "inhibits"): "inhibits",
+    ("enables", "upregulates"): "upregulates",
+    ("enables", "downregulates"): "downregulates",
     ("blocks", "activates"): "inhibits",
     ("blocks", "inhibits"): "activates",
+    ("blocks", "upregulates"): "downregulates",
+    ("blocks", "downregulates"): "upregulates",
+    # promotes / suppresses cross with up/downregulates
+    ("promotes", "upregulates"): "upregulates",
+    ("promotes", "downregulates"): "downregulates",
+    ("suppresses", "upregulates"): "downregulates",
+    ("suppresses", "downregulates"): "upregulates",
+    # stabilizes / destabilizes
+    ("stabilizes", "activates"): "activates",
+    ("stabilizes", "inhibits"): "inhibits",
+    ("destabilizes", "activates"): "inhibits",
+    ("destabilizes", "inhibits"): "activates",
     # regulates — non-directional, preserves the other predicate's direction
     ("regulates", "activates"): "regulates",
     ("regulates", "inhibits"): "regulates",

@@ -136,6 +136,154 @@ impl RustStore {
         self.backend.outgoing_causal_edges(entity_id, causal_predicates)
     }
 
+    /// Rust-native causal composition prediction. Performs the full 2-hop BFS
+    /// with predicate composition, hub-skip, contradictory leg filter, and
+    /// convergent evidence scoring — entirely in Rust for sub-second performance.
+    ///
+    /// Returns Vec of (target_id, composed_predicate, supporting_count, opposing_count,
+    ///                  is_gap, intermediary_count).
+    pub fn predict_causal(
+        &self,
+        entity_id: &str,
+        causal_predicates: &HashSet<String>,
+        composition: &HashMap<(String, String), String>,
+        opposites: &HashMap<String, String>,
+        max_intermediaries: usize,
+        min_paths: usize,
+        hub_max_claims: usize,
+    ) -> Vec<(String, String, usize, usize, bool, usize)> {
+        // 1. Get outgoing causal edges from source
+        let edges = self.backend.outgoing_causal_edges(entity_id, causal_predicates);
+
+        // Build neighbor map: prefer directional over "regulates"
+        let mut outgoing: HashMap<String, (String, f64)> = HashMap::new();
+        let mut neighbor_preds: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut direct_neighbors: HashSet<String> = HashSet::new();
+
+        for (target, pred, conf) in &edges {
+            if target == entity_id { continue; }
+            direct_neighbors.insert(target.clone());
+            neighbor_preds.entry(target.clone()).or_default().insert(pred.clone());
+
+            if let Some((existing_pred, existing_conf)) = outgoing.get(target) {
+                // Prefer directional over "regulates"
+                if existing_pred == "regulates" && pred != "regulates" {
+                    outgoing.insert(target.clone(), (pred.clone(), *conf));
+                } else if pred != "regulates" && conf > existing_conf {
+                    outgoing.insert(target.clone(), (pred.clone(), *conf));
+                } else if existing_pred != "regulates" && pred == "regulates" {
+                    // keep existing
+                } else if conf > existing_conf {
+                    outgoing.insert(target.clone(), (pred.clone(), *conf));
+                }
+            } else {
+                outgoing.insert(target.clone(), (pred.clone(), *conf));
+            }
+        }
+
+        // Also collect ALL direct neighbors via adjacency for gap detection
+        // (fast — uses adjacency index, no claim loading)
+        // We'll use path_exists per-target instead for accuracy
+
+        // Contradictory leg filter
+        let mut clean: Vec<(String, String, f64)> = Vec::new();
+        for (mid, (pred, conf)) in &outgoing {
+            let preds = neighbor_preds.get(mid).cloned().unwrap_or_default();
+            let has_contradiction = preds.iter().any(|p| {
+                opposites.get(p).map_or(false, |opp| preds.contains(opp))
+            });
+            if !has_contradiction {
+                clean.push((mid.clone(), pred.clone(), *conf));
+            }
+        }
+
+        // Sort by confidence descending
+        clean.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+        // 2. Two-hop BFS through intermediaries
+        // target -> {composed_pred -> set of intermediary IDs}
+        let mut target_preds: HashMap<String, HashMap<String, HashSet<String>>> = HashMap::new();
+        let mut checked = 0usize;
+
+        for (mid, pred1, _conf1) in &clean {
+            if checked >= max_intermediaries { break; }
+
+            // Hub-skip: check claim count
+            if let Some(entity) = self.backend.get_entity(mid) {
+                if entity.claim_count > hub_max_claims { continue; }
+            }
+            checked += 1;
+
+            // Get outgoing causal edges from intermediary
+            let mid_edges = self.backend.outgoing_causal_edges(mid, causal_predicates);
+
+            for (target, pred2, _conf2) in &mid_edges {
+                if target == entity_id || target == mid { continue; }
+
+                // Compose predicates
+                let key = (pred1.clone(), pred2.clone());
+                let composed = if let Some(c) = composition.get(&key) {
+                    c.clone()
+                } else if pred1 == pred2 {
+                    pred1.clone()
+                } else {
+                    continue; // no composition rule
+                };
+
+                if composed == "associated_with" { continue; }
+
+                // Skip if this predicate already exists directly
+                if let Some(existing) = neighbor_preds.get(target) {
+                    if existing.contains(&composed) { continue; }
+                }
+
+                target_preds.entry(target.clone())
+                    .or_default()
+                    .entry(composed)
+                    .or_default()
+                    .insert(mid.clone());
+            }
+        }
+
+        // 3. Score and filter
+        let mut results: Vec<(String, String, usize, usize, bool, usize)> = Vec::new();
+
+        for (target, pred_map) in &target_preds {
+            for (pred, mids) in pred_map {
+                let supporting = mids.len();
+                if supporting < min_paths { continue; }
+
+                // Count opposing
+                let opp_pred = opposites.get(pred).cloned().unwrap_or_default();
+                let opposing = pred_map.get(&opp_pred).map_or(0, |s| s.len());
+
+                if supporting <= opposing { continue; }
+
+                // Gap detection: check if target is a direct neighbor
+                // (without alias resolution — faster than path_exists)
+                let is_gap = !direct_neighbors.contains(target);
+
+                results.push((
+                    target.clone(),
+                    pred.clone(),
+                    supporting,
+                    opposing,
+                    is_gap,
+                    supporting, // intermediary count = unique mids = supporting
+                ));
+            }
+        }
+
+        // Sort: gaps first, then by supporting count
+        results.sort_by(|a, b| {
+            b.4.cmp(&a.4) // is_gap (true first)
+                .then(b.2.cmp(&a.2)) // supporting count
+                .then(a.3.cmp(&b.3)) // opposing count (fewer is better)
+        });
+
+        results
+    }
+
     /// Reset the union-find alias table and rebuild from remaining same_as claims.
     pub fn clear_aliases(&mut self) -> Result<(), AttestError> {
         if self.read_only { return Err(AttestError::ReadOnly); }

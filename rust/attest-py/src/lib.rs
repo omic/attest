@@ -4,7 +4,7 @@
 //! Complex types (Claim, EntitySummary) are marshalled as Python dicts;
 //! a Python-side adapter reconstructs the proper dataclass instances.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -851,6 +851,26 @@ impl PyRustStore {
     fn outgoing_causal_edges(&self, entity_id: &str, causal_predicates: Vec<String>) -> Vec<(String, String, f64)> {
         let predset: std::collections::HashSet<String> = causal_predicates.into_iter().collect();
         self.inner.outgoing_causal_edges(entity_id, &predset)
+    }
+
+    /// Rust-native causal composition prediction. Performs the full 2-hop BFS
+    /// with predicate composition, hub-skip, and contradictory leg filter entirely
+    /// in Rust. Returns list of (target_id, predicate, supporting, opposing, is_gap, intermediaries).
+    fn predict_causal(
+        &self,
+        entity_id: &str,
+        causal_predicates: Vec<String>,
+        composition: HashMap<(String, String), String>,
+        opposites: HashMap<String, String>,
+        max_intermediaries: usize,
+        min_paths: usize,
+        hub_max_claims: usize,
+    ) -> Vec<(String, String, usize, usize, bool, usize)> {
+        let pred_set: HashSet<String> = causal_predicates.into_iter().collect();
+        self.inner.predict_causal(
+            entity_id, &pred_set, &composition, &opposites,
+            max_intermediaries, min_paths, hub_max_claims,
+        )
     }
 
     /// Reset the union-find alias table and rebuild from remaining same_as claims.
