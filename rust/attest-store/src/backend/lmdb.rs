@@ -43,6 +43,13 @@ const META_KEY_METADATA: &str = "metadata";
 const META_KEY_SCHEMA_VERSION: &str = "schema_version";
 const META_KEY_NEXT_SEQ: &str = "next_seq";
 
+/// Causal predicates that get indexed in causal_adj for fast composition lookups.
+const CAUSAL_PREDICATES: &[&str] = &[
+    "activates", "inhibits", "upregulates", "downregulates", "regulates",
+    "promotes", "suppresses", "increases", "decreases",
+    "causes", "prevents", "enables", "blocks",
+];
+
 /// Current schema version.
 const CURRENT_SCHEMA_VERSION: u32 = 3;
 
@@ -184,6 +191,8 @@ struct LmdbDatabases {
     entity_src_counts: Database<Str, Bytes>,
     // "{predicate_id}\x1F{subject_id}\x1F{object_id}" → bytes(count:u64 ++ sum_conf:f64) — O(1) find_contradictions
     pred_pair_counts: Database<Str, Bytes>,
+    // "{subject_id}\x1F{predicate_id}" → object_id (DUP_SORT) — O(1) causal neighbor lookup
+    causal_adj: Database<Str, Str>,
 }
 
 /// File-backed storage backend using LMDB.
@@ -447,6 +456,7 @@ impl LmdbBackend {
             namespace_idx: Self::create_dup_db::<Str, U64<BE>>(env, &mut wtxn, "namespace_idx")?,
             entity_type_idx: Self::create_dup_db::<Str, Str>(env, &mut wtxn, "entity_type_idx")?,
             text_idx: Self::create_dup_db::<Str, Str>(env, &mut wtxn, "text_idx")?,
+            causal_adj: Self::create_dup_db::<Str, Str>(env, &mut wtxn, "causal_adj")?,
         };
 
         wtxn.commit().map_err(|e| lmdb_err("commit", e))?;
@@ -693,6 +703,15 @@ impl LmdbBackend {
                 .map_err(|e| lmdb_err("put adjacency_idx", e))?;
         }
 
+        // CAUSAL_ADJ — directional causal neighbor index for fast predict()
+        // Only indexes claims where predicate is causal and subject→object direction
+        if CAUSAL_PREDICATES.contains(&claim.predicate.id.as_str()) && obj_fits {
+            let key = format!("{}\x1F{}", &claim.subject.id, &claim.predicate.id);
+            if key.len() <= LMDB_MAX_KEY {
+                let _ = self.dbs.causal_adj.put(wtxn, &key, &claim.object.id);
+            }
+        }
+
         // TIMESTAMP_IDX
         self.dbs.timestamp_idx.put(wtxn, &claim.timestamp, &seq)
             .map_err(|e| lmdb_err("put timestamp_idx", e))?;
@@ -925,6 +944,55 @@ impl LmdbBackend {
     }
 
     // ── Public Lifecycle ──────────────────────────────────────────────
+
+    /// Rebuild the causal_adj index from existing claims.
+    /// One-time operation for databases created before the index existed.
+    pub fn rebuild_causal_adj(&mut self) -> Result<usize, AttestError> {
+        if self.read_only { return Err(AttestError::ReadOnly); }
+
+        let rtxn = self.env().read_txn()
+            .map_err(|e| lmdb_err("rebuild read", e))?;
+
+        // Collect all causal claims
+        let mut entries: Vec<(String, String, String)> = Vec::new(); // (subject, predicate, object)
+        for pred in CAUSAL_PREDICATES {
+            let seqs = LmdbBackend::collect_seqs_for_key(&rtxn, &self.dbs.predicate_idx, pred);
+            for seq in seqs {
+                let claim_bytes = match self.dbs.claims.get(&rtxn, &seq) {
+                    Ok(Some(b)) => b.to_vec(),
+                    _ => continue,
+                };
+                let claim = match Self::decompress_claim(&claim_bytes) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                if claim.object.id.len() <= LMDB_MAX_KEY {
+                    entries.push((claim.subject.id.clone(), claim.predicate.id.clone(), claim.object.id.clone()));
+                }
+            }
+        }
+        drop(rtxn);
+
+        // Write in chunks
+        let total = entries.len();
+        const CHUNK: usize = 100_000;
+        let mut written = 0;
+
+        for chunk in entries.chunks(CHUNK) {
+            let mut wtxn = self.env().write_txn()
+                .map_err(|e| lmdb_err("rebuild write", e))?;
+            for (subj, pred, obj) in chunk {
+                let key = format!("{}\x1F{}", subj, pred);
+                if key.len() <= LMDB_MAX_KEY {
+                    let _ = self.dbs.causal_adj.put(&mut wtxn, &key, obj);
+                    written += 1;
+                }
+            }
+            wtxn.commit().map_err(|e| lmdb_err("rebuild commit", e))?;
+        }
+
+        Ok(written)
+    }
 
     pub fn close(&mut self) -> Result<(), AttestError> {
         self.flush_in_memory_state()?;
@@ -1706,9 +1774,9 @@ impl LmdbBackend {
         false
     }
 
-    /// Get outgoing causal edges for an entity — lightweight, no full claim deserialization.
-    /// Returns Vec<(target_entity_id, predicate_id, confidence)> for claims where entity_id
-    /// is the SUBJECT and predicate_id is in the provided set.
+    /// Get outgoing causal edges for an entity — uses causal_adj index when available,
+    /// falls back to full claim scan otherwise.
+    /// Returns Vec<(target_entity_id, predicate_id, confidence)>.
     pub fn outgoing_causal_edges(
         &self,
         entity_id: &str,
@@ -1719,8 +1787,28 @@ impl LmdbBackend {
             Err(_) => return Vec::new(),
         };
 
-        let seqs = LmdbBackend::collect_seqs_for_key(&rtxn, &self.dbs.entity_claims_idx, entity_id);
+        // Fast path: use causal_adj index (no claim deserialization!)
         let mut results = Vec::new();
+        let mut used_index = false;
+
+        for pred in causal_predicates {
+            let key = format!("{}\x1F{}", entity_id, pred);
+            if let Ok(Some(iter)) = self.dbs.causal_adj.get_duplicates(&rtxn, &key) {
+                for item in iter {
+                    if let Ok((_, target)) = item {
+                        results.push((target.to_string(), pred.clone(), 0.65));
+                        used_index = true;
+                    }
+                }
+            }
+        }
+
+        if used_index {
+            return results;
+        }
+
+        // Slow fallback: scan all claims for entity
+        let seqs = LmdbBackend::collect_seqs_for_key(&rtxn, &self.dbs.entity_claims_idx, entity_id);
 
         for seq in seqs {
             let claim_bytes = match self.dbs.claims.get(&rtxn, &seq) {
@@ -1732,7 +1820,6 @@ impl LmdbBackend {
                 Err(_) => continue,
             };
 
-            // Only outgoing edges with causal predicates
             if claim.subject.id != entity_id { continue; }
             if !causal_predicates.contains(&claim.predicate.id) { continue; }
             if !self.should_include_claim(&claim.claim_id) { continue; }

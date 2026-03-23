@@ -47,6 +47,13 @@ impl StorageBackend for Backend {
         }
     }
 
+    fn rebuild_causal_adj(&mut self) -> Result<usize, AttestError> {
+        match self {
+            Backend::InMemory(_) => Ok(0),
+            Backend::Lmdb(l) => l.rebuild_causal_adj(),
+        }
+    }
+
     fn clear_aliases(&mut self) -> Result<(), AttestError> {
         match self {
             Backend::InMemory(_) => Ok(()),

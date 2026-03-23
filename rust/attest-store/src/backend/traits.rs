@@ -25,6 +25,11 @@ pub trait StorageBackend {
     /// Write a full checkpoint without releasing the lock.
     fn checkpoint(&mut self) -> Result<(), AttestError>;
 
+    /// Rebuild the causal_adj index from existing claims.
+    fn rebuild_causal_adj(&mut self) -> Result<usize, AttestError> {
+        Ok(0)
+    }
+
     /// Reset the union-find alias table.
     fn clear_aliases(&mut self) -> Result<(), AttestError> {
         Ok(())

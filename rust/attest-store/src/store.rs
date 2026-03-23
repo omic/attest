@@ -284,6 +284,12 @@ impl RustStore {
         results
     }
 
+    /// Rebuild the causal_adj index from existing claims.
+    pub fn rebuild_causal_adj(&mut self) -> Result<usize, AttestError> {
+        if self.read_only { return Err(AttestError::ReadOnly); }
+        self.backend.rebuild_causal_adj()
+    }
+
     /// Reset the union-find alias table and rebuild from remaining same_as claims.
     pub fn clear_aliases(&mut self) -> Result<(), AttestError> {
         if self.read_only { return Err(AttestError::ReadOnly); }

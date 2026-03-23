@@ -873,6 +873,13 @@ impl PyRustStore {
         )
     }
 
+    /// Rebuild the causal_adj index from existing claims.
+    /// One-time operation for databases created before the index existed.
+    fn rebuild_causal_adj(&mut self) -> PyResult<usize> {
+        self.inner.rebuild_causal_adj()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
     /// Reset the union-find alias table and rebuild from remaining same_as claims.
     /// Call after purge_source() when same_as claims were purged.
     fn clear_aliases(&mut self) -> PyResult<()> {
