@@ -5970,6 +5970,40 @@ class BulkLoader:
                      len(entities), len(claim_rows), time.time() - t0)
         return result
 
+    # --- Domain loaders (delegated to domain-specific modules) ---
+
+    def load_courtlistener(self, *args, **kwargs):
+        from attestdb.infrastructure.bulk_loaders_legal import load_courtlistener_citations as _fn
+        return _fn(self._pipeline, *args, **kwargs)
+
+    def load_us_code(self, *args, **kwargs):
+        from attestdb.infrastructure.bulk_loaders_legal import load_us_code_sections as _fn
+        return _fn(self._pipeline, *args, **kwargs)
+
+    def load_federal_register_legal(self, *args, **kwargs):
+        from attestdb.infrastructure.bulk_loaders_legal import load_federal_register_legal as _fn
+        return _fn(self._pipeline, *args, **kwargs)
+
+    def load_faers(self, *args, **kwargs):
+        from attestdb.infrastructure.bulk_loaders_pharma import load_faers as _fn
+        return _fn(self._pipeline, *args, **kwargs)
+
+    def load_fda_safety(self, *args, **kwargs):
+        from attestdb.infrastructure.bulk_loaders_pharma import load_fda_safety_communications as _fn
+        return _fn(self._pipeline, *args, **kwargs)
+
+    def load_drug_withdrawals(self, *args, **kwargs):
+        from attestdb.infrastructure.bulk_loaders_pharma import load_drug_withdrawals as _fn
+        return _fn(self._pipeline, *args, **kwargs)
+
+    def load_sec_enforcement(self, *args, **kwargs):
+        from attestdb.infrastructure.bulk_loaders_finreg import load_sec_enforcement as _fn
+        return _fn(self._pipeline, *args, **kwargs)
+
+    def load_federal_register_rules(self, *args, **kwargs):
+        from attestdb.infrastructure.bulk_loaders_finreg import load_federal_register_rules as _fn
+        return _fn(self._pipeline, *args, **kwargs)
+
     def load_all(
         self,
         dest_dir: str,
@@ -6438,3 +6472,33 @@ class BulkLoader:
 
         return name_map
 
+
+# --- Standalone helpers for domain loader modules ---
+# These mirror BulkLoader class methods but accept pipeline as first arg,
+# so domain-specific loader modules can call them without a BulkLoader instance.
+
+
+def _ingest_append_direct_fn(pipeline, entities, claim_rows, timestamp):
+    """Standalone bulk insert — used by domain loader modules."""
+    store = pipeline._store
+    if hasattr(store, "insert_bulk"):
+        CHUNK = 500_000
+        total = 0
+        for i in range(0, len(claim_rows), CHUNK):
+            chunk = claim_rows[i:i + CHUNK]
+            total += store.insert_bulk(entities, chunk, timestamp)
+            if i + CHUNK < len(claim_rows):
+                logger.info("  bulk insert progress: %d/%d", i + CHUNK, len(claim_rows))
+        return BatchResult(ingested=total)
+    return BatchResult(ingested=0)
+
+
+def _register_entities_fn(pipeline, entities, timestamp):
+    """Standalone entity registration — used by domain loader modules."""
+    store = pipeline._store
+    if hasattr(store, "upsert_entities_batch"):
+        return store.upsert_entities_batch(entities, timestamp)
+    if hasattr(store, "insert_bulk"):
+        store.insert_bulk(entities, [], timestamp)
+        return len(entities)
+    return 0

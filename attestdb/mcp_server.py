@@ -719,6 +719,22 @@ def attest_corroboration(min_sources: int = 2) -> str:
 
 
 @mcp.tool()
+def attest_diagnose_corroboration(content_id: str) -> str:
+    """Show how corroboration is counted for a content_id. Useful for debugging inflation.
+
+    Returns external ID clustering vs provenance overlap breakdown, making it
+    visible when the same paper ingested via multiple paths inflates counts.
+
+    Args:
+        content_id: The content_id to diagnose (SHA-256 of subject+predicate+object)
+    """
+    _track_tool_call("attest_diagnose_corroboration", content_id)
+    db = _get_db()
+    result = db.diagnose_corroboration(content_id)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
 def attest_fragile(max_sources: int = 1, min_age_days: int = 0) -> str:
     """Find claims backed by few independent sources."""
     db = _get_db()
@@ -1295,6 +1311,72 @@ def attest_sweep_stale(
     """
     db = _get_db()
     result = db.sweep_stale(dry_run=dry_run, source_type=source_type)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def attest_archive(
+    dry_run: bool = True,
+    claim_ids: Optional[list] = None,
+    status: Optional[list] = None,
+    max_age_days: Optional[int] = None,
+) -> str:
+    """Archive claims to remove them from default queries while preserving history.
+
+    Archived claims are excluded from normal queries but remain queryable with
+    include_archived=True. Use for cleaning up degraded or failed claims.
+
+    dry_run=True (default): report what would be archived without changing anything.
+    dry_run=False: actually archive the claims.
+
+    Args:
+        dry_run: If True, preview only. If False, apply archival.
+        claim_ids: Specific claim IDs to archive (explicit mode).
+        status: Status filter for criteria mode (e.g. ["provenance_degraded", "verification_failed"]).
+        max_age_days: Only archive claims older than this many days.
+    """
+    _track_tool_call("attest_archive", f"dry_run={dry_run}")
+    db = _get_db()
+    criteria = None
+    if status or max_age_days is not None:
+        criteria = {}
+        if status:
+            criteria["status"] = status
+        if max_age_days is not None:
+            criteria["max_age_days"] = max_age_days
+    result = db.archive(claim_ids=claim_ids, criteria=criteria, dry_run=dry_run)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def attest_graph_stats() -> str:
+    """Report graph statistics: total claims by status, archival candidates.
+
+    Shows claim counts per status, source type breakdown, and how many claims
+    would be archived by auto_archive.
+    """
+    _track_tool_call("attest_graph_stats", "")
+    db = _get_db()
+
+    status_counts: dict[str, int] = {}
+    source_type_counts: dict[str, int] = {}
+    total = 0
+    for claim in db.iter_claims():
+        total += 1
+        s = claim.status.value
+        status_counts[s] = status_counts.get(s, 0) + 1
+        st = claim.provenance.source_type
+        source_type_counts[st] = source_type_counts.get(st, 0) + 1
+
+    # Preview auto-archive candidates
+    auto_preview = db.auto_archive(dry_run=True)
+
+    result = {
+        "total_claims": total,
+        "by_status": status_counts,
+        "by_source_type": dict(sorted(source_type_counts.items(), key=lambda x: -x[1])[:20]),
+        "auto_archive_candidates": auto_preview["archived_count"],
+    }
     return json.dumps(result, indent=2)
 
 

@@ -15,6 +15,7 @@ from attestdb.core.confidence import (
 )
 from attestdb.core.errors import (
     CircularProvenanceError,
+    ClaimRejectedByQualityGateError,
     DimensionalityError,
     DuplicateClaimError,
     PredicateConstraintError,
@@ -71,12 +72,30 @@ class IngestionPipeline:
         self._valid_entity_types: set[str] | None = None
         self._valid_pred_types: set[str] | None = None
         self._valid_source_types: set[str] | None = None
+        # Quality gate callbacks: run after structural validation, before persist
+        self._quality_gates: list[tuple[callable, str]] = []  # (gate_fn, name)
 
     def invalidate_vocab_caches(self) -> None:
         """Clear cached vocabulary type sets. Called by AttestDB.register_vocabulary()."""
         self._valid_entity_types = None
         self._valid_pred_types = None
         self._valid_source_types = None
+
+    def register_quality_gate(self, gate: callable, name: str = "") -> None:
+        """Register a quality gate callback.
+
+        Gates run in registration order after structural validation (all 13
+        rules) but before persistence. A claim must pass ALL gates to be
+        ingested.
+
+        gate: callable that takes a ClaimInput and returns:
+          ("accept", None) — claim passes this gate
+          ("reject", "reason") — claim is rejected, not ingested
+          ("flag", "reason") — claim is ingested but flagged in metadata
+        name: optional name for logging/debugging
+        """
+        self._quality_gates.append((gate, name or f"gate_{len(self._quality_gates)}"))
+        logger.info("Registered quality gate: %s", name or f"gate_{len(self._quality_gates) - 1}")
 
     def _get_valid_entity_types(self) -> set[str]:
         if self._valid_entity_types is None:
@@ -374,6 +393,20 @@ class IngestionPipeline:
         """Ingest a single claim, applying all 13 validation rules. Returns claim_id."""
         claim, embedding = self._validate_and_build(claim_input)
 
+        # Quality gates — run after structural validation, before persistence
+        for gate_fn, gate_name in self._quality_gates:
+            decision, reason = gate_fn(claim_input)
+            if decision == "reject":
+                raise ClaimRejectedByQualityGateError(
+                    f"Claim rejected by quality gate '{gate_name}': {reason}"
+                )
+            elif decision == "flag":
+                if claim.payload is None:
+                    claim.payload = Payload(schema_ref="", data={})
+                flags = claim.payload.data.get("quality_flags", [])
+                flags.append(reason)
+                claim.payload.data["quality_flags"] = flags
+
         # Rule 5: Corroboration tracking
         existing = self._store.claims_by_content_id(claim.content_id)
         if existing:
@@ -488,3 +521,31 @@ class IngestionPipeline:
                     on_ingested(claim.claim_id)
 
         return result
+
+
+# ---------------------------------------------------------------------------
+# Built-in quality gates
+# ---------------------------------------------------------------------------
+
+
+def min_entity_length_gate(min_chars: int = 2) -> callable:
+    """Reject claims where subject or object entity IDs are too short."""
+    def gate(claim_input: ClaimInput) -> tuple[str, str | None]:
+        subj_id = claim_input.subject[0]
+        obj_id = claim_input.object[0]
+        if len(subj_id) < min_chars or len(obj_id) < min_chars:
+            return ("reject", f"Entity ID too short (min {min_chars} chars)")
+        return ("accept", None)
+    return gate
+
+
+def no_self_reference_gate() -> callable:
+    """Reject claims where subject and object are the same entity."""
+    def gate(claim_input: ClaimInput) -> tuple[str, str | None]:
+        from attestdb.core.normalization import normalize_entity_id
+        subj_norm = normalize_entity_id(claim_input.subject[0])
+        obj_norm = normalize_entity_id(claim_input.object[0])
+        if subj_norm == obj_norm:
+            return ("reject", "Self-referencing claim (subject == object)")
+        return ("accept", None)
+    return gate

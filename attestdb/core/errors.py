@@ -35,3 +35,7 @@ class DimensionalityError(AttestError):
 
 class EntityNotFoundError(AttestError):
     """Entity not found in the database."""
+
+
+class ClaimRejectedByQualityGateError(AttestError):
+    """Claim rejected by a quality gate callback during ingestion."""

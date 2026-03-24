@@ -483,6 +483,33 @@ impl RustStore {
         self.backend.claims_for(entity_id, predicate_type, source_type, min_confidence)
     }
 
+    /// Get claims for an entity, optionally including inverse-derived claims.
+    pub fn claims_for_with_inverse(
+        &mut self,
+        entity_id: &str,
+        predicate_type: Option<&str>,
+        source_type: Option<&str>,
+        min_confidence: f64,
+        include_inverse: bool,
+    ) -> Vec<Claim> {
+        self.backend.claims_for_with_inverse(entity_id, predicate_type, source_type, min_confidence, include_inverse)
+    }
+
+    /// Compute transitive closure over causal predicates.
+    pub fn transitive_closure(
+        &mut self,
+        entity_id: &str,
+        predicates: &std::collections::HashSet<String>,
+        max_depth: usize,
+    ) -> Vec<(String, String, usize, f64)> {
+        self.backend.transitive_closure(entity_id, predicates, max_depth)
+    }
+
+    /// Get corroboration count for a content_id.
+    pub fn corroboration_count(&self, content_id: &str) -> u32 {
+        self.backend.corroboration_count(content_id)
+    }
+
     /// Get the provenance chain for a claim.
     pub fn get_claim_provenance_chain(&self, claim_id: &str) -> Vec<String> {
         self.backend.get_claim_provenance_chain(claim_id)

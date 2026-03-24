@@ -500,6 +500,38 @@ impl PyRustStore {
         Ok(list.into())
     }
 
+    /// Get claims for an entity, optionally including inverse-derived claims.
+    fn claims_for_with_inverse<'py>(
+        &mut self,
+        entity_id: &str,
+        predicate_type: Option<&str>,
+        source_type: Option<&str>,
+        min_confidence: f64,
+        include_inverse: bool,
+        py: Python<'py>,
+    ) -> PyResult<PyObject> {
+        let claims = self.inner.claims_for_with_inverse(
+            entity_id, predicate_type, source_type, min_confidence, include_inverse,
+        );
+        let list = PyList::empty(py);
+        for c in &claims {
+            list.append(claim_to_dict(py, c)?)?;
+        }
+        Ok(list.into())
+    }
+
+    /// Compute transitive closure over causal predicates.
+    /// Returns list of (target_entity_id, composed_predicate, depth, confidence).
+    fn transitive_closure(&mut self, entity_id: &str, causal_predicates: Vec<String>, max_depth: usize) -> Vec<(String, String, usize, f64)> {
+        let predset: std::collections::HashSet<String> = causal_predicates.into_iter().collect();
+        self.inner.transitive_closure(entity_id, &predset, max_depth)
+    }
+
+    /// Get corroboration count for a content_id.
+    fn corroboration_count(&self, content_id: &str) -> u32 {
+        self.inner.corroboration_count(content_id)
+    }
+
     fn get_claim_provenance_chain(&self, claim_id: &str) -> Vec<String> {
         self.inner.get_claim_provenance_chain(claim_id)
     }

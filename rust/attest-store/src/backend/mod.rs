@@ -79,6 +79,39 @@ impl StorageBackend for Backend {
         }
     }
 
+    fn claims_for_with_inverse(
+        &mut self,
+        entity_id: &str,
+        predicate_type: Option<&str>,
+        source_type: Option<&str>,
+        min_confidence: f64,
+        include_inverse: bool,
+    ) -> Vec<attest_core::types::Claim> {
+        match self {
+            Backend::InMemory(m) => m.claims_for_with_inverse(entity_id, predicate_type, source_type, min_confidence, include_inverse),
+            Backend::Lmdb(_l) => Vec::new(), // TODO: implement for LMDB
+        }
+    }
+
+    fn transitive_closure(
+        &mut self,
+        entity_id: &str,
+        predicates: &std::collections::HashSet<String>,
+        max_depth: usize,
+    ) -> Vec<(String, String, usize, f64)> {
+        match self {
+            Backend::InMemory(m) => m.transitive_closure(entity_id, predicates, max_depth),
+            Backend::Lmdb(_l) => Vec::new(), // TODO: implement for LMDB
+        }
+    }
+
+    fn corroboration_count(&self, content_id: &str) -> u32 {
+        match self {
+            Backend::InMemory(m) => m.corroboration_count(content_id),
+            Backend::Lmdb(_l) => 1, // TODO: implement for LMDB
+        }
+    }
+
     fn compact(&mut self) -> Result<bool, AttestError> {
         match self {
             Backend::InMemory(_) => Ok(false),

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import builtins
 import hashlib
-import hmac
 import json
 import logging
 import os
@@ -12,9 +11,7 @@ import shutil
 import tempfile
 import threading
 import time
-import uuid
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -443,28 +440,38 @@ class AttestDB:
         instance._multi_embedding_index = None
         instance._embedding_index = None
         instance._pipeline = None
+        instance._py_status_overrides = {}
+        instance._load_py_status_overrides()
+
+        def _converting(d):
+            claim = claim_from_dict(d)
+            override = instance._py_status_overrides.get(claim.claim_id)
+            if override is not None:
+                claim.status = override
+            return claim
         instance._query_engine = QueryEngine(
             instance._store,
-            claim_converter=lambda d: claim_from_dict(d),
+            claim_converter=_converting,
         )
-        instance._event_hooks = {}
+        # Composed subsystem objects (read-only: minimal setup)
+        from attestdb.infrastructure.audit_log import AuditLog
+        from attestdb.infrastructure.webhooks import WebhookManager
+        from attestdb.infrastructure.rbac import RBACManager
+        from attestdb.infrastructure.event_bus import EventBus
+
+        instance._audit = AuditLog(db_path, True)  # read-only = in-memory audit
+        instance._webhooks_mgr = WebhookManager(None)
+        instance._rbac_mgr = RBACManager(None, instance._audit, lambda: instance._store.get_namespace_filter())
+        instance._events = EventBus(instance._webhooks_mgr, lambda cid: instance.get_claim(cid))
+
         instance._scheduler = None
         instance._purge_timer = None
         instance._purge_interval = 0
-        instance._webhooks = []
-        instance._webhooks_path = None
-        instance._webhook_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="attest-webhook")
         instance._chain_log = []
         instance._last_chain_hash = "genesis"
-        instance._actor = ""
-        instance._audit_path = None
-        instance._rbac = {}
-        instance._rbac_path = None
-        instance._rbac_enabled = False
         instance._autodidact = None
         instance._federation = None
         instance._decay_config = None
-        instance._subscriptions = {}
         instance._trust_policy = None
         instance._curator = None
         instance._text_extractor = None
@@ -547,11 +554,36 @@ class AttestDB:
             self._store, self._embedding_index, embedding_dim, strict
         )
 
-        # Query engine — Rust engine handles status filtering natively
-        self._query_engine = QueryEngine(self._store, claim_converter=claim_from_dict)
+        # Python-level status overlays for statuses the Rust fast path doesn't track.
+        # The Rust engine's apply_status_overlay_fast only handles tombstoned via
+        # retracted_ids HashSet. Other status overlays (archived, disputed, etc.) are
+        # only read by get_claim() (which checks the LMDB status_overrides table).
+        # For bulk reads (claims_for, all_claims), we apply the overlay in Python.
+        self._py_status_overrides: dict[str, ClaimStatus] = {}
+        self._load_py_status_overrides()
 
-        # Event hooks
-        self._event_hooks: dict[str, list] = {}
+        # Query engine — converter applies Python-level status overlays
+        def _converting(d):
+            claim = claim_from_dict(d)
+            override = self._py_status_overrides.get(claim.claim_id)
+            if override is not None:
+                claim.status = override
+            return claim
+        self._query_engine = QueryEngine(self._store, claim_converter=_converting)
+
+        # Composed subsystem objects
+        from attestdb.infrastructure.audit_log import AuditLog
+        from attestdb.infrastructure.webhooks import WebhookManager
+        from attestdb.infrastructure.rbac import RBACManager
+        from attestdb.infrastructure.event_bus import EventBus
+
+        is_memory = self._is_memory_db
+        self._audit = AuditLog(self._db_path, is_memory)
+        webhooks_path = None if is_memory else self._db_path + ".webhooks.json"
+        self._webhooks_mgr = WebhookManager(webhooks_path)
+        rbac_path = None if is_memory else self._db_path + ".rbac.json"
+        self._rbac_mgr = RBACManager(rbac_path, self._audit, lambda: self._store.get_namespace_filter())
+        self._events = EventBus(self._webhooks_mgr, lambda cid: self.get_claim(cid))
 
         # Continuous ingestion scheduler (lazy-init)
         self._scheduler = None
@@ -560,32 +592,10 @@ class AttestDB:
         self._purge_timer: threading.Timer | None = None
         self._purge_interval: float = 0
 
-        # Webhook registrations
-        self._webhooks: list[dict] = []
-        self._webhooks_path: str | None = None
-        self._webhook_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="attest-webhook")
-        if not self._is_memory_db:
-            self._webhooks_path = self._db_path + ".webhooks.json"
-            self._load_webhooks()
-
         # Tamper-evident audit chain (Merkle hash chain over claim IDs)
         self._chain_log: list[tuple[str, str]] = []  # [(claim_id, chain_hash), ...]
         self._last_chain_hash: str = "genesis"
         self._load_chain_log()
-
-        # Audit log (append-only JSONL)
-        self._actor: str = ""
-        self._audit_path: str | None = None
-        if not self._is_memory_db:
-            self._audit_path = self._db_path + ".audit.jsonl"
-
-        # RBAC (per-namespace role-based access control)
-        self._rbac: dict[str, dict[str, str]] = {}  # {principal: {namespace: role}}
-        self._rbac_path: str | None = None
-        self._rbac_enabled: bool = False
-        if not self._is_memory_db:
-            self._rbac_path = self._db_path + ".rbac.json"
-            self._load_rbac()
 
         # Entity aliases (runtime synonym table)
         self._load_entity_aliases()
@@ -602,9 +612,6 @@ class AttestDB:
         # Verification budget (per-session cost tracking)
         self._verification_budget: float | None = None  # None = no limit
         self._verification_spent: float = 0.0
-
-        # Topic subscriptions (in-memory session state)
-        self._subscriptions: dict[str, dict] = {}
 
         # Trust policy (in-memory session state)
         self._trust_policy: list | None = None
@@ -785,6 +792,40 @@ class AttestDB:
         except Exception as e:
             logger.warning("Failed to migrate retraction sidecar: %s", e)
 
+    def _load_py_status_overrides(self) -> None:
+        """Load non-tombstone status overrides from Rust store into Python dict.
+
+        The Rust engine's fast overlay path only handles tombstoned claims via
+        an in-memory HashSet. Other status overlays (archived, verification_failed,
+        etc.) are stored in the LMDB status_overrides table but only read by
+        get_claim(). This method bootstraps a Python-side dict so that bulk read
+        paths (query engine, iter_claims) can apply the full overlay.
+        """
+        if not hasattr(self._store, 'get_status_overrides'):
+            return
+        try:
+            overrides = self._store.get_status_overrides()
+            for claim_id, status_str in overrides.items():
+                if status_str != "tombstoned":  # tombstoned handled by Rust fast path
+                    try:
+                        self._py_status_overrides[claim_id] = ClaimStatus(status_str)
+                    except ValueError:
+                        pass
+        except Exception:
+            pass  # Graceful degradation — overlays will be applied per get_claim
+
+    def _update_py_status_overlay(self, claim_id: str, status: str) -> None:
+        """Track a status change in the Python overlay dict."""
+        if status == "tombstoned":
+            self._py_status_overrides.pop(claim_id, None)
+        elif status == "active":
+            self._py_status_overrides.pop(claim_id, None)
+        else:
+            try:
+                self._py_status_overrides[claim_id] = ClaimStatus(status)
+            except ValueError:
+                pass
+
     # --- Embedding provider ---
 
     def configure_embeddings(self, provider: str = "openai", **kwargs) -> None:
@@ -873,6 +914,11 @@ class AttestDB:
         return self._decay_config
 
     # --- Tamper-evident chain ---
+
+    @property
+    def ingestion_pipeline(self) -> IngestionPipeline:
+        """Access the ingestion pipeline for registering quality gates."""
+        return self._pipeline
 
     @property
     def _is_memory_db(self) -> bool:
@@ -1005,7 +1051,7 @@ class AttestDB:
                 if self._scheduler:
                     self._scheduler.stop_all()
                     self._scheduler = None
-                self._webhook_executor.shutdown(wait=False)
+                self._webhooks_mgr.shutdown()
                 self._flush_chain_log()
                 if self._multi_embedding_index and len(self._multi_embedding_index) > 0:
                     self._multi_embedding_index.save(self._db_path)
@@ -1054,24 +1100,11 @@ class AttestDB:
         All subsequent mutations (ingest, retract, etc.) will be
         attributed to this actor in the audit log.
         """
-        self._actor = actor
+        self._audit.set_actor(actor)
 
     def _audit_write(self, event: str, **kwargs) -> None:
         """Append an audit event to the JSONL log."""
-        if not self._audit_path:
-            return
-
-        entry = {
-            "event": event,
-            "timestamp": int(time.time() * 1_000_000_000),
-            "actor": self._actor,
-            **kwargs,
-        }
-        try:
-            with builtins.open(self._audit_path, "a") as f:
-                f.write(json.dumps(entry, default=str) + "\n")
-        except Exception as exc:
-            logger.warning("Failed to write audit event: %s", exc)
+        self._audit.write(event, **kwargs)
 
     def audit_log(
         self,
@@ -1091,74 +1124,18 @@ class AttestDB:
         Returns:
             List of AuditEvent, oldest first.
         """
-        if not self._audit_path or not os.path.exists(self._audit_path):
-            return []
-        events = []
-        with builtins.open(self._audit_path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    d = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                ts = d.get("timestamp", 0)
-                if ts <= since:
-                    continue
-                if event_type and d.get("event") != event_type:
-                    continue
-                if actor and d.get("actor") != actor:
-                    continue
-                evt = d.get("event", "")
-                events.append(AuditEvent(
-                    event=evt,
-                    timestamp=ts,
-                    actor=d.get("actor", ""),
-                    claim_id=d.get("claim_id", ""),
-                    source_id=d.get("source_id", ""),
-                    namespace=d.get("namespace", ""),
-                    details={k: v for k, v in d.items()
-                             if k not in ("event", "timestamp", "actor",
-                                          "claim_id", "source_id", "namespace")},
-                ))
-                if len(events) >= limit:
-                    break
-        return events
+        return self._audit.query(since, event_type, actor, limit)
 
     # --- RBAC (role-based access control) ---
-
-    def _load_rbac(self) -> None:
-        """Load RBAC config from sidecar file."""
-        if self._rbac_path and os.path.exists(self._rbac_path):
-            try:
-                with builtins.open(self._rbac_path) as f:
-                    data = json.load(f)
-                self._rbac = data.get("grants", {})
-                self._rbac_enabled = data.get("enabled", False)
-            except Exception as exc:
-                logger.warning("Failed to load RBAC config: %s", exc)
-
-    def _save_rbac(self) -> None:
-        """Persist RBAC config to sidecar file."""
-        if not self._rbac_path:
-            return
-        try:
-            with builtins.open(self._rbac_path, "w") as f:
-                json.dump({"enabled": self._rbac_enabled, "grants": self._rbac}, f, indent=2)
-        except Exception as exc:
-            logger.warning("Failed to save RBAC config: %s", exc)
 
     def enable_rbac(self) -> None:
         """Enable RBAC enforcement. Once enabled, all mutations require a
         matching grant for the current actor + active namespace."""
-        self._rbac_enabled = True
-        self._save_rbac()
+        self._rbac_mgr.enable()
 
     def disable_rbac(self) -> None:
         """Disable RBAC enforcement (all operations permitted)."""
-        self._rbac_enabled = False
-        self._save_rbac()
+        self._rbac_mgr.disable()
 
     def grant(self, principal: str, namespace: str, role: str | Role) -> None:
         """Grant a role to a principal on a namespace.
@@ -1173,15 +1150,7 @@ class AttestDB:
             db.grant("alice@corp.com", "team_a", "writer")
             db.grant("bob@corp.com", "*", "admin")
         """
-        if isinstance(role, Role):
-            role = role.value
-        if role not in ("admin", "writer", "reader"):
-            raise ValueError(f"Invalid role: {role}. Must be admin, writer, or reader.")
-        self._check_permission("admin")
-        grants = self._rbac.setdefault(principal, {})
-        grants[namespace] = role
-        self._save_rbac()
-        self._audit_write("rbac_grant", principal=principal, namespace=namespace, role=role)
+        self._rbac_mgr.grant(principal, namespace, role)
 
     def revoke(self, principal: str, namespace: str) -> None:
         """Revoke a principal's access to a namespace.
@@ -1190,60 +1159,25 @@ class AttestDB:
             principal: User or service identity.
             namespace: Namespace to revoke. Use "*" to revoke global access.
         """
-        self._check_permission("admin")
-        grants = self._rbac.get(principal, {})
-        grants.pop(namespace, None)
-        if not grants:
-            self._rbac.pop(principal, None)
-        self._save_rbac()
-        self._audit_write("rbac_revoke", principal=principal, namespace=namespace)
+        self._rbac_mgr.revoke(principal, namespace)
 
     def list_grants(self, principal: str | None = None) -> dict:
         """List all RBAC grants, optionally filtered by principal.
 
         Returns dict: {principal: {namespace: role}}.
         """
-        if principal:
-            grants = self._rbac.get(principal, {})
-            return {principal: grants} if grants else {}
-        return dict(self._rbac)
+        return self._rbac_mgr.list_grants(principal)
 
     def _get_actor_role(self, namespace: str = "") -> str | None:
         """Get the current actor's effective role for a namespace."""
-        if not self._actor:
-            return None
-        grants = self._rbac.get(self._actor, {})
-        # Check specific namespace first, then wildcard
-        role = grants.get(namespace) or grants.get("*")
-        return role
+        return self._rbac_mgr.get_actor_role(namespace)
 
     def _check_permission(self, required_role: str) -> None:
         """Raise PermissionError if RBAC is enabled and actor lacks permission.
 
         Role hierarchy: admin > writer > reader.
         """
-        if not self._rbac_enabled:
-            return
-        if not self._actor:
-            raise PermissionError("RBAC is enabled but no actor set. Call db.set_actor() first.")
-
-        # Determine effective namespace
-        ns_filter = self._store.get_namespace_filter()
-        namespace = ns_filter[0] if len(ns_filter) == 1 else ""
-
-        role = self._get_actor_role(namespace)
-        if role is None:
-            raise PermissionError(
-                f"Actor '{self._actor}' has no access to namespace '{namespace or '*'}'."
-            )
-
-        hierarchy = {"admin": 3, "writer": 2, "reader": 1}
-        required_level = hierarchy.get(required_role, 0)
-        actual_level = hierarchy.get(role, 0)
-        if actual_level < required_level:
-            raise PermissionError(
-                f"Actor '{self._actor}' has role '{role}' but '{required_role}' is required."
-            )
+        self._rbac_mgr.check_permission(required_role)
 
     def _set_include_retracted(self, include: bool) -> None:
         """Set retraction visibility on the Rust store."""
@@ -1304,40 +1238,15 @@ class AttestDB:
         Returns:
             Subscription ID (use to unsubscribe).
         """
-        sub_id = str(uuid.uuid4())
-        self._subscriptions[sub_id] = {
-            "subscriber_id": subscriber_id,
-            "topics": {normalize_entity_id(t) for t in topics},
-            "callback": callback,
-            "predicates": set(predicates) if predicates else None,
-            "min_confidence": min_confidence,
-        }
-        return sub_id
+        return self._events.subscribe(subscriber_id, topics, callback, predicates, min_confidence)
 
     def unsubscribe(self, sub_id: str) -> bool:
         """Remove a subscription. Returns True if it existed."""
-        return self._subscriptions.pop(sub_id, None) is not None
+        return self._events.unsubscribe(sub_id)
 
     def _check_subscriptions(self, claim_id: str, claim_input: ClaimInput) -> None:
         """Check all subscriptions against a newly ingested claim."""
-        if not self._subscriptions:
-            return
-        subj_id = normalize_entity_id(claim_input.subject[0])
-        obj_id = normalize_entity_id(claim_input.object[0])
-        pred_id = claim_input.predicate[0]
-        conf = claim_input.confidence if claim_input.confidence is not None else 0.5
-        # Build a lightweight claim dict for callbacks
-        claim = claim_from_dict(self._store.get_claim(claim_id)) if claim_id else None
-        for sub_id, sub in list(self._subscriptions.items()):
-            if conf < sub["min_confidence"]:
-                continue
-            if sub["predicates"] is not None and pred_id not in sub["predicates"]:
-                continue
-            if subj_id in sub["topics"] or obj_id in sub["topics"]:
-                try:
-                    sub["callback"](claim, sub_id, sub["subscriber_id"])
-                except Exception as exc:
-                    logger.warning("Subscription %s callback failed: %s", sub_id, exc)
+        self._events.check_subscriptions(claim_id, claim_input)
 
     # --- Hypothetical reasoning ---
 
@@ -1460,37 +1369,17 @@ class AttestDB:
         "sync_completed", "insight_alerts", "autodidact_cycle_completed",
         "autodidact_budget_exhausted"
         """
-        self._event_hooks.setdefault(event, []).append(callback)
+        self._events.on(event, callback)
 
     def off(self, event: str, callback) -> None:
         """Remove a registered callback."""
-        hooks = self._event_hooks.get(event, [])
-        if callback in hooks:
-            hooks.remove(callback)
+        self._events.off(event, callback)
 
     def _fire(self, event: str, **kwargs) -> None:
         """Fire all callbacks for an event and POST to registered webhooks."""
-        for cb in self._event_hooks.get(event, []):
-            try:
-                cb(**kwargs)
-            except Exception as exc:
-                logger.warning("Event hook %s failed: %s", event, exc)
-        self._fire_webhooks(event, kwargs)
+        self._events.fire(event, **kwargs)
 
     # --- Webhooks ---
-
-    def _load_webhooks(self) -> None:
-        if self._webhooks_path and os.path.exists(self._webhooks_path):
-            try:
-                with builtins.open(self._webhooks_path) as f:
-                    self._webhooks = json.load(f)
-            except Exception:
-                self._webhooks = []
-
-    def _save_webhooks(self) -> None:
-        if self._webhooks_path:
-            with builtins.open(self._webhooks_path, "w") as f:
-                json.dump(self._webhooks, f)
 
     def register_webhook(
         self, url: str, events: list[str] | None = None, secret: str | None = None,
@@ -1502,60 +1391,15 @@ class AttestDB:
             events: List of event names to subscribe to. None = all events.
             secret: Optional HMAC-SHA256 secret for payload signing.
         """
-        # Remove existing registration for same URL
-        self._webhooks = [w for w in self._webhooks if w["url"] != url]
-        self._webhooks.append({
-            "url": url,
-            "events": events,
-            "secret": secret,
-        })
-        self._save_webhooks()
+        self._webhooks_mgr.register(url, events, secret)
 
     def remove_webhook(self, url: str) -> bool:
         """Remove a registered webhook by URL. Returns True if found."""
-        before = len(self._webhooks)
-        self._webhooks = [w for w in self._webhooks if w["url"] != url]
-        if len(self._webhooks) < before:
-            self._save_webhooks()
-            return True
-        return False
+        return self._webhooks_mgr.remove(url)
 
     def list_webhooks(self) -> list[dict]:
         """Return registered webhooks (secrets are masked)."""
-        return [
-            {"url": w["url"], "events": w["events"], "has_secret": bool(w.get("secret"))}
-            for w in self._webhooks
-        ]
-
-    def _fire_webhooks(self, event: str, data: dict) -> None:
-        """POST event payload to matching webhook URLs (fire-and-forget, non-blocking)."""
-        if not self._webhooks:
-            return
-        try:
-            import requests as _requests
-        except ImportError:
-            return
-        payload = json.dumps({"event": event, "data": {k: str(v) for k, v in data.items()}})
-        for wh in self._webhooks:
-            if wh["events"] is not None and event not in wh["events"]:
-                continue
-            headers = {"Content-Type": "application/json"}
-            if wh.get("secret"):
-                sig = hmac.new(
-                    wh["secret"].encode(), payload.encode(), hashlib.sha256,
-                ).hexdigest()
-                headers["X-Attest-Signature"] = sig
-            self._webhook_executor.submit(
-                self._post_webhook, _requests, wh["url"], payload, headers,
-            )
-
-    @staticmethod
-    def _post_webhook(requests_mod, url: str, payload: str, headers: dict) -> None:
-        """Execute a single webhook POST (runs in thread pool)."""
-        try:
-            requests_mod.post(url, data=payload, headers=headers, timeout=5)
-        except Exception as exc:
-            logger.warning("Webhook POST to %s failed: %s", url, exc)
+        return self._webhooks_mgr.list()
 
     # --- Auto-purge ---
 
@@ -1999,8 +1843,8 @@ class AttestDB:
                 sensitivity = self._security.default_sensitivity
 
             # Set owner from actor if not specified
-            if owner is None and self._actor:
-                owner = self._actor
+            if owner is None and self._audit.actor:
+                owner = self._audit.actor
 
             # Persist security metadata
             self._set_claim_security(claim_id, sensitivity, owner, acl or [])
@@ -2075,6 +1919,7 @@ class AttestDB:
         llm_narrative: bool = False,
         confidence_threshold: float = 0.0,
         predicate_types: list[str] | None = None,
+        include_archived: bool = False,
     ) -> ContextFrame:
         with _span("attestdb.query", {"focal_entity": focal_entity, "depth": depth}):
             frame = self._query_engine.query(
@@ -2082,6 +1927,7 @@ class AttestDB:
                 max_claims, max_tokens,
                 confidence_threshold=confidence_threshold,
                 predicate_types=predicate_types,
+                include_archived=include_archived,
             )
             _set_attr("claim_count", frame.claim_count)
             _set_attr("relationship_count", len(frame.direct_relationships))
@@ -3229,6 +3075,53 @@ class AttestDB:
         self._cache_ts[cache_key] = time.time()
         return result
 
+    def diagnose_corroboration(self, content_id: str) -> dict:
+        """Show how corroboration is counted for a specific content_id.
+
+        Returns a breakdown of external ID clustering vs provenance overlap
+        grouping, making corroboration inflation visible and debuggable.
+        """
+        from attestdb.core.confidence import (
+            _extract_external_id,
+            _count_by_provenance_overlap,
+            count_independent_sources,
+        )
+
+        raw = self._store.claims_by_content_id(content_id)
+        claims = [claim_from_dict(d) for d in raw]
+
+        # Reproduce the two-pass logic with full detail
+        external_id_groups: dict[str, list] = {}
+        unclustered: list = []
+        claim_details: list[dict] = []
+
+        for claim in claims:
+            ext_id = _extract_external_id(claim)
+            detail = {
+                "claim_id": claim.claim_id,
+                "source_id": claim.provenance.source_id,
+                "source_type": claim.provenance.source_type,
+                "external_id": ext_id,
+                "provenance_chain": claim.provenance.chain,
+            }
+            claim_details.append(detail)
+            if ext_id:
+                external_id_groups.setdefault(ext_id, []).append(claim)
+            else:
+                unclustered.append(claim)
+
+        provenance_overlap_groups = _count_by_provenance_overlap(unclustered) if unclustered else 0
+
+        return {
+            "content_id": content_id,
+            "total_claims": len(claims),
+            "external_id_groups": {k: len(v) for k, v in external_id_groups.items()},
+            "unclustered_claims": len(unclustered),
+            "provenance_overlap_groups": provenance_overlap_groups,
+            "final_independent_count": count_independent_sources(claims),
+            "claims": claim_details,
+        }
+
     def claims_for_predicate(self, predicate_id: str) -> list[Claim]:
         """Return all claims with the given predicate id via Rust index (O(k))."""
         claims = [claim_from_dict(d) for d in self._store.claims_by_predicate_id(predicate_id)]
@@ -3458,6 +3351,135 @@ class AttestDB:
         deleted = self._store.purge_source(source_id)
         self._invalidate_cache()
         return deleted
+
+    # --- Archival lifecycle ---
+
+    def archive(
+        self,
+        claim_ids: list[str] | None = None,
+        criteria: dict | None = None,
+        dry_run: bool = True,
+    ) -> dict:
+        """Move claims from active graph to archived status.
+
+        Two modes:
+        1. Explicit: pass claim_ids to archive specific claims
+        2. Criteria-based: pass criteria dict to archive matching claims
+
+        criteria options:
+            status: list[str] — archive claims with these statuses
+                (default: ["provenance_degraded", "verification_failed"])
+            max_age_days: int — archive claims older than this
+                (only applies to claims matching status filter)
+            max_confidence: float — archive claims below this confidence
+            source_types: list[str] — only archive from these source types
+            exclude_verified: bool — never archive VERIFIED claims (default: True)
+
+        dry_run: if True, return what would be archived without changing anything.
+        """
+        self._check_permission("admin")
+
+        exclude_verified = True
+        if criteria:
+            exclude_verified = criteria.get("exclude_verified", True)
+
+        # Collect candidate claim IDs
+        candidates: list[Claim] = []
+        if claim_ids:
+            for cid in claim_ids:
+                claim = self.get_claim(cid)
+                if claim is not None:
+                    candidates.append(claim)
+        elif criteria:
+            status_filter = set(criteria.get("status", ["provenance_degraded", "verification_failed"]))
+            max_age_days = criteria.get("max_age_days")
+            max_confidence = criteria.get("max_confidence")
+            source_types = set(criteria.get("source_types", []))
+            now_ns = int(time.time() * 1_000_000_000)
+            age_cutoff_ns = now_ns - (max_age_days * 86400 * 1_000_000_000) if max_age_days is not None else 0
+
+            for claim in self.iter_claims():
+                # Re-fetch via get_claim to pick up status overlays
+                full_claim = self.get_claim(claim.claim_id)
+                if full_claim is None:
+                    continue
+                if full_claim.status.value not in status_filter:
+                    continue
+                if max_age_days is not None and full_claim.timestamp > age_cutoff_ns:
+                    continue  # too recent
+                if max_confidence is not None and full_claim.confidence > max_confidence:
+                    continue
+                if source_types and full_claim.provenance.source_type not in source_types:
+                    continue
+                candidates.append(full_claim)
+        else:
+            return {"archived_count": 0, "archived_claim_ids": [], "skipped_count": 0, "dry_run": dry_run}
+
+        # Filter out protected claims
+        protected_statuses = set()
+        if exclude_verified:
+            protected_statuses.add(ClaimStatus.VERIFIED)
+
+        archived_ids: list[str] = []
+        skipped = 0
+        for claim in candidates:
+            if claim.status in protected_statuses:
+                skipped += 1
+                continue
+            if claim.status == ClaimStatus.ARCHIVED:
+                skipped += 1
+                continue  # already archived
+            archived_ids.append(claim.claim_id)
+
+        if not dry_run and archived_ids:
+            updates = [(cid, "archived") for cid in archived_ids]
+            self._store.update_claim_status_batch(updates)
+            for cid in archived_ids:
+                self._update_py_status_overlay(cid, "archived")
+            self._invalidate_cache()
+            for cid in archived_ids:
+                self._audit_write("claim_archived", claim_id=cid)
+
+        return {
+            "archived_count": len(archived_ids),
+            "archived_claim_ids": archived_ids,
+            "skipped_count": skipped,
+            "dry_run": dry_run,
+        }
+
+    def auto_archive(self, dry_run: bool = True) -> dict:
+        """Run automatic archival based on default thresholds.
+
+        Archives:
+        - PROVENANCE_DEGRADED claims older than 90 days
+        - VERIFICATION_FAILED claims older than 30 days
+
+        Respects protected claims (verified are never archived).
+        Designed to run daily via cron or scheduler.
+        """
+        degraded_result = self.archive(
+            criteria={
+                "status": ["provenance_degraded"],
+                "max_age_days": 90,
+                "exclude_verified": True,
+            },
+            dry_run=dry_run,
+        )
+        failed_result = self.archive(
+            criteria={
+                "status": ["verification_failed"],
+                "max_age_days": 30,
+                "exclude_verified": True,
+            },
+            dry_run=dry_run,
+        )
+        all_ids = degraded_result["archived_claim_ids"] + failed_result["archived_claim_ids"]
+        return {
+            "archived_count": len(all_ids),
+            "archived_claim_ids": all_ids,
+            "skipped_count": degraded_result["skipped_count"] + failed_result["skipped_count"],
+            "dry_run": dry_run,
+        }
 
     def retract_cascade(self, source_id: str, reason: str) -> CascadeResult:
         """Retract all claims from a source and mark downstream dependents as degraded."""
@@ -5916,6 +5938,172 @@ class AttestDB:
 
     # --- Topic Threads ---
 
+    @staticmethod
+    def _format_claim_oneliner(c: "Claim") -> str:
+        """Format a claim as a single-line string."""
+        subj = c.subject.display_name or c.subject.id
+        obj = c.object.display_name or c.object.id
+        return f"{subj} {c.predicate.id} {obj}"
+
+    @staticmethod
+    def _select_key_findings(
+        claims: list,
+        target: int = 3,
+        max_count: int = 10,
+        initial_threshold: float = 0.8,
+        floor: float = 0.4,
+    ) -> tuple[list, float]:
+        """Select key findings with adaptive confidence threshold.
+
+        Starts at initial_threshold, lowers by 0.1 until at least `target`
+        findings are found or the floor is reached.
+
+        Returns (findings, threshold_used).
+        """
+        threshold = initial_threshold
+        while threshold >= floor:
+            findings = [c for c in claims if c.confidence >= threshold]
+            if len(findings) >= target:
+                findings.sort(key=lambda c: c.confidence, reverse=True)
+                return findings[:max_count], threshold
+            threshold = round(threshold - 0.1, 2)
+        # Below floor: return whatever we have
+        findings = sorted(claims, key=lambda c: c.confidence, reverse=True)[:max_count]
+        effective = findings[-1].confidence if findings else 0.0
+        return findings, effective
+
+    def _build_contradiction_details(
+        self,
+        contradictions: list,
+        claims_dict: dict,
+    ) -> list[dict]:
+        """Build structured contradiction details with evidence counts and confidence."""
+        details = []
+        for ctr in contradictions:
+            claim_a = claims_dict.get(ctr.claim_a) or self.get_claim(ctr.claim_a)
+            claim_b = claims_dict.get(ctr.claim_b) or self.get_claim(ctr.claim_b)
+            if not claim_a or not claim_b:
+                continue
+
+            evidence_a = ctr.evidence_a
+            evidence_b = ctr.evidence_b
+            conf_a = claim_a.confidence
+            conf_b = claim_b.confidence
+
+            # If evidence counts weren't populated, estimate from source counts
+            if evidence_a == 0:
+                evidence_a = max(1, getattr(claim_a, 'n_independent_sources', 1) or 1)
+            if evidence_b == 0:
+                evidence_b = max(1, getattr(claim_b, 'n_independent_sources', 1) or 1)
+
+            # Determine resolution status
+            if ctr.status != "unresolved":
+                status = ctr.status
+            elif conf_a > conf_b and evidence_a > evidence_b:
+                status = "a_preferred"
+            elif conf_b > conf_a and evidence_b > evidence_a:
+                status = "b_preferred"
+            elif conf_a > conf_b + 0.2:
+                status = "a_preferred"
+            elif conf_b > conf_a + 0.2:
+                status = "b_preferred"
+            else:
+                status = "unresolved"
+
+            summary_a = self._format_claim_oneliner(claim_a)
+            summary_b = self._format_claim_oneliner(claim_b)
+
+            details.append({
+                "description": ctr.description,
+                "claim_a_summary": summary_a,
+                "claim_b_summary": summary_b,
+                "confidence_a": round(conf_a, 2),
+                "confidence_b": round(conf_b, 2),
+                "evidence_a": evidence_a,
+                "evidence_b": evidence_b,
+                "status": status,
+            })
+        return details
+
+    def _generate_thread_synthesis(
+        self,
+        key_findings: list,
+        contradiction_details: list[dict],
+        seed_entities: list[str],
+        claim_count: int,
+        entity_count: int,
+    ) -> str:
+        """Generate a narrative synthesis of a thread via LLM.
+
+        Falls back to structural summary when no LLM provider is configured
+        or on any error.
+        """
+        if self._curator_model == "heuristic":
+            return self._structural_thread_summary(
+                key_findings, contradiction_details, seed_entities,
+                claim_count, entity_count,
+            )
+
+        try:
+            extractor = self._get_text_extractor()
+            client = extractor._client
+            model = extractor._llm_model
+            if not client or not model:
+                raise ValueError("No LLM client available")
+
+            findings_text = "\n".join(
+                f"- {self._format_claim_oneliner(f)} (conf={f.confidence:.2f})"
+                for f in key_findings[:10]
+            ) or "(none)"
+
+            contradictions_text = "\n".join(
+                f"- {c['claim_a_summary']} vs {c['claim_b_summary']} ({c['status']})"
+                for c in contradiction_details[:5]
+            ) or "(none)"
+
+            prompt = (
+                "Summarize the following research thread in 2-3 sentences. "
+                "Focus on: what is established, what is contested, and what is unknown.\n\n"
+                f"Topic: {', '.join(seed_entities[:5])}\n\n"
+                f"Key findings:\n{findings_text}\n\n"
+                f"Contradictions:\n{contradictions_text}\n\n"
+                "Write a concise scientific summary. No preamble."
+            )
+
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=200,
+            )
+            text = resp.choices[0].message.content
+            if text and text.strip():
+                return text.strip()
+        except Exception:
+            pass
+
+        return self._structural_thread_summary(
+            key_findings, contradiction_details, seed_entities,
+            claim_count, entity_count,
+        )
+
+    @staticmethod
+    def _structural_thread_summary(
+        key_findings: list,
+        contradiction_details: list[dict],
+        seed_entities: list[str],
+        claim_count: int,
+        entity_count: int,
+    ) -> str:
+        """Structural metadata summary (no LLM)."""
+        parts = [f"Thread covering {entity_count} entities with {claim_count} claims."]
+        if seed_entities:
+            parts.append(f"Seeded from: {', '.join(seed_entities[:5])}")
+        if key_findings:
+            parts.append(f"{len(key_findings)} key findings.")
+        if contradiction_details:
+            parts.append(f"{len(contradiction_details)} contradictions.")
+        return " ".join(parts)
+
     def create_thread(
         self,
         seed: "str | list[str]",
@@ -5985,18 +6173,22 @@ class AttestDB:
         claims_list = list(all_claims.values())
         claim_ids = [c.claim_id for c in claims_list]
 
-        # Extract narrative metadata
+        # Extract narrative metadata — adaptive key findings
+        finding_claims, findings_threshold = self._select_key_findings(claims_list)
         key_findings = []
-        for c in sorted(claims_list, key=lambda x: -x.confidence)[:20]:
-            if c.confidence >= 0.8:
-                status_tag = f" [{c.status.value}]" if c.status != ClaimStatus.ACTIVE else ""
-                key_findings.append(
-                    f"{c.subject.display_name or c.subject.id} "
-                    f"{c.predicate.id} "
-                    f"{c.object.display_name or c.object.id} "
-                    f"(conf={c.confidence:.2f}{status_tag})"
-                )
-        key_findings = key_findings[:10]
+        for c in finding_claims:
+            status_tag = f" [{c.status.value}]" if c.status != ClaimStatus.ACTIVE else ""
+            key_findings.append(
+                f"{c.subject.display_name or c.subject.id} "
+                f"{c.predicate.id} "
+                f"{c.object.display_name or c.object.id} "
+                f"(conf={c.confidence:.2f}{status_tag})"
+            )
+
+        # Build structured contradiction details
+        contradiction_details = self._build_contradiction_details(
+            all_contradictions, all_claims,
+        )
 
         open_questions = []
         for ctr in all_contradictions[:5]:
@@ -6005,16 +6197,16 @@ class AttestDB:
         for gap in all_gaps[:5]:
             open_questions.append(f"Gap: {gap}")
 
-        summary_parts = [f"Thread covering {len(entities_seen)} entities with {len(claims_list)} claims."]
-        if seed_entities:
-            summary_parts.append(f"Seeded from: {', '.join(seed_entities[:5])}")
-        if key_findings:
-            summary_parts.append(f"{len(key_findings)} key findings.")
-        if open_questions:
-            summary_parts.append(f"{len(open_questions)} open questions.")
-        summary = " ".join(summary_parts)
-
         frontier_list = list(all_frontier)[:20]
+
+        # Generate summary (LLM synthesis if configured, else structural)
+        summary = self._generate_thread_synthesis(
+            key_findings=finding_claims,
+            contradiction_details=contradiction_details,
+            seed_entities=seed_entities,
+            claim_count=len(claims_list),
+            entity_count=len(entities_seen),
+        )
 
         # Generate thread_id and persist as claims in the graph
         now = int(time.time() * 1e9)
@@ -6035,6 +6227,8 @@ class AttestDB:
             summary=summary,
             open_questions=open_questions,
             key_findings=key_findings,
+            contradiction_details=contradiction_details,
+            key_findings_threshold=findings_threshold,
         )
 
         self._persist_thread_state(state, seed_entities)
@@ -6106,17 +6300,21 @@ class AttestDB:
         new_claims = [c for c in claims_list if c.claim_id not in previous_claim_ids]
         removed_ids = list(previous_claim_ids - current_claim_ids)
 
-        # Regenerate narrative metadata
+        # Regenerate narrative metadata — adaptive key findings
+        finding_claims, findings_threshold = self._select_key_findings(claims_list)
         key_findings = []
-        for c in sorted(claims_list, key=lambda x: -x.confidence)[:20]:
-            if c.confidence >= 0.8:
-                status_tag = f" [{c.status.value}]" if c.status != ClaimStatus.ACTIVE else ""
-                key_findings.append(
-                    f"{c.subject.display_name or c.subject.id} "
-                    f"{c.predicate.id} {c.object.display_name or c.object.id} "
-                    f"(conf={c.confidence:.2f}{status_tag})"
-                )
-        key_findings = key_findings[:10]
+        for c in finding_claims:
+            status_tag = f" [{c.status.value}]" if c.status != ClaimStatus.ACTIVE else ""
+            key_findings.append(
+                f"{c.subject.display_name or c.subject.id} "
+                f"{c.predicate.id} {c.object.display_name or c.object.id} "
+                f"(conf={c.confidence:.2f}{status_tag})"
+            )
+
+        # Build structured contradiction details
+        contradiction_details = self._build_contradiction_details(
+            all_contradictions, all_claims,
+        )
 
         open_questions = []
         for ctr in all_contradictions[:5]:
@@ -6125,7 +6323,14 @@ class AttestDB:
         for gap in all_gaps[:5]:
             open_questions.append(f"Gap: {gap}")
 
-        summary = f"Thread covering {len(entities_seen)} entities with {len(claims_list)} claims."
+        # Generate summary (LLM synthesis if configured, else structural)
+        summary = self._generate_thread_synthesis(
+            key_findings=finding_claims,
+            contradiction_details=contradiction_details,
+            seed_entities=state.seed_entities,
+            claim_count=len(claims_list),
+            entity_count=len(entities_seen),
+        )
         if new_claims:
             summary += f" {len(new_claims)} new claims since last access."
         if removed_ids:
@@ -6138,6 +6343,8 @@ class AttestDB:
         state.summary = summary
         state.open_questions = open_questions
         state.key_findings = key_findings
+        state.contradiction_details = contradiction_details
+        state.key_findings_threshold = findings_threshold
         state.stale = False
 
         self._persist_thread_state(state, state.seed_entities, overwrite_id=thread_id)
@@ -6274,17 +6481,47 @@ class AttestDB:
             lines.append(state.summary)
             lines.append("")
 
-        # Key findings
+        # Key findings — label shows threshold when it was lowered
         if state.key_findings:
-            lines.append("### Key Findings")
+            threshold = getattr(state, 'key_findings_threshold', 0.8)
+            if threshold < 0.8:
+                lines.append(f"### Key Findings (confidence \u2265 {threshold:.1f})")
+            else:
+                lines.append("### Key Findings (verified)")
             for kf in state.key_findings[:10]:
                 lines.append(f"- {kf}")
             lines.append("")
 
-        # Open questions
-        if state.open_questions:
+        # Contradictions — structured resolution summaries
+        contradiction_details = getattr(state, 'contradiction_details', None)
+        if contradiction_details:
+            lines.append("### Contradictions")
+            for c in contradiction_details[:10]:
+                status_label = {
+                    "a_preferred": f"\u2192 Evidence favors: {c['claim_a_summary']}",
+                    "b_preferred": f"\u2192 Evidence favors: {c['claim_b_summary']}",
+                    "unresolved": "\u2192 Unresolved \u2014 evidence is balanced",
+                }.get(c["status"], "\u2192 Status unknown")
+                lines.append(
+                    f"- {c['claim_a_summary']} (conf={c['confidence_a']:.2f}, "
+                    f"{c['evidence_a']} sources) vs "
+                    f"{c['claim_b_summary']} (conf={c['confidence_b']:.2f}, "
+                    f"{c['evidence_b']} sources)"
+                )
+                lines.append(f"  {status_label}")
+            lines.append("")
+        elif state.open_questions:
+            # Backward compat: old threads without contradiction_details
             lines.append("### Open Questions")
             for oq in state.open_questions[:10]:
+                lines.append(f"- {oq}")
+            lines.append("")
+
+        # Non-contradiction open questions (gaps)
+        gap_questions = [oq for oq in state.open_questions if not oq.startswith("Contradiction:")]
+        if gap_questions:
+            lines.append("### Open Questions")
+            for oq in gap_questions[:10]:
                 lines.append(f"- {oq}")
             lines.append("")
 
@@ -6309,11 +6546,12 @@ class AttestDB:
         # Estimate token budget (rough: 1 claim ≈ 40 tokens, header ≈ 200)
         header_tokens = len("\n".join(lines)) // 4
         remaining = max_tokens - header_tokens
-        claims_budget = remaining // 40
+        claims_budget = max(remaining // 40, 0)
 
-        if claims[:claims_budget]:
+        displayed_claims = claims[:claims_budget] if claims_budget > 0 else []
+        if displayed_claims:
             lines.append("### Claims")
-            for c in claims[:claims_budget]:
+            for c in displayed_claims:
                 status_tag = f" [{c.status.value}]" if c.status != ClaimStatus.ACTIVE else ""
                 lines.append(
                     f"- {c.subject.display_name or c.subject.id} "
@@ -6321,6 +6559,34 @@ class AttestDB:
                     f"{c.object.display_name or c.object.id} "
                     f"(conf={c.confidence:.2f}{status_tag})"
                 )
+            lines.append("")
+
+        # Dropped claims signal
+        total_claims = len(claims)
+        shown_claims = len(displayed_claims)
+        dropped = total_claims - shown_claims
+        if dropped > 0:
+            lines.append("### Note")
+            lines.append(
+                f"Showing {shown_claims} of {total_claims} claims "
+                f"(sorted by confidence \u00d7 recency). "
+                f"{dropped} claims omitted due to token budget. "
+                f"Use `focus` parameter to narrow scope, or increase `max_tokens`."
+            )
+            # Show entities only in dropped claims
+            dropped_entities: set[str] = set()
+            for c in claims[shown_claims:]:
+                dropped_entities.add(c.subject.id)
+                dropped_entities.add(c.object.id)
+            shown_entities: set[str] = set()
+            for c in displayed_claims:
+                shown_entities.add(c.subject.id)
+                shown_entities.add(c.object.id)
+            unique_dropped = dropped_entities - shown_entities
+            if unique_dropped:
+                sample = sorted(unique_dropped)[:5]
+                suffix = f" (+{len(unique_dropped) - 5} more)" if len(unique_dropped) > 5 else ""
+                lines.append(f"Entities only in omitted claims: {', '.join(sample)}{suffix}")
             lines.append("")
 
         # Frontier

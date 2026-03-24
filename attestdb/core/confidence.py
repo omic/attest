@@ -142,30 +142,133 @@ LLM_SOURCE_TYPES: frozenset = frozenset({
 
 
 def count_independent_sources(claims: list) -> int:
-    """Count claims with independent provenance (no shared ancestors).
+    """Count truly independent sources for a set of corroborating claims.
 
-    Two claims are independent if their provenance chains and source_ids
-    don't overlap. Claims sharing a common provenance ancestor are grouped.
+    Two-pass deduplication:
 
-    Args:
-        claims: list of Claim objects sharing the same content_id.
+    Pass 1 — External ID clustering:
+      If claims carry external identifiers (DOI, PMID) extractable from their
+      source_id or payload metadata, cluster by those identifiers first.
+      Multiple claims citing the same DOI = 1 source group regardless of
+      how they entered the system.
 
-    Returns:
-        Number of independent provenance groups.
+    Pass 2 — Provenance chain overlap (existing logic):
+      Within each non-externally-identified group, check for overlapping
+      source_id and provenance.chain sets. Claims with overlapping chains
+      are merged into one source group.
+
+    Returns the number of distinct source groups.
     """
     if not claims:
         return 0
     if len(claims) == 1:
         return 1
 
-    # Build provenance sets for each claim
+    # Pass 1: Cluster by external identifiers
+    external_id_groups: dict[str, list] = {}  # external_id → claims
+    unclustered: list = []
+
+    for claim in claims:
+        ext_id = _extract_external_id(claim)
+        if ext_id:
+            external_id_groups.setdefault(ext_id, []).append(claim)
+        else:
+            unclustered.append(claim)
+
+    # Each external ID group counts as 1 source
+    independent_count = len(external_id_groups)
+
+    # Pass 2: Apply provenance chain overlap logic to unclustered claims
+    if unclustered:
+        independent_count += _count_by_provenance_overlap(unclustered)
+
+    return max(independent_count, 1)  # at least 1
+
+
+def _extract_external_id(claim) -> str | None:
+    """Extract a canonical external identifier from a claim's provenance or payload.
+
+    Priority order:
+    1. payload.data["doi"] (normalized)
+    2. payload.data["pmid"] (normalized)
+    3. payload.data["url"] (normalized)
+    4. source_id if it matches DOI/PMID patterns
+    5. None if no external identifier found
+    """
+    # Check payload data for explicit external IDs
+    payload = getattr(claim, "payload", None)
+    if payload is not None:
+        data = getattr(payload, "data", None) or {}
+        doi = data.get("doi")
+        if doi:
+            return _normalize_doi(str(doi))
+        pmid = data.get("pmid")
+        if pmid:
+            return _normalize_pmid(str(pmid))
+        url = data.get("url")
+        if url:
+            return _normalize_url(str(url))
+
+    # Check source_id for DOI/PMID patterns
+    prov = getattr(claim, "provenance", None)
+    source_id = getattr(prov, "source_id", "") or ""
+    if source_id.startswith("10."):
+        return _normalize_doi(source_id)
+    # semmeddb:{pmid} pattern — extract PMID
+    if source_id.startswith("semmeddb:"):
+        parts = source_id.split(":")
+        if len(parts) >= 2 and parts[1].isdigit():
+            return _normalize_pmid(parts[1])
+    if source_id.startswith("PMID:") or source_id.startswith("pmid:"):
+        return _normalize_pmid(source_id)
+
+    return None
+
+
+def _normalize_doi(doi: str) -> str:
+    """Normalize DOI to canonical form."""
+    doi = doi.lower().strip()
+    for prefix in ("https://doi.org/", "http://doi.org/", "doi:", "doi.org/"):
+        if doi.startswith(prefix):
+            doi = doi[len(prefix):]
+    return f"doi:{doi}"
+
+
+def _normalize_pmid(pmid: str) -> str:
+    """Normalize PMID to canonical form."""
+    pmid = pmid.strip()
+    for prefix in ("PMID:", "pmid:", "pubmed:", "semmeddb:"):
+        if pmid.startswith(prefix):
+            pmid = pmid[len(prefix):]
+    return f"pmid:{pmid.strip()}"
+
+
+def _normalize_url(url: str) -> str:
+    """Normalize URL to canonical form."""
+    url = url.lower().strip().rstrip("/")
+    for prefix in ("https://www.", "http://www.", "https://", "http://"):
+        if url.startswith(prefix):
+            url = url[len(prefix):]
+    return f"url:{url}"
+
+
+def _count_by_provenance_overlap(claims: list) -> int:
+    """Count independent provenance groups via chain set overlap.
+
+    Two claims are independent if their provenance chains and source_ids
+    don't overlap. Claims sharing a common provenance ancestor are grouped.
+    """
+    if not claims:
+        return 0
+    if len(claims) == 1:
+        return 1
+
     claim_chains: list[set[str]] = []
     for c in claims:
         chain_set = set(c.provenance.chain) if c.provenance.chain else set()
         chain_set.add(c.provenance.source_id)
         claim_chains.append(chain_set)
 
-    # Greedy grouping: two claims are independent if their chain sets don't overlap
     groups: list[set[str]] = []
     for chain in claim_chains:
         merged = False

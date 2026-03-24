@@ -8,12 +8,19 @@ from attestdb.core.confidence import (
     recency_factor,
     tier1_confidence,
     tier2_confidence,
+    _extract_external_id,
+    _normalize_doi,
+    _normalize_pmid,
+    _normalize_url,
+    _count_by_provenance_overlap,
 )
-from attestdb.core.types import Claim, EntityRef, PredicateRef, Provenance
+from attestdb.core.types import Claim, EntityRef, PredicateRef, Payload, Provenance
 
 
-def _make_claim(source_id, source_type="experimental", chain=None, timestamp=None):
+def _make_claim(source_id, source_type="experimental", chain=None, timestamp=None,
+                payload_data=None):
     """Helper to create a minimal Claim for testing."""
+    payload = Payload(schema_ref="", data=payload_data) if payload_data else None
     return Claim(
         claim_id=f"test_{source_id}",
         content_id="shared_content",
@@ -26,6 +33,7 @@ def _make_claim(source_id, source_type="experimental", chain=None, timestamp=Non
             source_id=source_id,
             chain=chain or [],
         ),
+        payload=payload,
         timestamp=timestamp or int(time.time() * 1_000_000_000),
     )
 
@@ -73,3 +81,112 @@ def test_tier2_with_corroboration():
     tier1 = tier1_confidence("experimental")
     # Corroboration boost of 1.3x should push score above tier1
     assert score > tier1 * 0.95  # allowing slight recency decay
+
+
+# --- External ID deduplication tests ---
+
+def test_same_doi_different_sources_counts_as_one():
+    """Three claims from same paper via different paths = 1 independent source."""
+    claims = [
+        _make_claim("pubmed_loader", payload_data={"doi": "10.1038/xyz"}),
+        _make_claim("hetionet_bulk", payload_data={"doi": "10.1038/xyz"}),
+        _make_claim("agent_session_1", payload_data={"doi": "10.1038/xyz"}),
+    ]
+    assert count_independent_sources(claims) == 1
+
+
+def test_different_dois_count_as_independent():
+    """Claims from different papers are independent."""
+    claims = [
+        _make_claim("loader_1", payload_data={"doi": "10.1038/aaa"}),
+        _make_claim("loader_2", payload_data={"doi": "10.1038/bbb"}),
+    ]
+    assert count_independent_sources(claims) == 2
+
+
+def test_mixed_external_and_unclustered():
+    """Claims with and without external IDs are counted correctly."""
+    claims = [
+        _make_claim("pubmed", payload_data={"doi": "10.1038/xyz"}),
+        _make_claim("agent_1", payload_data={"doi": "10.1038/xyz"}),
+        _make_claim("slack_msg_123"),
+        _make_claim("email_456"),
+    ]
+    # 1 DOI group + 2 unclustered with non-overlapping provenance = 3
+    assert count_independent_sources(claims) == 3
+
+
+def test_doi_normalization():
+    """Different DOI formats resolve to same ID."""
+    assert _normalize_doi("10.1038/xyz") == "doi:10.1038/xyz"
+    assert _normalize_doi("https://doi.org/10.1038/xyz") == "doi:10.1038/xyz"
+    assert _normalize_doi("DOI:10.1038/xyz") == "doi:10.1038/xyz"
+    assert _normalize_doi("http://doi.org/10.1038/xyz") == "doi:10.1038/xyz"
+
+
+def test_pmid_normalization():
+    """Different PMID formats resolve to same ID."""
+    assert _normalize_pmid("12345678") == "pmid:12345678"
+    assert _normalize_pmid("PMID:12345678") == "pmid:12345678"
+    assert _normalize_pmid("pmid:12345678") == "pmid:12345678"
+    assert _normalize_pmid("pubmed:12345678") == "pmid:12345678"
+
+
+def test_url_normalization():
+    """URLs are normalized for dedup."""
+    assert _normalize_url("https://example.com/page/") == "url:example.com/page"
+    assert _normalize_url("http://www.example.com/page") == "url:example.com/page"
+    assert _normalize_url("HTTPS://EXAMPLE.COM/page") == "url:example.com/page"
+
+
+def test_backward_compatible_no_external_ids():
+    """Claims without external IDs use existing provenance overlap logic."""
+    claims = [
+        _make_claim("source_a"),
+        _make_claim("source_b"),
+    ]
+    assert count_independent_sources(claims) == 2
+
+
+def test_semmeddb_pmid_extraction():
+    """SemMedDB source_id pattern extracts PMID for clustering."""
+    claims = [
+        _make_claim("semmeddb:12345678"),
+        _make_claim("pubmed_loader", payload_data={"pmid": "12345678"}),
+    ]
+    assert count_independent_sources(claims) == 1
+
+
+def test_extract_external_id_doi_from_payload():
+    """DOI extracted from payload.data."""
+    claim = _make_claim("src1", payload_data={"doi": "10.1038/xyz"})
+    assert _extract_external_id(claim) == "doi:10.1038/xyz"
+
+
+def test_extract_external_id_from_source_id():
+    """DOI pattern in source_id is extracted."""
+    claim = _make_claim("10.1038/xyz")
+    assert _extract_external_id(claim) == "doi:10.1038/xyz"
+
+
+def test_extract_external_id_none():
+    """No external ID when neither payload nor source_id has one."""
+    claim = _make_claim("slack_msg_123")
+    assert _extract_external_id(claim) is None
+
+
+def test_empty_claims_returns_zero():
+    assert count_independent_sources([]) == 0
+
+
+def test_single_claim_returns_one():
+    assert count_independent_sources([_make_claim("only")]) == 1
+
+
+def test_doi_case_insensitive():
+    """DOI normalization is case-insensitive."""
+    claims = [
+        _make_claim("src1", payload_data={"doi": "10.1038/XYZ"}),
+        _make_claim("src2", payload_data={"doi": "10.1038/xyz"}),
+    ]
+    assert count_independent_sources(claims) == 1

@@ -202,6 +202,8 @@ class ThreadState:
     summary: str | None = None
     open_questions: list[str] = field(default_factory=list)
     key_findings: list[str] = field(default_factory=list)
+    contradiction_details: list[dict] = field(default_factory=list)
+    key_findings_threshold: float = 0.8
     stale: bool = False
 
 

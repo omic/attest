@@ -60,6 +60,8 @@ pub struct MemoryBackend {
     include_retracted: bool,
     /// Namespace filter: empty = all namespaces visible.
     namespace_filter: Vec<String>,
+    /// Corroboration counts: content_id → number of active claims.
+    content_id_counts: HashMap<String, u32>,
 }
 
 impl MemoryBackend {
@@ -77,6 +79,7 @@ impl MemoryBackend {
             retracted_ids: HashSet::new(),
             include_retracted: false,
             namespace_filter: Vec::new(),
+            content_id_counts: HashMap::new(),
         }
     }
 
@@ -123,6 +126,7 @@ impl MemoryBackend {
                         retracted_ids,
                         include_retracted: false,
                         namespace_filter: Vec::new(),
+            content_id_counts: HashMap::new(),
                     }
                 }
                 Err(file_format::FileError::ChecksumMismatch { expected, actual }) => {
@@ -144,6 +148,7 @@ impl MemoryBackend {
                         retracted_ids: HashSet::new(),
                         include_retracted: false,
                         namespace_filter: Vec::new(),
+            content_id_counts: HashMap::new(),
                     }
                 }
                 Err(e) => {
@@ -166,6 +171,7 @@ impl MemoryBackend {
                 retracted_ids: HashSet::new(),
                 include_retracted: false,
                 namespace_filter: Vec::new(),
+            content_id_counts: HashMap::new(),
             }
         };
 
@@ -485,8 +491,12 @@ impl MemoryBackend {
         let pred_id = claim.predicate.id.clone();
         let subj_id = claim.subject.id.clone();
         let obj_id = claim.object.id.clone();
+        let content_id = claim.content_id.clone();
 
         self.claims.append(claim);
+
+        // Increment corroboration counter
+        *self.content_id_counts.entry(content_id).or_insert(0) += 1;
 
         if ALIAS_PREDICATES.contains(pred_id.as_str()) {
             if pred_id == "same_as" {
@@ -551,6 +561,19 @@ impl MemoryBackend {
             if let Err(e) = wal.append_status_update(claim_id, status_u8) {
                 log::error!("WAL write failed for status update {claim_id}: {e}");
                 return Err(AttestError::Provenance(format!("WAL write failed: {e}")));
+            }
+        }
+
+        // Update corroboration counter
+        if let Some(claim) = self.claims.get(claim_id) {
+            let cid = claim.content_id.clone();
+            if status == ClaimStatus::Tombstoned {
+                if let Some(count) = self.content_id_counts.get_mut(&cid) {
+                    *count = count.saturating_sub(1);
+                }
+            } else if self.retracted_ids.contains(claim_id) {
+                // Reinstating a previously retracted claim
+                *self.content_id_counts.entry(cid).or_insert(0) += 1;
             }
         }
 
@@ -683,6 +706,142 @@ impl MemoryBackend {
             .cloned()
             .map(|mut c| { Self::apply_status_overlay(&self.status_overrides, &mut c); c })
             .collect()
+    }
+
+    /// Get outgoing causal edges for an entity — lightweight, returns
+    /// list of (target_entity_id, predicate_id, confidence) tuples.
+    /// Only returns claims where entity_id is the SUBJECT and predicate is causal.
+    pub fn outgoing_causal_edges(
+        &self,
+        entity_id: &str,
+        causal_predicates: &HashSet<String>,
+    ) -> Vec<(String, String, f64)> {
+        let normalized = normalize_entity_id(entity_id);
+        let mut results = Vec::new();
+        for claim in self.claims.for_entity(&normalized) {
+            if claim.subject.id != normalized {
+                continue;
+            }
+            if !causal_predicates.contains(&claim.predicate.id) {
+                continue;
+            }
+            if !self.should_include_claim(&claim.claim_id) {
+                continue;
+            }
+            if !self.should_include_namespace(&claim.namespace) {
+                continue;
+            }
+            results.push((claim.object.id.clone(), claim.predicate.id.clone(), claim.confidence));
+        }
+        results
+    }
+
+    /// Get claims for an entity, optionally including inverse-derived claims.
+    pub fn claims_for_with_inverse(
+        &mut self,
+        entity_id: &str,
+        predicate_type: Option<&str>,
+        source_type: Option<&str>,
+        min_confidence: f64,
+        include_inverse: bool,
+    ) -> Vec<Claim> {
+        let mut results = self.claims_for(entity_id, predicate_type, source_type, min_confidence);
+        if !include_inverse {
+            return results;
+        }
+        let resolved = self.resolve(entity_id);
+        // Track existing (subject, predicate, object) triples to avoid duplicates
+        let mut seen: HashSet<(String, String, String)> = HashSet::new();
+        for c in &results {
+            seen.insert((c.subject.id.clone(), c.predicate.id.clone(), c.object.id.clone()));
+        }
+        // For claims where entity is the OBJECT, derive inverse claims
+        let mut inverse_claims = Vec::new();
+        for c in &results {
+            if c.object.id == resolved {
+                if let Some(&inv_pred) = attest_core::vocabulary::INVERSE_PREDICATES.get(c.predicate.id.as_str()) {
+                    let key = (resolved.clone(), inv_pred.to_string(), c.subject.id.clone());
+                    if !seen.contains(&key) {
+                        seen.insert(key);
+                        let mut derived = c.clone();
+                        // Swap subject and object
+                        let tmp = derived.subject.clone();
+                        derived.subject = derived.object.clone();
+                        derived.object = tmp;
+                        derived.predicate.id = inv_pred.to_string();
+                        derived.provenance.method = Some("inverse_derived".to_string());
+                        derived.claim_id = format!("inv:{}", c.claim_id);
+                        inverse_claims.push(derived);
+                    }
+                }
+            }
+        }
+        results.extend(inverse_claims);
+        results
+    }
+
+    /// Compute transitive closure over causal predicates from an entity.
+    pub fn transitive_closure(
+        &mut self,
+        entity_id: &str,
+        predicates: &HashSet<String>,
+        max_depth: usize,
+    ) -> Vec<(String, String, usize, f64)> {
+        use attest_core::vocabulary::compose_predicates;
+        use std::collections::VecDeque;
+
+        let max_depth = max_depth.min(5); // hard cap
+        let resolved = self.resolve(entity_id);
+
+        // BFS: (current_entity, accumulated_predicate, depth, accumulated_confidence)
+        let mut queue: VecDeque<(String, String, usize, f64)> = VecDeque::new();
+        let mut visited: HashSet<String> = HashSet::new();
+        visited.insert(resolved.clone());
+
+        // Seed with direct causal neighbors
+        let direct_edges = self.outgoing_causal_edges(&resolved, predicates);
+        for (target, pred, conf) in direct_edges {
+            if !visited.contains(&target) {
+                queue.push_back((target, pred, 1, conf));
+            }
+        }
+
+        let mut results: Vec<(String, String, usize, f64)> = Vec::new();
+
+        while let Some((current, acc_pred, depth, acc_conf)) = queue.pop_front() {
+            if visited.contains(&current) {
+                continue;
+            }
+            visited.insert(current.clone());
+
+            // At depth >= 2, this is a composed result (not a direct neighbor)
+            if depth >= 2 {
+                results.push((current.clone(), acc_pred.clone(), depth, acc_conf));
+            }
+
+            // Continue BFS if not at max depth
+            if depth < max_depth {
+                let edges = self.outgoing_causal_edges(&current, predicates);
+                for (next_target, edge_pred, edge_conf) in edges {
+                    if visited.contains(&next_target) {
+                        continue;
+                    }
+                    let composed = compose_predicates(&acc_pred, &edge_pred).to_string();
+                    if composed == "associated_with" {
+                        continue; // weak composition, skip
+                    }
+                    let new_conf = acc_conf * edge_conf;
+                    queue.push_back((next_target, composed, depth + 1, new_conf));
+                }
+            }
+        }
+
+        results
+    }
+
+    /// Get corroboration count for a content_id.
+    pub fn corroboration_count(&self, content_id: &str) -> u32 {
+        *self.content_id_counts.get(content_id).unwrap_or(&0)
     }
 
     /// Get the provenance chain for a claim.

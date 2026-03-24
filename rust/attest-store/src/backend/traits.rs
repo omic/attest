@@ -50,6 +50,45 @@ pub trait StorageBackend {
         Vec::new()
     }
 
+    /// Get claims for an entity, optionally including inverse-derived claims.
+    /// When `include_inverse` is true, for claims where the entity is the OBJECT,
+    /// derive a synthetic claim with subject/object swapped and predicate replaced
+    /// by its inverse (e.g., A→causes→B becomes B→caused_by→A when querying B).
+    fn claims_for_with_inverse(
+        &mut self,
+        _entity_id: &str,
+        _predicate_type: Option<&str>,
+        _source_type: Option<&str>,
+        _min_confidence: f64,
+        _include_inverse: bool,
+    ) -> Vec<attest_core::types::Claim> {
+        Vec::new()
+    }
+
+    /// Compute transitive closure over causal predicates from an entity.
+    /// Returns Vec of (target_entity_id, composed_predicate, depth, composed_confidence).
+    /// Follows outgoing causal edges up to max_depth hops, composing predicates via
+    /// the PREDICATE_COMPOSITION table.
+    fn transitive_closure(
+        &mut self,
+        _entity_id: &str,
+        _predicates: &std::collections::HashSet<String>,
+        _max_depth: usize,
+    ) -> Vec<(String, String, usize, f64)> {
+        Vec::new()
+    }
+
+    /// Get the corroboration count for a content_id (number of independent sources).
+    /// Default returns 1 (no corroboration tracking).
+    fn corroboration_count(&self, _content_id: &str) -> u32 {
+        1
+    }
+
+    /// Batch lookup of corroboration counts.
+    fn corroboration_counts_batch(&self, _content_ids: &[&str]) -> std::collections::HashMap<String, u32> {
+        std::collections::HashMap::new()
+    }
+
     /// Compact the database file, reclaiming free pages.
     /// Returns `true` if compaction freed any space.
     /// Default: returns `Ok(false)` (no-op).

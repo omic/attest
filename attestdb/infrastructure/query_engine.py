@@ -85,6 +85,7 @@ class QueryEngine:
         max_tokens: int = 4000,
         confidence_threshold: float = 0.0,
         predicate_types: list[str] | None = None,
+        include_archived: bool = False,
     ) -> ContextFrame:
         return self._execute_query(
             focal_entity, depth=depth, min_confidence=min_confidence,
@@ -92,6 +93,7 @@ class QueryEngine:
             max_claims=max_claims, max_tokens=max_tokens,
             confidence_threshold=confidence_threshold,
             predicate_types=predicate_types,
+            include_archived=include_archived,
         )
 
     def _execute_query(
@@ -108,12 +110,14 @@ class QueryEngine:
         include_quantitative: bool = True,
         include_contradictions: bool = True,
         include_narrative: bool = True,
+        include_archived: bool = False,
     ) -> ContextFrame:
         with _span("attestdb.query.execute", {"focal_entity": focal_entity, "depth": depth}):
             return self._execute_query_inner(
                 focal_entity, depth, min_confidence, exclude_source_types,
                 max_claims, max_tokens, confidence_threshold, predicate_types,
                 claim_filter, include_quantitative, include_contradictions, include_narrative,
+                include_archived,
             )
 
     def _execute_query_inner(
@@ -130,6 +134,7 @@ class QueryEngine:
         include_quantitative: bool = True,
         include_contradictions: bool = True,
         include_narrative: bool = True,
+        include_archived: bool = False,
     ) -> ContextFrame:
         exclude = set(exclude_source_types or [])
         # Effective confidence floor: max of min_confidence and confidence_threshold
@@ -204,7 +209,10 @@ class QueryEngine:
                         continue
                     if claim.provenance.source_type in exclude:
                         continue
-                    if claim.status != ClaimStatus.ACTIVE:
+                    if claim.status == ClaimStatus.ARCHIVED:
+                        if not include_archived:
+                            continue
+                    elif claim.status != ClaimStatus.ACTIVE:
                         continue
                     if _is_expired(claim):
                         continue
