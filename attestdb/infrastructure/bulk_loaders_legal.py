@@ -1,4 +1,4 @@
-"""Legal data source loaders: CourtListener citations, US Code, Federal Register."""
+"""Legal data source loaders: CourtListener, Harvard CAP, US Code, Federal Register."""
 
 from __future__ import annotations
 
@@ -383,5 +383,179 @@ def load_federal_register_legal(
     logger.info(
         "Federal Register (legal): %d claims, %d entities from %d rules in %.1fs",
         len(claim_rows), len(entities), count, elapsed,
+    )
+    return result
+
+
+def load_harvard_cap(
+    pipeline,
+    path: str,
+    max_cases: int = 0,
+) -> BatchResult:
+    """Load case law from Harvard Caselaw Access Project metadata.
+
+    Expected format: NDJSON where each line is a case from CasesMetadata.json
+    with fields: id, name, name_abbreviation, decision_date, court,
+    citations, cites_to, docket_number, jurisdiction.
+
+    Download from: https://static.case.law/{reporter}/{volume}/CasesMetadata.json
+
+    Produces claims:
+    - case → cites → case (case-to-case citations via cites_to[].case_ids)
+    - case → interprets → statute (case-to-statute citations via cites_to[].category)
+
+    Confidence by court level: SCOTUS=0.95, Circuit=0.85, State supreme=0.80, other=0.70.
+
+    Args:
+        pipeline: IngestionPipeline instance.
+        path: Path to NDJSON file of CAP case metadata.
+        max_cases: Maximum cases to process (0 = unlimited).
+
+    Returns:
+        BatchResult with ingestion counts.
+    """
+    t0 = time.time()
+    timestamp = int(t0 * 1_000_000_000)
+
+    entities: dict[str, tuple[str, str, str]] = {}
+    claim_rows: list[tuple] = []
+    seen_claim_ids: set[str] = set()
+    count = 0
+    case_cite_count = 0
+    statute_cite_count = 0
+
+    with open(path, "r", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if max_cases and count >= max_cases:
+                break
+            try:
+                case = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            case_id = case.get("id", "")
+            name = (case.get("name_abbreviation") or case.get("name") or "").strip()
+            court = case.get("court", {})
+            court_name = court.get("name_abbreviation", court.get("name", ""))
+            decision_date = (case.get("decision_date") or "").strip()
+            citations = case.get("citations", [])
+            cites_to = case.get("cites_to", [])
+
+            if not case_id or not name:
+                continue
+
+            # Build case entity ID from official citation if available
+            official_cite = ""
+            for cit in citations:
+                if cit.get("type") == "official":
+                    official_cite = cit.get("cite", "")
+                    break
+            case_label = official_cite or f"cap_{case_id}"
+            case_eid = normalize_entity_id(case_label)
+            case_eid, case_ext = _safe_entity_id(case_eid)
+
+            if case_eid not in entities:
+                ext = dict(case_ext) if case_ext else {}
+                ext["cap_id"] = str(case_id)
+                if official_cite:
+                    ext["citation"] = official_cite
+                if decision_date:
+                    ext["decision_date"] = decision_date
+                entities[case_eid] = ("case", name[:100], json.dumps(ext))
+
+            # Confidence by court type
+            court_abbrev = court_name.lower()
+            if "supreme court of the united states" in court_abbrev or court_abbrev == "u.s.":
+                confidence = 0.95
+            elif "circuit" in court_abbrev or court_abbrev.startswith("ca"):
+                confidence = 0.85
+            elif "supreme" in court_abbrev:
+                confidence = 0.80  # state supreme courts
+            else:
+                confidence = 0.70
+
+            source_type = "database_import"
+
+            # Process citations
+            for cite_ref in cites_to:
+                category = cite_ref.get("category", "")
+                cite_text = cite_ref.get("cite", "").strip()
+                if not cite_text:
+                    continue
+
+                if "reporter" in category and cite_ref.get("case_ids"):
+                    # Case-to-case citation
+                    target_cite = cite_text
+                    target_eid = normalize_entity_id(target_cite)
+                    target_eid, target_ext = _safe_entity_id(target_eid)
+
+                    if target_eid not in entities:
+                        t_ext = dict(target_ext) if target_ext else {}
+                        t_ext["citation"] = cite_text
+                        if cite_ref.get("year"):
+                            t_ext["year"] = str(cite_ref["year"])
+                        entities[target_eid] = ("case", cite_text, json.dumps(t_ext))
+
+                    pred_id = "cites"
+                    source_id = f"cap:{case_id}:cites:{cite_text}"
+                    claim_id = compute_claim_id(
+                        case_eid, pred_id, target_eid,
+                        source_id, source_type, timestamp,
+                    )
+                    if claim_id not in seen_claim_ids:
+                        seen_claim_ids.add(claim_id)
+                        content_id = compute_content_id(case_eid, pred_id, target_eid)
+                        claim_rows.append((
+                            case_eid, target_eid,
+                            claim_id, content_id, pred_id, "relates_to",
+                            confidence,
+                            source_type, source_id,
+                            "", "[]", "", "", "", timestamp, "active",
+                        ))
+                        case_cite_count += 1
+
+                elif "statute" in category:
+                    # Case-to-statute citation
+                    statute_eid = normalize_entity_id(cite_text)
+                    statute_eid, statute_ext = _safe_entity_id(statute_eid)
+
+                    if statute_eid not in entities:
+                        s_ext = dict(statute_ext) if statute_ext else {}
+                        s_ext["citation"] = cite_text
+                        entities[statute_eid] = ("statute", cite_text, json.dumps(s_ext))
+
+                    pred_id = "interprets"
+                    source_id = f"cap:{case_id}:interprets:{cite_text}"
+                    claim_id = compute_claim_id(
+                        case_eid, pred_id, statute_eid,
+                        source_id, source_type, timestamp,
+                    )
+                    if claim_id not in seen_claim_ids:
+                        seen_claim_ids.add(claim_id)
+                        content_id = compute_content_id(case_eid, pred_id, statute_eid)
+                        claim_rows.append((
+                            case_eid, statute_eid,
+                            claim_id, content_id, pred_id, "relates_to",
+                            confidence,
+                            source_type, source_id,
+                            "", "[]", "", "", "", timestamp, "active",
+                        ))
+                        statute_cite_count += 1
+
+            count += 1
+
+    if not claim_rows:
+        return BatchResult(ingested=0)
+
+    result = _ingest_append_direct(pipeline, entities, claim_rows, timestamp)
+    elapsed = time.time() - t0
+    logger.info(
+        "Harvard CAP: %d claims (%d case-to-case, %d case-to-statute), "
+        "%d entities from %d cases in %.1fs",
+        len(claim_rows), case_cite_count, statute_cite_count,
+        len(entities), count, elapsed,
     )
     return result

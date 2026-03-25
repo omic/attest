@@ -5984,6 +5984,11 @@ class BulkLoader:
         from attestdb.infrastructure.bulk_loaders_legal import load_federal_register_legal as _fn
         return _fn(self._pipeline, *args, **kwargs)
 
+    def load_harvard_cap(self, *args, **kwargs):
+        from attestdb.infrastructure.bulk_loaders_legal import load_harvard_cap as _fn
+        return _fn(self._pipeline, *args, **kwargs)
+
+
     def load_faers(self, *args, **kwargs):
         from attestdb.infrastructure.bulk_loaders_pharma import load_faers as _fn
         return _fn(self._pipeline, *args, **kwargs)

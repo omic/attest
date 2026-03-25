@@ -1,6 +1,6 @@
 """Attest: the database for knowledge you can verify."""
 
-__version__ = "0.1.21"
+__version__ = "0.1.28"
 
 # Lazy-import table: name -> (module_path, attribute_name)
 # Open-source engine only — intelligence & connectors are in attestdb-enterprise.

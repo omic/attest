@@ -1836,6 +1836,115 @@ impl LmdbBackend {
         results
     }
 
+    /// Get claims for an entity, optionally including inverse-derived claims.
+    pub fn claims_for_with_inverse(
+        &mut self,
+        entity_id: &str,
+        predicate_type: Option<&str>,
+        source_type: Option<&str>,
+        min_confidence: f64,
+        include_inverse: bool,
+    ) -> Vec<Claim> {
+        let mut results = self.claims_for(entity_id, predicate_type, source_type, min_confidence);
+        if !include_inverse {
+            return results;
+        }
+        let resolved = self.resolve(entity_id);
+        let mut seen: HashSet<(String, String, String)> = HashSet::new();
+        for c in &results {
+            seen.insert((c.subject.id.clone(), c.predicate.id.clone(), c.object.id.clone()));
+        }
+        let mut inverse_claims = Vec::new();
+        for c in &results {
+            if c.object.id == resolved {
+                if let Some(&inv_pred) = attest_core::vocabulary::INVERSE_PREDICATES.get(c.predicate.id.as_str()) {
+                    let key = (resolved.clone(), inv_pred.to_string(), c.subject.id.clone());
+                    if !seen.contains(&key) {
+                        seen.insert(key);
+                        let mut derived = c.clone();
+                        let tmp = derived.subject.clone();
+                        derived.subject = derived.object.clone();
+                        derived.object = tmp;
+                        derived.predicate.id = inv_pred.to_string();
+                        derived.provenance.method = Some("inverse_derived".to_string());
+                        derived.claim_id = format!("inv:{}", c.claim_id);
+                        inverse_claims.push(derived);
+                    }
+                }
+            }
+        }
+        results.extend(inverse_claims);
+        results
+    }
+
+    /// Compute transitive closure over causal predicates from an entity.
+    pub fn transitive_closure(
+        &mut self,
+        entity_id: &str,
+        predicates: &HashSet<String>,
+        max_depth: usize,
+    ) -> Vec<(String, String, usize, f64)> {
+        use attest_core::vocabulary::compose_predicates;
+        use std::collections::VecDeque;
+
+        let max_depth = max_depth.min(5);
+        let resolved = self.resolve(entity_id);
+
+        let mut queue: VecDeque<(String, String, usize, f64)> = VecDeque::new();
+        let mut visited: HashSet<String> = HashSet::new();
+        visited.insert(resolved.clone());
+
+        let direct_edges = self.outgoing_causal_edges(&resolved, predicates);
+        for (target, pred, conf) in direct_edges {
+            if !visited.contains(&target) {
+                queue.push_back((target, pred, 1, conf));
+            }
+        }
+
+        let mut results: Vec<(String, String, usize, f64)> = Vec::new();
+
+        while let Some((current, acc_pred, depth, acc_conf)) = queue.pop_front() {
+            if visited.contains(&current) {
+                continue;
+            }
+            visited.insert(current.clone());
+
+            if depth >= 2 {
+                results.push((current.clone(), acc_pred.clone(), depth, acc_conf));
+            }
+
+            if depth < max_depth {
+                let edges = self.outgoing_causal_edges(&current, predicates);
+                for (next_target, edge_pred, edge_conf) in edges {
+                    if visited.contains(&next_target) {
+                        continue;
+                    }
+                    let composed = compose_predicates(&acc_pred, &edge_pred).to_string();
+                    if composed == "associated_with" {
+                        continue;
+                    }
+                    let new_conf = acc_conf * edge_conf;
+                    queue.push_back((next_target, composed, depth + 1, new_conf));
+                }
+            }
+        }
+
+        results
+    }
+
+    /// Get corroboration count for a content_id by counting entries in the content_id index.
+    pub fn corroboration_count(&self, content_id: &str) -> u32 {
+        let rtxn = match self.env().read_txn() {
+            Ok(t) => t,
+            Err(_) => return 1,
+        };
+        let count = match self.dbs.content_id_idx.get_duplicates(&rtxn, content_id) {
+            Ok(Some(iter)) => iter.count() as u32,
+            _ => 0,
+        };
+        count
+    }
+
     pub fn get_adjacency_list(&self) -> HashMap<String, HashSet<String>> {
         let rtxn = match self.env().read_txn() {
             Ok(t) => t,

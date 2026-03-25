@@ -10,7 +10,7 @@ PROVIDERS = {
     "gemini": {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
         "env_key": "GOOGLE_API_KEY",
-        "default_model": "gemini-2.5-flash-lite",
+        "default_model": "gemini-flash-lite-latest",
     },
     "together": {
         "base_url": "https://api.together.xyz/v1",
@@ -55,8 +55,8 @@ PROVIDERS = {
 }
 
 # Recommended fallback chain for text extraction, ordered by benchmark performance.
-# gemini (2.5-flash-lite) → together (Qwen3-Next) → openai (4.1-mini) → deepseek → grok
-EXTRACTION_FALLBACK_CHAIN = ["gemini", "together", "openai", "deepseek", "grok"]
+# groq (fastest) → gemini → together → openai → deepseek → grok
+EXTRACTION_FALLBACK_CHAIN = ["groq", "gemini", "together", "openai", "deepseek", "grok"]
 
 
 def load_env_file(env_path: str) -> dict[str, str]:

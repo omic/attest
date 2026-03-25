@@ -74,7 +74,7 @@ impl StorageBackend for Backend {
         causal_predicates: &std::collections::HashSet<String>,
     ) -> Vec<(String, String, f64)> {
         match self {
-            Backend::InMemory(_) => Vec::new(),
+            Backend::InMemory(m) => m.outgoing_causal_edges(entity_id, causal_predicates),
             Backend::Lmdb(l) => l.outgoing_causal_edges(entity_id, causal_predicates),
         }
     }
@@ -89,7 +89,7 @@ impl StorageBackend for Backend {
     ) -> Vec<attest_core::types::Claim> {
         match self {
             Backend::InMemory(m) => m.claims_for_with_inverse(entity_id, predicate_type, source_type, min_confidence, include_inverse),
-            Backend::Lmdb(_l) => Vec::new(), // TODO: implement for LMDB
+            Backend::Lmdb(l) => l.claims_for_with_inverse(entity_id, predicate_type, source_type, min_confidence, include_inverse),
         }
     }
 
@@ -101,14 +101,14 @@ impl StorageBackend for Backend {
     ) -> Vec<(String, String, usize, f64)> {
         match self {
             Backend::InMemory(m) => m.transitive_closure(entity_id, predicates, max_depth),
-            Backend::Lmdb(_l) => Vec::new(), // TODO: implement for LMDB
+            Backend::Lmdb(l) => l.transitive_closure(entity_id, predicates, max_depth),
         }
     }
 
     fn corroboration_count(&self, content_id: &str) -> u32 {
         match self {
             Backend::InMemory(m) => m.corroboration_count(content_id),
-            Backend::Lmdb(_l) => 1, // TODO: implement for LMDB
+            Backend::Lmdb(l) => l.corroboration_count(content_id),
         }
     }
 
