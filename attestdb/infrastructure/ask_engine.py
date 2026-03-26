@@ -10,8 +10,8 @@ if TYPE_CHECKING:
 
 from attestdb.core.types import AskResult, Citation, claim_from_dict
 
-DEFAULT_MAX_RELATIONSHIPS = 400
-ENTITY_BUDGET_FLOOR = 60
+DEFAULT_MAX_RELATIONSHIPS = 60
+ENTITY_BUDGET_FLOOR = 15
 
 
 class AskEngine:
@@ -160,15 +160,20 @@ class AskEngine:
         if len(entity_ids) <= 1:
             return [list(entity_ids)] if entity_ids else []
 
-        # Build neighbor sets only for the candidate entities (not the full graph)
+        # Build neighbor sets — cap at 200 claims per entity to avoid
+        # materializing 100K+ dicts for high-degree entities.
+        # Read subject/object IDs from raw dicts (no full Claim deserialization).
         neighbors: dict[str, set[str]] = {}
         for eid in entity_ids:
             raw = self.db._store.claims_for(eid, None, None, 0.0)
+            if len(raw) > 200:
+                raw = raw[:200]
             adj: set[str] = set()
             for c in raw:
-                claim = claim_from_dict(c)
-                other = claim.object.id if claim.subject.id == eid else claim.subject.id
-                adj.add(other)
+                if isinstance(c, dict):
+                    s = c.get("subject", {}).get("id", "")
+                    o = c.get("object", {}).get("id", "")
+                    adj.add(o if s == eid else s)
             neighbors[eid] = adj
 
         # Build candidate-level adjacency: two candidates are connected if
@@ -578,19 +583,45 @@ class AskEngine:
         per_entity = max(max_rels // max(len(entity_ids), 1), 5)
 
         for eid in entity_ids:
-            claims = self.db.claims_for(eid)
-            if not claims:
-                continue
-
-            # Get entity display name
             entity = self.db._store.get_entity(eid)
-            ename = (entity or {}).get("display_name", eid)
-            etype = (entity or {}).get("entity_type", "entity")
-            lines.append(f"\n## {ename} ({etype})")
+            if not entity:
+                continue
+            ename = entity.get("display_name", eid)
+            etype = entity.get("entity_type", "entity")
+            claim_count = entity.get("claim_count", 0)
+            lines.append(f"\n## {ename} ({etype}, {claim_count} claims)")
 
-            # Sort by confidence, take budget
-            claims.sort(key=lambda c: -c.confidence)
-            budgeted = claims[:per_entity]
+            # For large entities (>200 claims), use predicate summary (instant)
+            # instead of materializing all claims across Rust→Python boundary.
+            if claim_count > 200 and hasattr(self.db._store, 'entity_predicate_counts'):
+                pred_counts = self.db._store.entity_predicate_counts(eid)
+                if isinstance(pred_counts, list):
+                    # Format predicate summary as evidence (no claim deserialization)
+                    for pred, count in pred_counts[:per_entity]:
+                        lines.append(f"- {ename} {pred} ({count} claims)")
+                    # For large entities, build citations from predicate summary
+                    # (claims_for is too slow — materializes all claims above threshold)
+                    if collect_citations:
+                        for pred, count in pred_counts[:10]:
+                            if len(citations) >= 50:
+                                break
+                            citations.append(Citation(
+                                claim_id="", subject=eid, predicate=pred,
+                                object=f"{count} targets",
+                                confidence=0.8, source_id="aggregate",
+                                source_type="database_import",
+                            ))
+                    budgeted = []  # no per-claim iteration needed
+                else:
+                    raw_claims = self.db._store.claims_for(eid, None, None, 0.0)
+                    raw_claims = [d for d in raw_claims if isinstance(d, dict)]
+                    raw_claims.sort(key=lambda d: -d.get("confidence", 0))
+                    budgeted = [claim_from_dict(d) for d in raw_claims[:per_entity]]
+            else:
+                raw_claims = self.db._store.claims_for(eid, None, None, 0.0)
+                raw_claims = [d for d in raw_claims if isinstance(d, dict)]
+                raw_claims.sort(key=lambda d: -d.get("confidence", 0))
+                budgeted = [claim_from_dict(d) for d in raw_claims[:per_entity]]
 
             # Group by predicate for contradiction detection
             pred_targets: dict[str, list] = {}  # (subj, obj) -> [predicate_ids]

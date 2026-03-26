@@ -1316,6 +1316,46 @@ def _claim_from_dict_inner(d: dict) -> Claim:
     )
 
 
+@dataclass
+class EvalItem:
+    """A single evaluation question with expected answer."""
+    question: str
+    expected_answer: str
+    supporting_claims: list[str] = field(default_factory=list)
+    difficulty: str = "medium"
+    domain: str = ""
+    eval_type: str = ""
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass
+class EvalSet:
+    """A versioned set of evaluation items for a domain."""
+    eval_id: str
+    items: list[EvalItem] = field(default_factory=list)
+    domains: list[str] = field(default_factory=list)
+    created_at: int = 0
+    version: int = 1
+    n_easy: int = 0
+    n_medium: int = 0
+    n_hard: int = 0
+
+
+@dataclass
+class EvalResult:
+    """Result of an agent taking an eval."""
+    eval_id: str
+    agent_id: str
+    score: float = 0.0
+    total: int = 0
+    correct: int = 0
+    per_item: list[dict] = field(default_factory=list)
+    domain_scores: dict[str, float] = field(default_factory=dict)
+    type_scores: dict[str, float] = field(default_factory=dict)
+    elapsed: float = 0.0
+    timestamp: int = 0
+
+
 def entity_summary_from_dict(d: dict) -> EntitySummary:
     """Convert a dict from the Rust store into an EntitySummary dataclass."""
     return EntitySummary(

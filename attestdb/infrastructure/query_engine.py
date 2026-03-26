@@ -200,7 +200,13 @@ class QueryEngine:
             # Sort frontier by max-confidence edge when threshold is active
             frontier_list = list(frontier)
             for eid in frontier_list:
-                for claim in [self._convert_claim(d) for d in self._store.claims_for(eid)]:
+                # Cap claims per entity to avoid materializing 100K+ dicts
+                # for high-degree entities like TP53. Uses min_confidence to
+                # pre-filter at the Rust level when possible.
+                raw = self._store.claims_for(eid, None, None, effective_min_conf)
+                if len(raw) > max_claims:
+                    raw = raw[:max_claims]
+                for claim in [self._convert_claim(d) for d in raw]:
                     if claim.claim_id in seen_claim_ids:
                         continue
                     if claim_filter is not None and not claim_filter(claim):
@@ -436,9 +442,9 @@ class QueryEngine:
         # Check for open inquiries involving the focal entity
         inquiry_ids = []
         try:
-            for d in self._store.claims_for(canonical):
+            for d in self._store.claims_for(canonical, "inquiry", None, 0.0):
                 ic = self._convert_claim(d)
-                if ic.predicate.id == "inquiry" and ic.status == ClaimStatus.ACTIVE:
+                if ic.status == ClaimStatus.ACTIVE:
                     inquiry_ids.append(ic.claim_id)
         except Exception:
             logger.warning("Failed to query inquiries for %s", canonical, exc_info=True)
@@ -552,7 +558,10 @@ class QueryEngine:
                 break
             next_frontier: set[str] = set()
             for eid in list(frontier):
-                for claim in [self._convert_claim(d) for d in self._store.claims_for(eid)]:
+                raw = self._store.claims_for(eid, None, None, 0.0)
+                if len(raw) > max_claims:
+                    raw = raw[:max_claims]
+                for claim in [self._convert_claim(d) for d in raw]:
                     if claim.claim_id in seen_claim_ids:
                         continue
                     if claim.confidence < effective_min_conf:
@@ -630,6 +639,8 @@ class QueryEngine:
             next_frontier: set[str] = set()
             for eid in list(frontier):
                 raw = self._store.claims_for(eid, None, None, 0.0)
+                if len(raw) > 500:
+                    raw = raw[:500]  # cap for high-degree entities
                 claims = [self._convert_claim(d) for d in raw]
                 for claim in claims:
                     other = claim.object.id if claim.subject.id == eid else claim.subject.id

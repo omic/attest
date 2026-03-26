@@ -367,10 +367,16 @@ class HypotheticalContext:
         """Find entities 1-hop from subject/object in parent that are unconnected."""
         subj_neighbors: set[str] = set()
         obj_neighbors: set[str] = set()
-        for d in self._parent._store.claims_for(subj_id, None, None, 0.0):
+        subj_raw = self._parent._store.claims_for(subj_id, None, None, 0.0)
+        if len(subj_raw) > 200:
+            subj_raw = subj_raw[:200]
+        for d in subj_raw:
             c = claim_from_dict(d)
             subj_neighbors.add(c.object.id if c.subject.id == normalize_entity_id(subj_id) else c.subject.id)
-        for d in self._parent._store.claims_for(obj_id, None, None, 0.0):
+        obj_raw = self._parent._store.claims_for(obj_id, None, None, 0.0)
+        if len(obj_raw) > 200:
+            obj_raw = obj_raw[:200]
+        for d in obj_raw:
             c = claim_from_dict(d)
             obj_neighbors.add(c.object.id if c.subject.id == normalize_entity_id(obj_id) else c.subject.id)
 
@@ -496,6 +502,10 @@ class AttestDB:
         instance._security_layer = SecurityLayer(instance)
         from attestdb.infrastructure.ask_engine import AskEngine
         instance._ask_engine = AskEngine(instance)
+        from attestdb.infrastructure.eval_engine import EvalEngine
+        instance._eval_engine = EvalEngine(instance)
+        from attestdb.infrastructure.agent_registry import AgentRegistry
+        instance._agent_registry = AgentRegistry(instance)
         return instance
 
     def __init__(
@@ -661,6 +671,14 @@ class AttestDB:
         # Ask engine (question-answering subsystem)
         from attestdb.infrastructure.ask_engine import AskEngine
         self._ask_engine = AskEngine(self)
+
+        # Eval engine (domain evaluation generation and scoring)
+        from attestdb.infrastructure.eval_engine import EvalEngine
+        self._eval_engine = EvalEngine(self)
+
+        # Agent registry (agent registration and leaderboard)
+        from attestdb.infrastructure.agent_registry import AgentRegistry
+        self._agent_registry = AgentRegistry(self)
 
     # --- TTL cache helper ---
 
@@ -1219,7 +1237,10 @@ class AttestDB:
                 hop_entities = [entity_id] if depth_hop == 0 else list(neighbors)
                 neighbors = set()
                 for eid in hop_entities:
-                    for cd in self._store.claims_for(eid, None, None, 0.0):
+                    eid_claims = self._store.claims_for(eid, None, None, 0.0)
+                    if len(eid_claims) > 500:
+                        eid_claims = eid_claims[:500]
+                    for cd in eid_claims:
                         cid = cd["claim_id"]
                         if cid in seen_claims:
                             continue
@@ -1994,6 +2015,8 @@ class AttestDB:
         if self._embedding_index is None:
             return None
         raw_claims = self._store.claims_for(norm_id, None, None, 0.0)
+        if len(raw_claims) > 200:
+            raw_claims = raw_claims[:200]
         vecs = []
         for c in raw_claims:
             cid = c.get("claim_id") or c.get("id")
@@ -2044,6 +2067,8 @@ class AttestDB:
             results: list[Claim] = []
             for entity in entities:
                 raw_claims = self._store.claims_for(entity.id, None, None, 0.0)
+                if len(raw_claims) > 500:
+                    raw_claims = raw_claims[:500]
                 for d in raw_claims:
                     claim = claim_from_dict(d)
                     if claim.claim_id in seen_claim_ids:
@@ -3611,6 +3636,37 @@ class AttestDB:
         """Multi-LLM consensus with cross-pollination."""
         return self._analytics.agent_consensus(*args, **kwargs)
 
+    # --- Eval engine (delegated to EvalEngine) ---
+
+    def generate_eval(self, **kwargs):
+        """Generate a domain evaluation set from the knowledge graph."""
+        return self._eval_engine.generate_eval(**kwargs)
+
+    def score_eval(self, eval_set, agent_answers, agent_id="unknown"):
+        """Score agent answers against an eval set."""
+        return self._eval_engine.score_eval(eval_set, agent_answers, agent_id)
+
+    def eval_history(self, agent_id=None):
+        """Get eval result history from the graph."""
+        return self._eval_engine.eval_history(agent_id)
+
+    # --- Agent registry (delegated to AgentRegistry) ---
+
+    def register_agent(self, agent_id, **kwargs):
+        """Register an agent and its domain expertise."""
+        return self._agent_registry.register(agent_id, **kwargs)
+
+    def list_agents(self):
+        """List all registered agents with their domains and eval scores."""
+        return self._agent_registry.list_agents()
+
+    def agent_profile(self, agent_id):
+        """Get full agent profile: domains, capabilities, eval history."""
+        return self._agent_registry.agent_profile(agent_id)
+
+    def agent_leaderboard(self, domain=None):
+        """Rank agents by eval score, optionally filtered by domain."""
+        return self._agent_registry.leaderboard(domain)
 
 
 # Backward-compat alias

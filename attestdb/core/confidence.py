@@ -129,7 +129,7 @@ def source_confidence_ceiling(source_type: str) -> float:
     """Maximum confidence a source type is allowed to claim.
 
     Prevents confidence inflation from agents that always submit high values.
-    Ceiling = min(tier1 * 1.5, 0.95). Unknown source types get 0.70.
+    Ceiling = min(tier1 * 1.5, 0.95). Unknown source types get 0.75.
     """
     base = tier1_confidence(source_type)
     return min(base * 1.5, 0.95)
@@ -137,7 +137,7 @@ def source_confidence_ceiling(source_type: str) -> float:
 
 LLM_SOURCE_TYPES: frozenset = frozenset({
     "llm_inference", "claude_chat", "claude_code", "agent_session",
-    "literature_extraction",
+    "agent", "literature_extraction",
 })
 
 
