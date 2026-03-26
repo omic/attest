@@ -12,6 +12,9 @@ from attestdb.core.types import AskResult, Citation, claim_from_dict
 
 DEFAULT_MAX_RELATIONSHIPS = 60
 ENTITY_BUDGET_FLOOR = 15
+# Cap for claims_for() on high-degree entities — avoids materializing 100K+ dicts
+_LARGE_ENTITY_THRESHOLD = 200
+_NEIGHBOR_CLAIMS_CAP = 200
 
 
 class AskEngine:
@@ -166,7 +169,7 @@ class AskEngine:
         neighbors: dict[str, set[str]] = {}
         for eid in entity_ids:
             raw = self.db._store.claims_for(eid, None, None, 0.0)
-            if len(raw) > 200:
+            if len(raw) > _NEIGHBOR_CLAIMS_CAP:
                 raw = raw[:200]
             adj: set[str] = set()
             for c in raw:
@@ -591,33 +594,31 @@ class AskEngine:
             claim_count = entity.get("claim_count", 0)
             lines.append(f"\n## {ename} ({etype}, {claim_count} claims)")
 
+            budgeted = []
+
             # For large entities (>200 claims), use predicate summary (instant)
             # instead of materializing all claims across Rust→Python boundary.
-            if claim_count > 200 and hasattr(self.db._store, 'entity_predicate_counts'):
+            if claim_count > _LARGE_ENTITY_THRESHOLD and hasattr(self.db._store, 'entity_predicate_counts'):
                 pred_counts = self.db._store.entity_predicate_counts(eid)
                 if isinstance(pred_counts, list):
-                    # Format predicate summary as evidence (no claim deserialization)
                     for pred, count in pred_counts[:per_entity]:
                         lines.append(f"- {ename} {pred} ({count} claims)")
-                    # For large entities, build citations from predicate summary
-                    # (claims_for is too slow — materializes all claims above threshold)
+                    # Build summary citations (aggregate, not individual claims)
                     if collect_citations:
                         for pred, count in pred_counts[:10]:
                             if len(citations) >= 50:
                                 break
                             citations.append(Citation(
-                                claim_id="", subject=eid, predicate=pred,
+                                claim_id=f"summary:{eid}:{pred}",
+                                subject=eid, predicate=pred,
                                 object=f"{count} targets",
-                                confidence=0.8, source_id="aggregate",
-                                source_type="database_import",
+                                confidence=min(0.7, count / 100),
+                                source_id="predicate_summary",
+                                source_type="aggregate",
                             ))
-                    budgeted = []  # no per-claim iteration needed
-                else:
-                    raw_claims = self.db._store.claims_for(eid, None, None, 0.0)
-                    raw_claims = [d for d in raw_claims if isinstance(d, dict)]
-                    raw_claims.sort(key=lambda d: -d.get("confidence", 0))
-                    budgeted = [claim_from_dict(d) for d in raw_claims[:per_entity]]
-            else:
+
+            if not budgeted and claim_count <= _LARGE_ENTITY_THRESHOLD:
+                # Small entity: safe to materialize all claims
                 raw_claims = self.db._store.claims_for(eid, None, None, 0.0)
                 raw_claims = [d for d in raw_claims if isinstance(d, dict)]
                 raw_claims.sort(key=lambda d: -d.get("confidence", 0))
@@ -678,6 +679,20 @@ class AskEngine:
                                 "claim_a": "", "claim_b": "",
                                 "description": desc, "status": "unresolved",
                             })
+
+        # Detect knowledge gaps: entities with very few relationship types
+        if collect_citations:
+            from attestdb.core.vocabulary import BUILT_IN_PREDICATE_TYPES
+            for eid in entity_ids:
+                entity = self.db._store.get_entity(eid)
+                if not entity:
+                    continue
+                cc = entity.get("claim_count", 0)
+                if cc > 0 and hasattr(self.db._store, 'entity_predicate_counts'):
+                    preds = self.db._store.entity_predicate_counts(eid)
+                    if isinstance(preds, list) and len(preds) <= 2 and cc > 10:
+                        ename = entity.get("display_name", eid)
+                        all_gaps.append(f"{ename} has {cc} claims but only {len(preds)} relationship types")
 
         evidence_text = "\n".join(lines)
         if collect_citations:

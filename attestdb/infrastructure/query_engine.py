@@ -442,6 +442,8 @@ class QueryEngine:
         # Check for open inquiries involving the focal entity
         inquiry_ids = []
         try:
+            # Filter by predicate_type="inquiry" — works because inquiry claims
+            # are ingested with predicate=("inquiry", "inquiry") (id == type).
             for d in self._store.claims_for(canonical, "inquiry", None, 0.0):
                 ic = self._convert_claim(d)
                 if ic.status == ClaimStatus.ACTIVE:
@@ -535,65 +537,18 @@ class QueryEngine:
     ) -> tuple[ContextFrame, QueryProfile]:
         """Like query() but also returns a QueryProfile with timing and counts."""
         t0 = time.time()
-        exclude = set(exclude_source_types or [])
-        effective_min_conf = max(min_confidence, confidence_threshold)
-        allowed_predicates = set(predicate_types) if predicate_types else None
 
-        # STEP 1: Resolve
-        canonical = self._store.resolve(normalize_entity_id(focal_entity))
-        raw_entity = self._store.get_entity(canonical)
-        if raw_entity is None:
-            raise EntityNotFoundError(f"Entity not found: {focal_entity}")
-
-        # STEP 2: BFS
-        candidates: list[tuple[Claim, int, str]] = []
-        visited_entities: set[str] = {canonical}
-        aliases = self._store.get_alias_group(canonical)
-        visited_entities.update(aliases)
-        frontier: set[str] = set(aliases)
-        seen_claim_ids: set[str] = set()
-
-        for hop in range(1, depth + 1):
-            if not frontier:
-                break
-            next_frontier: set[str] = set()
-            for eid in list(frontier):
-                raw = self._store.claims_for(eid, None, None, 0.0)
-                if len(raw) > max_claims:
-                    raw = raw[:max_claims]
-                for claim in [self._convert_claim(d) for d in raw]:
-                    if claim.claim_id in seen_claim_ids:
-                        continue
-                    if claim.confidence < effective_min_conf:
-                        continue
-                    if claim.provenance.source_type in exclude:
-                        continue
-                    if claim.status != ClaimStatus.ACTIVE:
-                        continue
-                    if claim.expires_at > 0 and time.time_ns() >= claim.expires_at:
-                        continue
-                    if allowed_predicates and claim.predicate.id not in allowed_predicates:
-                        continue
-                    seen_claim_ids.add(claim.claim_id)
-                    candidates.append((claim, hop, eid))
-                    if claim.subject.id == eid or claim.subject.id in visited_entities:
-                        other = claim.object.id
-                    else:
-                        other = claim.subject.id
-                    if other not in visited_entities:
-                        next_frontier.add(other)
-                        visited_entities.add(other)
-            frontier = next_frontier
-
-        total_candidates = len(candidates)
-
-        # Run normal query for the frame
+        # Run the query once — derive candidate count from the result
+        # (previously ran a full BFS here then threw it away and called query() again)
         frame = self.query(
             focal_entity, depth, min_confidence, exclude_source_types,
             max_claims, max_tokens,
             confidence_threshold=confidence_threshold,
             predicate_types=predicate_types,
         )
+
+        canonical = normalize_entity_id(focal_entity)
+        total_candidates = frame.claim_count
 
         elapsed_ms = (time.time() - t0) * 1000
 
@@ -640,7 +595,11 @@ class QueryEngine:
             for eid in list(frontier):
                 raw = self._store.claims_for(eid, None, None, 0.0)
                 if len(raw) > 500:
-                    raw = raw[:500]  # cap for high-degree entities
+                    # For path search: always check target edges first before capping,
+                    # so we don't miss a direct connection on high-degree entities.
+                    target_edges = [d for d in raw if
+                        (d.get("subject", {}).get("id") == rb or d.get("object", {}).get("id") == rb)]
+                    raw = target_edges + [d for d in raw[:500] if d not in target_edges]
                 claims = [self._convert_claim(d) for d in raw]
                 for claim in claims:
                     other = claim.object.id if claim.subject.id == eid else claim.subject.id
