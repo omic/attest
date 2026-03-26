@@ -8,7 +8,7 @@
 
 > Licensed under the [Business Source License 1.1](LICENSE). Free to use, modify, and self-host. Cannot be offered as a competing managed service. Converts to Apache 2.0 after 4 years.
 
-**The database for agents.** Persistent memory that compounds across sessions -- every fact sourced, every claim confidence-weighted, every failure a data point that prunes the search tree for everyone. `pip install`, single file, no server.
+**The database for agents.** Persistent memory that compounds across sessions -- every fact sourced, every claim confidence-weighted, every failure a data point that prunes the search tree for everyone. `pip install`, single file, no server. 1.3M claims/sec ingestion, 8us entity query.
 
 ## Install
 
@@ -70,7 +70,7 @@ attest_research_context("bincode serialization")
 # Returns: dead ends, prior findings, active strategies, prior investigators
 ```
 
-36 MCP tools total. Works with Claude Code, Cursor, Windsurf, and Codex.
+84 MCP tools total. Works with Claude Code, Cursor, Windsurf, and Codex.
 
 ## Multi-Agent Collaborative Research
 
@@ -110,13 +110,13 @@ Content-addressed claims (`content_id` = SHA-256 of subject+predicate+object) en
 
 ## Rust Backend
 
-For 100x faster ingestion (1M+ claims/sec), install the Rust storage engine:
+The Rust storage engine powers all operations (1.3M claims/sec ingestion, 8us entity query). Install separately if not bundled:
 
 ```bash
 pip install attest-py
 ```
 
-Attest uses the Rust backend automatically when available.
+Attest uses the Rust backend automatically when available. LMDB storage: instant crash recovery, concurrent readers, O(1) memory open for any database size.
 
 ## Core Capabilities
 
@@ -124,8 +124,10 @@ Attest uses the Rust backend automatically when available.
 - **Confidence scoring** -- Tier 1 (direct evidence) + Tier 2 (corroboration)
 - **Retraction with cascade** -- `db.retract("source_123")` propagates downstream
 - **Time travel** -- `db.at(timestamp)` for point-in-time views
+- **Graph algorithms** -- PageRank, betweenness centrality, SVD embeddings, causal prediction
+- **Contradiction resolution** -- evidence-weighted voting across corroboration, source tier, recency
 - **Snapshot/Restore** -- `db.snapshot(path)` and `AttestDB.restore(path)`
-- **MCP server** -- 36 tools for AI agent integration
+- **MCP server** -- 84 tools for AI agent integration
 - **Embedding index** -- HNSW similarity search via usearch
 - **Audit chain** -- tamper-evident Merkle hash chain on append-only log
 - **Multi-agent research** -- agent registration, task queue, federation
@@ -175,7 +177,7 @@ See `docs/` for full architecture and design documentation:
 
 ```bash
 pip install attestdb[dev]
-pytest tests/unit/ tests/integration/   # ~35 tests, <30s
+pytest tests/unit/ tests/integration/   # ~1100 tests, <75s
 cd rust && cargo test                   # Rust unit + golden vectors
 ```
 

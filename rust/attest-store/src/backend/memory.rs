@@ -696,16 +696,21 @@ impl MemoryBackend {
         predicate_type: Option<&str>,
         source_type: Option<&str>,
         min_confidence: f64,
+        limit: usize,
     ) -> Vec<Claim> {
         let resolved = self.resolve(entity_id);
         let aliases = self.get_alias_group(&resolved);
-        self.claims
+        let iter = self.claims
             .for_entity_filtered(&aliases, predicate_type, source_type, min_confidence)
             .into_iter()
             .filter(|c| self.should_include_claim(&c.claim_id) && self.should_include_namespace(&c.namespace))
             .cloned()
-            .map(|mut c| { Self::apply_status_overlay(&self.status_overrides, &mut c); c })
-            .collect()
+            .map(|mut c| { Self::apply_status_overlay(&self.status_overrides, &mut c); c });
+        if limit > 0 {
+            iter.take(limit).collect()
+        } else {
+            iter.collect()
+        }
     }
 
     /// Get outgoing causal edges for an entity — lightweight, returns
@@ -745,7 +750,7 @@ impl MemoryBackend {
         min_confidence: f64,
         include_inverse: bool,
     ) -> Vec<Claim> {
-        let mut results = self.claims_for(entity_id, predicate_type, source_type, min_confidence);
+        let mut results = self.claims_for(entity_id, predicate_type, source_type, min_confidence, 0);
         if !include_inverse {
             return results;
         }

@@ -479,8 +479,9 @@ impl RustStore {
         predicate_type: Option<&str>,
         source_type: Option<&str>,
         min_confidence: f64,
+        limit: usize,
     ) -> Vec<Claim> {
-        self.backend.claims_for(entity_id, predicate_type, source_type, min_confidence)
+        self.backend.claims_for(entity_id, predicate_type, source_type, min_confidence, limit)
     }
 
     /// Get claims for an entity, optionally including inverse-derived claims.
@@ -816,12 +817,12 @@ mod tests {
     #[test]
     fn test_claims_for() {
         let mut store = setup_store();
-        let claims = store.claims_for("brca1", None, None, 0.0);
+        let claims = store.claims_for("brca1", None, None, 0.0, 0);
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].claim_id, "c1");
 
         // tp53 is in both claims
-        let claims = store.claims_for("tp53", None, None, 0.0);
+        let claims = store.claims_for("tp53", None, None, 0.0, 0);
         assert_eq!(claims.len(), 2);
     }
 
@@ -829,7 +830,7 @@ mod tests {
     fn test_claims_for_with_filters() {
         let mut store = setup_store();
         // Filter by source_type
-        let claims = store.claims_for("tp53", None, Some("experimental"), 0.0);
+        let claims = store.claims_for("tp53", None, Some("experimental"), 0.0, 0);
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].claim_id, "c1");
     }
@@ -1481,11 +1482,11 @@ mod tests {
         assert_eq!(all[0].claim_id, "c2");
 
         // claims_for should exclude c1
-        let claims = store.claims_for("brca1", None, None, 0.0);
+        let claims = store.claims_for("brca1", None, None, 0.0, 0);
         assert_eq!(claims.len(), 0);
 
         // claims_for tp53 should only have c2
-        let claims = store.claims_for("tp53", None, None, 0.0);
+        let claims = store.claims_for("tp53", None, None, 0.0, 0);
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].claim_id, "c2");
     }
@@ -1762,7 +1763,7 @@ mod tests {
         store.insert_claim(make_ns_claim("c2", "a", "rel", "b", "ns2"));
 
         store.set_namespace_filter(vec!["ns1".to_string()]);
-        let claims = store.claims_for("a", None, None, 0.0);
+        let claims = store.claims_for("a", None, None, 0.0, 0);
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].claim_id, "c1");
     }
@@ -1838,7 +1839,7 @@ mod tests {
         assert!(store.claim_exists("c3"));
 
         // Adjacency updated
-        let claims = store.claims_for("a", None, None, 0.0);
+        let claims = store.claims_for("a", None, None, 0.0, 0);
         assert_eq!(claims.len(), 3);
     }
 
@@ -2060,11 +2061,11 @@ mod lmdb_tests {
     fn test_lmdb_claims_for() {
         let (path, _guard) = temp_db();
         let mut store = setup_store(path.to_str().unwrap());
-        let claims = store.claims_for("brca1", None, None, 0.0);
+        let claims = store.claims_for("brca1", None, None, 0.0, 0);
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].claim_id, "c1");
 
-        let claims = store.claims_for("tp53", None, None, 0.0);
+        let claims = store.claims_for("tp53", None, None, 0.0, 0);
         assert_eq!(claims.len(), 2);
     }
 
@@ -2072,7 +2073,7 @@ mod lmdb_tests {
     fn test_lmdb_claims_for_with_filters() {
         let (path, _guard) = temp_db();
         let mut store = setup_store(path.to_str().unwrap());
-        let claims = store.claims_for("tp53", None, Some("experimental"), 0.0);
+        let claims = store.claims_for("tp53", None, Some("experimental"), 0.0, 0);
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].claim_id, "c1");
     }
@@ -2459,7 +2460,7 @@ mod lmdb_tests {
             assert_eq!(claims[0].namespace, "team_alpha");
 
             // Verify claims_for also filters
-            let claims = store.claims_for("a", None, None, 0.0);
+            let claims = store.claims_for("a", None, None, 0.0, 0);
             assert_eq!(claims.len(), 1);
             assert_eq!(claims[0].claim_id, "c1");
 
@@ -2487,7 +2488,7 @@ mod lmdb_tests {
         assert!(e.is_some());
         assert_eq!(e.unwrap().name, "BRCA1");
 
-        let claims = ro_store.claims_for("tp53", None, None, 0.0);
+        let claims = ro_store.claims_for("tp53", None, None, 0.0, 0);
         assert_eq!(claims.len(), 2); // tp53 appears in both c1 and c2
 
         let results = ro_store.search_entities("BRCA1", 10);
@@ -2521,8 +2522,8 @@ mod lmdb_tests {
         let e2 = ro2.get_entity("tp53");
         assert!(e2.is_some());
 
-        let claims1 = ro1.claims_for("tp53", None, None, 0.0);
-        let claims2 = ro2.claims_for("brca1", None, None, 0.0);
+        let claims1 = ro1.claims_for("tp53", None, None, 0.0, 0);
+        let claims2 = ro2.claims_for("brca1", None, None, 0.0, 0);
         assert_eq!(claims1.len(), 2);
         assert_eq!(claims2.len(), 1);
     }
@@ -2630,10 +2631,10 @@ mod lmdb_tests {
         assert_eq!(store.stats().total_claims, 3);
 
         // Adjacency works for batch-inserted claims
-        let claims_a = store.claims_for("a", None, None, 0.0);
+        let claims_a = store.claims_for("a", None, None, 0.0, 0);
         assert_eq!(claims_a.len(), 2); // c1 + c3
 
-        let claims_b = store.claims_for("b", None, None, 0.0);
+        let claims_b = store.claims_for("b", None, None, 0.0, 0);
         assert_eq!(claims_b.len(), 2); // c1 + c2
 
         // BFS traversal works

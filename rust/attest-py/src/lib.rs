@@ -481,18 +481,19 @@ impl PyRustStore {
         Ok(list.into())
     }
 
-    #[pyo3(signature = (entity_id, predicate_type=None, source_type=None, min_confidence=0.0))]
+    #[pyo3(signature = (entity_id, predicate_type=None, source_type=None, min_confidence=0.0, limit=0))]
     fn claims_for<'py>(
         &mut self,
         entity_id: &str,
         predicate_type: Option<&str>,
         source_type: Option<&str>,
         min_confidence: f64,
+        limit: usize,
         py: Python<'py>,
     ) -> PyResult<PyObject> {
         let claims =
             self.inner
-                .claims_for(entity_id, predicate_type, source_type, min_confidence);
+                .claims_for(entity_id, predicate_type, source_type, min_confidence, limit);
         let list = PyList::empty(py);
         for c in &claims {
             list.append(claim_to_dict(py, c)?)?;

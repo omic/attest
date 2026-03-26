@@ -3266,6 +3266,44 @@ class AttestDB:
 
         return count
 
+    def pagerank(self, damping: float = 0.85, top_k: int = 0) -> dict[str, float]:
+        """Compute PageRank centrality over the knowledge graph.
+
+        Args:
+            damping: Damping factor (0.85 standard).
+            top_k: If > 0, return only the top-K entities by rank. 0 = all.
+
+        Returns:
+            {entity_id: pagerank_score} sorted by score descending.
+        """
+        from attestdb.intelligence.graph_embeddings import compute_pagerank
+
+        adj = self.get_adjacency_list()
+        scores = compute_pagerank(adj, damping=damping)
+        ranked = dict(sorted(scores.items(), key=lambda x: x[1], reverse=True))
+        if top_k > 0:
+            return dict(list(ranked.items())[:top_k])
+        return ranked
+
+    def betweenness(self, sample_size: int = 200, top_k: int = 0) -> dict[str, float]:
+        """Approximate betweenness centrality (identifies bridge entities).
+
+        Args:
+            sample_size: Number of source nodes for approximation (200 = fast).
+            top_k: If > 0, return only the top-K entities. 0 = all.
+
+        Returns:
+            {entity_id: betweenness_score} sorted descending.
+        """
+        from attestdb.intelligence.graph_embeddings import compute_betweenness_centrality
+
+        adj = self.get_adjacency_list()
+        scores = compute_betweenness_centrality(adj, sample_size=sample_size)
+        ranked = dict(sorted(scores.items(), key=lambda x: x[1], reverse=True))
+        if top_k > 0:
+            return dict(list(ranked.items())[:top_k])
+        return ranked
+
     # --- Schema ---
 
     def schema(self) -> SchemaDescriptor:

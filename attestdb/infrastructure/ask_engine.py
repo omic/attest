@@ -99,7 +99,7 @@ class AskEngine:
                     model=model,
                     messages=messages,
                     temperature=temperature,
-                    timeout=60,
+                    timeout=30,
                     **param_kwargs,
                 )
                 content = r.choices[0].message.content

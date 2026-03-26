@@ -217,6 +217,7 @@ pub trait StorageBackend {
         predicate_type: Option<&str>,
         source_type: Option<&str>,
         min_confidence: f64,
+        limit: usize,
     ) -> Vec<Claim>;
 
     /// Get the provenance chain for a claim.

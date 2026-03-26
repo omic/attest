@@ -1666,6 +1666,7 @@ impl LmdbBackend {
         predicate_type: Option<&str>,
         source_type: Option<&str>,
         min_confidence: f64,
+        limit: usize,
     ) -> Vec<Claim> {
         let resolved = self.resolve(entity_id);
         let aliases = self.get_alias_group(&resolved);
@@ -1677,7 +1678,7 @@ impl LmdbBackend {
 
         let claims = self.claims_for_entities(&rtxn, &aliases);
 
-        claims.into_iter().filter(|c| {
+        let iter = claims.into_iter().filter(|c| {
             if !self.should_include_claim(&c.claim_id) { return false; }
             if !self.should_include_namespace(&c.namespace) { return false; }
             if let Some(pt) = predicate_type {
@@ -1687,8 +1688,12 @@ impl LmdbBackend {
                 if c.provenance.source_type != st { return false; }
             }
             c.confidence >= min_confidence
-        }).map(|mut c| { self.apply_status_overlay_fast(&mut c); c })
-        .collect()
+        }).map(|mut c| { self.apply_status_overlay_fast(&mut c); c });
+        if limit > 0 {
+            iter.take(limit).collect()
+        } else {
+            iter.collect()
+        }
     }
 
     pub fn get_claim_provenance_chain(&self, claim_id: &str) -> Vec<String> {
@@ -1845,7 +1850,7 @@ impl LmdbBackend {
         min_confidence: f64,
         include_inverse: bool,
     ) -> Vec<Claim> {
-        let mut results = self.claims_for(entity_id, predicate_type, source_type, min_confidence);
+        let mut results = self.claims_for(entity_id, predicate_type, source_type, min_confidence, 0);
         if !include_inverse {
             return results;
         }
@@ -3327,7 +3332,7 @@ mod tests {
         assert_eq!(bfs.len(), 2, "BFS depth 1 from brca1 should find 2 claims");
 
         // claims_for should return both claims for brca1
-        let claims = backend.claims_for("brca1", None, None, 0.0);
+        let claims = backend.claims_for("brca1", None, None, 0.0, 0);
         assert_eq!(claims.len(), 2, "claims_for brca1 should return 2 claims");
 
         // entity_type_idx: "gene" type should have 3 entities

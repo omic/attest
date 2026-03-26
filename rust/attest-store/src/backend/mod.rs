@@ -329,10 +329,11 @@ impl StorageBackend for Backend {
         predicate_type: Option<&str>,
         source_type: Option<&str>,
         min_confidence: f64,
+        limit: usize,
     ) -> Vec<Claim> {
         match self {
-            Backend::InMemory(m) => m.claims_for(entity_id, predicate_type, source_type, min_confidence),
-            Backend::Lmdb(l) => l.claims_for(entity_id, predicate_type, source_type, min_confidence),
+            Backend::InMemory(m) => m.claims_for(entity_id, predicate_type, source_type, min_confidence, limit),
+            Backend::Lmdb(l) => l.claims_for(entity_id, predicate_type, source_type, min_confidence, limit),
         }
     }
 

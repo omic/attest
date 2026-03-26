@@ -517,7 +517,7 @@ class AnalyticsEngine:
         """Analyze consensus around a topic (entity)."""
         from attestdb.core.types import ConsensusReport
 
-        claims = self.db.claims_for(topic)
+        claims = self.db.claims_for(topic)[:500]
         if not claims:
             return ConsensusReport(topic=topic)
 
@@ -765,10 +765,10 @@ class AnalyticsEngine:
 
         related = set()
         if subj_exists:
-            for c in self.db.claims_for(claim.subject[0]):
+            for c in self.db.claims_for(claim.subject[0])[:200]:
                 related.add(c.object.id)
         if obj_exists:
-            for c in self.db.claims_for(claim.object[0]):
+            for c in self.db.claims_for(claim.object[0])[:200]:
                 related.add(c.subject.id)
 
         return HypotheticalReport(
@@ -870,7 +870,7 @@ class AnalyticsEngine:
         ):
             if checked >= max_intermediaries:
                 break
-            mid_claims = self.db._store.claims_for(mid, None, None, 0.0)
+            mid_claims = self.db._store.claims_for(mid, None, None, 0.0)[:200]
             checked += 1
             for d in mid_claims:
                 mc = claim_from_dict(d)
@@ -1296,7 +1296,7 @@ class AnalyticsEngine:
                 ]
             if not hop2_iter:
                 # Slow path fallback
-                mid_claims = self.db._store.claims_for(mid, None, None, 0.0)
+                mid_claims = self.db._store.claims_for(mid, None, None, 0.0)[:300]
                 for d in mid_claims:
                     mc = claim_from_dict(d)
                     if (mc.subject.id == mid
@@ -1409,7 +1409,7 @@ class AnalyticsEngine:
         # Include retracted claims to track retractions in evolution
         self.db._set_include_retracted(True)
         try:
-            all_claims = self.db.claims_for(eid)
+            all_claims = self.db.claims_for(eid)[:500]
         finally:
             self.db._set_include_retracted(False)
         if not all_claims:
@@ -1544,7 +1544,7 @@ class AnalyticsEngine:
                     to_eid = b_norm
 
                 # Get all claims between from_eid and to_eid
-                from_claims = self.db.claims_for(from_eid)
+                from_claims = self.db.claims_for(from_eid)[:300]
                 hop_claims = [
                     c for c in from_claims
                     if (c.subject.id == from_eid and c.object.id == to_eid)
@@ -1760,7 +1760,8 @@ class AnalyticsEngine:
             degree = len(adj.get(inv.entity_id, set()))
             boost = min(degree / 20.0, 1.0)
             inv.priority_score *= (1.0 + 0.5 * boost)
-            inv.affected_downstream = len(self.db.claims_for(inv.entity_id))
+            # Use adjacency degree as proxy — avoids materializing all claims
+            inv.affected_downstream = degree
 
         investigations.sort(key=lambda x: x.priority_score, reverse=True)
         return investigations[:top_k]
@@ -2171,7 +2172,7 @@ class AnalyticsEngine:
                     if len(bridge.communities) < 2:
                         continue
                     # Compare predicates used in each community
-                    bridge_claims = self.db.claims_for(bridge.entity_id)
+                    bridge_claims = self.db.claims_for(bridge.entity_id)[:300]
                     comm_predicates: dict[str, set[str]] = {}
                     for claim in bridge_claims:
                         for cid in bridge.communities:
@@ -2244,11 +2245,11 @@ class AnalyticsEngine:
                             continue
                         # Get predicates along the path
                         claims_a_n1 = [
-                            c for c in self.db.claims_for(entity.id)
+                            c for c in self.db.claims_for(entity.id)[:300]
                             if c.object.id == n1 or c.subject.id == n1
                         ]
                         claims_n1_n2 = [
-                            c for c in self.db.claims_for(n1)
+                            c for c in self.db.claims_for(n1)[:300]
                             if c.object.id == n2 or c.subject.id == n2
                         ]
                         if not claims_a_n1 or not claims_n1_n2:
@@ -2345,7 +2346,7 @@ class AnalyticsEngine:
 
         # Get A:B relationship predicates
         ab_claims = [
-            c for c in self.db.claims_for(entity_a)
+            c for c in self.db.claims_for(entity_a)[:500]
             if c.object.id == entity_b or c.subject.id == entity_b
         ]
         if not ab_claims:
@@ -2682,8 +2683,9 @@ class AnalyticsEngine:
 
     def resolve_contradictions(
         self, top_k: int = 10, auto_resolve: bool = False, use_llm: bool = False,
+        for_entity: str | None = None,
     ) -> ContradictionReport:
-        """Find and score all contradictions in the knowledge graph.
+        """Find and score contradictions in the knowledge graph.
 
         Uses OPPOSITE_PREDICATES to detect contradicting claims on the
         same (subject, object) pair, scores evidence quality on each side,
@@ -2693,6 +2695,8 @@ class AnalyticsEngine:
             top_k: Maximum contradictions to return.
             auto_resolve: If True, ingest meta-claims for resolved contradictions.
             use_llm: If True and ambiguous, use LLM for adjudication.
+            for_entity: If set, only find contradictions involving this entity
+                (much faster than full-scan for large databases).
 
         Returns:
             ContradictionReport with scored analyses.
@@ -2704,7 +2708,10 @@ class AnalyticsEngine:
         )
         from attestdb.core.vocabulary import OPPOSITE_PREDICATES
 
-        all_claims = self.db._all_claims()
+        if for_entity:
+            all_claims = self.db.claims_for(for_entity)[:500]
+        else:
+            all_claims = self.db._all_claims()
 
         # Group by (subject.id, object.id) → {predicate: [claims]}
         pair_preds: dict[tuple[str, str], dict[str, list[Claim]]] = {}
@@ -2734,17 +2741,19 @@ class AnalyticsEngine:
                         sources = {c.provenance.source_id for c in claims}
                         source_types = sorted({c.provenance.source_type for c in claims})
                         corr = count_independent_sources(claims)
-                        avg_conf = (
-                            sum(tier1_confidence(c.provenance.source_type) for c in claims)
-                            / len(claims)
-                        )
+                        # Tier-weighted confidence: experimental > database > llm
+                        tier_scores = [tier1_confidence(c.provenance.source_type) for c in claims]
+                        avg_conf = sum(tier_scores) / len(tier_scores)
+                        # Bonus for having high-tier sources (experimental, curated)
+                        max_tier = max(tier_scores) if tier_scores else 0.0
                         newest = max(c.timestamp for c in claims)
                         rec = recency_factor(newest)
                         weight = (
-                            0.35 * min(corr / 5, 1.0)
-                            + 0.25 * avg_conf
-                            + 0.20 * min(len(sources) / 3, 1.0)
-                            + 0.20 * rec
+                            0.30 * min(corr / 5, 1.0)        # corroboration
+                            + 0.25 * avg_conf                 # avg source tier
+                            + 0.15 * max_tier                 # best source quality
+                            + 0.15 * min(len(sources) / 3, 1.0)  # source diversity
+                            + 0.15 * rec                      # recency
                         )
                         return ContradictionSide(
                             predicate=pred,
@@ -3076,7 +3085,7 @@ class AnalyticsEngine:
         opp = OPPOSITE_PREDICATES.get(pred_id)
         if opp:
             # Look for opposite predicate on same (subj, obj)
-            all_subj_claims = self.db.claims_for(subj_id)
+            all_subj_claims = self.db.claims_for(subj_id)[:300]
             for c in all_subj_claims:
                 if c.predicate.id == opp and c.object.id == obj_id:
                     new_contradictions.append(
@@ -3119,7 +3128,7 @@ class AnalyticsEngine:
         from attestdb.core.normalization import normalize_entity_id
 
         eid = normalize_entity_id(entity_id)
-        entity_claims = self.db.claims_for(eid)
+        entity_claims = self.db.claims_for(eid)[:500]
 
         if not entity_claims:
             return SimulationReport(
@@ -3275,7 +3284,7 @@ class AnalyticsEngine:
             cluster_claims: list[Claim] = []
             claim_ids_seen: set[str] = set()
             for eid in cluster:
-                for c in self.db.claims_for(eid):
+                for c in self.db.claims_for(eid)[:200]:
                     if c.claim_id not in claim_ids_seen and c.status == ClaimStatus.ACTIVE:
                         claim_ids_seen.add(c.claim_id)
                         cluster_claims.append(c)
@@ -3564,7 +3573,7 @@ class AnalyticsEngine:
             Forecast with predicted connections and growth trajectory.
         """
         eid = normalize_entity_id(entity_id)
-        entity_claims = self.db.claims_for(eid)
+        entity_claims = self.db.claims_for(eid)[:500]
 
         if not entity_claims:
             return Forecast(entity_id=eid)
@@ -3587,7 +3596,7 @@ class AnalyticsEngine:
                     candidates.setdefault(hop2, {"bridges": [], "predicates": []})
                     candidates[hop2]["bridges"].append(neighbor)
                     # Collect predicates from bridge
-                    for c in self.db.claims_for(neighbor):
+                    for c in self.db.claims_for(neighbor)[:200]:
                         if c.object.id == hop2 or c.subject.id == hop2:
                             candidates[hop2]["predicates"].append(c.predicate.id)
 
