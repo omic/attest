@@ -10,7 +10,7 @@ PROVIDERS = {
     "gemini": {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
         "env_key": "GOOGLE_API_KEY",
-        "default_model": "gemini-flash-lite-latest",
+        "default_model": "gemini-3.1-flash-lite-preview",
     },
     "together": {
         "base_url": "https://api.together.xyz/v1",
