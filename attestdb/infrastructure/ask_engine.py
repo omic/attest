@@ -1,46 +1,119 @@
-"""AskEngine — question-answering subsystem extracted from AttestDB."""
+"""AskEngine — question-answering subsystem extracted from AttestDB.
+
+V2 pipeline: entity-first resolution → graph-native evidence → focused LLM synthesis.
+Replaces slow word-by-word BM25 scanning with three-tier entity extraction.
+"""
 
 from __future__ import annotations
 
+import json
+import logging
+import time
 from collections import deque
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from attestdb.core.types import EntitySummary
 
-from attestdb.core.types import AskResult, Citation, claim_from_dict
+from attestdb.core.normalization import normalize_entity_id
+from attestdb.core.types import AskResult, Citation, PathResult, claim_from_dict
 
-DEFAULT_MAX_RELATIONSHIPS = 60
-ENTITY_BUDGET_FLOOR = 15
-# Cap for claims_for() on high-degree entities — avoids materializing 100K+ dicts
-_LARGE_ENTITY_THRESHOLD = 200
-_NEIGHBOR_CLAIMS_CAP = 200
+logger = logging.getLogger(__name__)
+
+
+def _safe_claims_for(store, eid, pred=None, src=None, min_conf=0.0, limit=0):
+    """Call claims_for with backwards-compatible limit parameter."""
+    try:
+        return store.claims_for(eid, pred, src, min_conf, limit)
+    except TypeError:
+        # Old wheel without limit param — slice in Python
+        result = store.claims_for(eid, pred, src, min_conf)
+        return result[:limit] if limit > 0 else result
+
+
+# Stop words for candidate generation
+_STOP = frozenset({
+    "what", "who", "how", "why", "when", "where", "which", "does",
+    "the", "are", "for", "and", "that", "this", "with", "from",
+    "about", "has", "have", "been", "is", "was", "were", "tell",
+    "me", "show", "find", "get", "list", "of", "in", "on", "at",
+    "by", "an", "a", "do", "did", "our", "we", "us", "made",
+    "being", "last", "recent", "done", "any", "all", "some",
+    "much", "many", "can", "could", "would", "should", "will",
+    "to", "it", "its", "be", "not", "no", "or", "but", "if",
+    "than", "them", "they", "their", "there", "then", "top",
+    "best", "most", "also", "just", "only", "very", "more",
+    "good", "bad", "new", "old", "like", "use", "used", "using",
+    "target", "role", "effect", "type", "cause", "work", "works",
+    "related", "involved", "between", "affect", "impact",
+    "evidence", "suggest", "prevent", "inhibiting", "inhibit",
+    "activate", "activating", "regulate", "know", "known",
+})
+
+# High-frequency domain terms too common for useful BM25 on large bio DBs
+# (each matches 100K+ entities, BM25 scan takes 5-10s per term)
+_BM25_SKIP = frozenset({
+    "disease", "gene", "protein", "cell", "drug", "compound",
+    "treatment", "therapy", "receptor", "enzyme", "tissue",
+    "organ", "syndrome", "disorder", "condition", "mutation",
+    "variant", "expression", "level", "factor", "response",
+})
+
+# Predicate specificity weights for bridge scoring.
+# Causal/mechanistic predicates are more informative than generic associations.
+_PRED_WEIGHT = {
+    "inhibits": 1.0, "activates": 1.0, "binds": 1.0,
+    "upregulates": 0.9, "downregulates": 0.9,
+    "causes": 0.9, "prevents": 0.9, "treats": 0.9,
+    "regulates": 0.7, "interacts": 0.6, "interacts_with": 0.6,
+    "predisposes": 0.7, "contraindicates": 0.7,
+    "expressed_in": 0.4, "participates_in": 0.3,
+    "associated_with": 0.1, "associates": 0.1,
+}
+
+
+def _entity_name(raw, fallback: str = "?") -> str:
+    """Extract best display name from a raw entity dict."""
+    if isinstance(raw, dict):
+        return raw.get("display_name") or raw.get("name") or fallback
+    if hasattr(raw, "name") and raw.name:
+        return raw.name
+    return fallback
+
+
+@dataclass
+class ResolvedEntity:
+    """An entity resolved from a question, with match metadata."""
+    entity_id: str
+    name: str
+    entity_type: str
+    claim_count: int
+    match_tier: int  # 1=exact, 2=bm25, 3=llm
+    original_mention: str
 
 
 class AskEngine:
     """Encapsulates the ask() pipeline and its helpers.
 
-    Holds a back-reference to the owning ``AttestDB`` instance so it can
-    call ``db.search_entities``, ``db.claims_for``, ``db._store``, etc.
+    V2 architecture: entity-first resolution → graph evidence → LLM synthesis.
     """
 
     def __init__(self, db):
         self.db = db
 
-    # --- LLM access ---
+    # ──────────────────────────────────────────────────────────────────
+    # LLM access (unchanged from v1)
+    # ──────────────────────────────────────────────────────────────────
 
     def _get_llm_client(self):
-        """Return (client, model) for LLM calls.
+        """Return (client, model) for LLM calls."""
+        # Use pre-loaded client if available (avoids httpx deadlock in uvicorn)
+        if hasattr(self, '_preloaded_client') and self._preloaded_client:
+            return self._preloaded_client, self._preloaded_model
+        if hasattr(self.db, '_preloaded_llm_client') and self.db._preloaded_llm_client:
+            return self.db._preloaded_llm_client, self.db._preloaded_llm_model
 
-        Prefers direct OpenAI client initialization from env keys (avoids httpx
-        conflicts with uvicorn when text extractor creates its own httpx client).
-        Falls back to text extractor if no env keys are available.
-        """
-        import logging
-        logger = logging.getLogger(__name__)
-
-        # Prefer direct initialization from env keys — creates a fresh httpx client
-        # that doesn't conflict with uvicorn's event loop (unlike text extractor's)
         try:
             from attestdb.core.providers import PROVIDERS, EXTRACTION_FALLBACK_CHAIN
             import os
@@ -55,122 +128,603 @@ class AskEngine:
                     continue
                 client = OpenAI(api_key=key, base_url=provider["base_url"])
                 model = provider["default_model"]
-                logger.info("_get_llm_client: initialized %s/%s directly from env", provider_name, model)
+                logger.info("_get_llm_client: initialized %s/%s", provider_name, model)
                 return client, model
         except ImportError:
             logger.debug("_get_llm_client: openai package not available")
 
-        # Last resort: try text extractor (may cause httpx conflicts in uvicorn)
         try:
             ext = self.db._get_text_extractor()
             if ext._client and ext._llm_model:
-                logger.info("_get_llm_client: using text extractor client (last resort)")
                 return ext._client, ext._llm_model
-        except Exception as exc:
-            logger.debug("_get_llm_client: text extractor unavailable: %s", exc)
+        except Exception:
+            pass
 
-        logger.warning("_get_llm_client: no LLM provider available")
         return None, None
 
-    def _llm_call(self, prompt: str, max_tokens: int = 512, temperature: float = 0.1) -> str | None:
-        """Single LLM call with provider fallback and proper error handling.
+    def _llm_call_via_requests(self, prompt: str, max_tokens: int = 512, temperature: float = 0.1) -> str | None:
+        """LLM call using requests library directly — no httpx, no asyncio deadlock.
 
-        Tries max_completion_tokens first (for reasoning models), falls back
-        to max_tokens. If the primary provider fails, walks the fallback chain.
-        All failures are logged.
+        This is the preferred path when running inside uvicorn or any async framework.
+        Falls through the provider chain until one succeeds.
         """
-        import logging
-        logger = logging.getLogger(__name__)
+        import os
+        try:
+            import requests as _requests
+        except ImportError:
+            return None
 
+        try:
+            from attestdb.core.providers import PROVIDERS, EXTRACTION_FALLBACK_CHAIN
+        except ImportError:
+            return None
+
+        for provider_name in EXTRACTION_FALLBACK_CHAIN:
+            provider = PROVIDERS.get(provider_name)
+            if not provider:
+                continue
+            key = os.environ.get(provider["env_key"], "")
+            if not key:
+                continue
+            try:
+                url = provider["base_url"].rstrip("/") + "/chat/completions"
+                resp = _requests.post(
+                    url,
+                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                    json={
+                        "model": provider["default_model"],
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": max_tokens,
+                        "temperature": temperature,
+                    },
+                    timeout=30,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    if content and content.strip():
+                        logger.info("_llm_call_requests: %s/%s succeeded", provider_name, provider["default_model"])
+                        return content.strip()
+            except Exception as exc:
+                logger.debug("_llm_call_requests: %s failed: %s", provider_name, exc)
+                continue
+
+        return None
+
+    def _llm_call(self, prompt: str, max_tokens: int = 512, temperature: float = 0.1) -> str | None:
+        """LLM call with provider fallback. Tries requests first (uvicorn-safe),
+        falls back to openai library."""
+        # Prefer requests library — avoids httpx/uvicorn deadlock
+        result = self._llm_call_via_requests(prompt, max_tokens, temperature)
+        if result:
+            return result
+
+        # Fallback: openai library (works from CLI, may deadlock in uvicorn)
         client, model = self._get_llm_client()
         if not client:
-            logger.warning("_llm_call: no LLM client available (configure_curator not called or no API key)")
+            logger.warning("_llm_call: no LLM client available")
             return None
 
         messages = [{"role": "user", "content": prompt}]
-
-        # Try with max_completion_tokens first (reasoning models need this)
         for param_name, param_kwargs in [
             ("max_completion_tokens", {"max_completion_tokens": max_tokens}),
             ("max_tokens", {"max_tokens": max_tokens}),
         ]:
             try:
                 r = client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=temperature,
-                    timeout=30,
+                    model=model, messages=messages,
+                    temperature=temperature, timeout=30,
                     **param_kwargs,
                 )
                 content = r.choices[0].message.content
                 if content and content.strip():
                     return content.strip()
-                # Empty content — try next param style
-                logger.debug("_llm_call: %s/%s returned empty content with %s", model, param_name, param_name)
-                continue
-            except Exception as exc:
-                logger.debug("_llm_call: %s/%s failed with %s: %s", model, param_name, type(exc).__name__, exc)
+            except Exception:
                 continue
 
-        # Primary provider failed or returned empty — try fallback providers
-        try:
-            from attestdb.core.providers import PROVIDERS, EXTRACTION_FALLBACK_CHAIN
-            import os
-            from openai import OpenAI
-
-            current_model = model
-            for provider_name in EXTRACTION_FALLBACK_CHAIN:
-                provider = PROVIDERS.get(provider_name)
-                if not provider:
-                    continue
-                key = os.environ.get(provider["env_key"], "")
-                if not key:
-                    continue
-                fallback_model = provider["default_model"]
-                if fallback_model == current_model:
-                    continue  # already tried this one
-                try:
-                    fallback_client = OpenAI(api_key=key, base_url=provider["base_url"])
-                    r = fallback_client.chat.completions.create(
-                        model=fallback_model,
-                        messages=messages,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        timeout=30,
-                    )
-                    content = r.choices[0].message.content
-                    if content and content.strip():
-                        logger.info("_llm_call: fallback to %s/%s succeeded", provider_name, fallback_model)
-                        return content.strip()
-                except Exception as exc:
-                    logger.debug("_llm_call: fallback %s/%s failed: %s", provider_name, fallback_model, exc)
-                    continue
-        except ImportError:
-            pass
-
-        logger.warning("_llm_call: all providers failed for prompt (%d chars)", len(prompt))
+        logger.warning("_llm_call: all providers failed (%d char prompt)", len(prompt))
         return None
 
-    # --- Graph-neighborhood clustering for ask() ---
+    # ──────────────────────────────────────────────────────────────────
+    # Phase A: Entity Extraction (target < 500ms)
+    # ──────────────────────────────────────────────────────────────────
+
+    def _generate_candidates(self, question: str) -> list[str]:
+        """Extract candidate entity mention spans from question text.
+
+        Returns candidate strings longest-first: contiguous non-stopword
+        subsequences of 1-4 words.
+        """
+        words = question.split()
+        clean_words = []
+        for w in words:
+            cleaned = w.strip("?.,!\"'()[]{}:;").lower()
+            if cleaned and len(cleaned) >= 2 and cleaned not in _STOP:
+                clean_words.append((len(clean_words), w.strip("?.,!\"'()[]{}:;")))
+
+        candidates: list[str] = []
+        seen: set[str] = set()
+
+        # Generate contiguous spans of content words (max 4), longest first
+        for span_len in range(min(4, len(clean_words)), 0, -1):
+            for start in range(len(clean_words) - span_len + 1):
+                span = clean_words[start:start + span_len]
+                text = " ".join(w for _, w in span)
+                key = text.lower()
+                if key not in seen:
+                    candidates.append(text)
+                    seen.add(key)
+
+        return candidates
+
+    def _resolve_entity(self, candidate: str) -> ResolvedEntity | None:
+        """Try to resolve a candidate mention to a database entity.
+
+        Tier 1: exact match via normalize_entity_id → get_entity.
+        Tier 2: targeted BM25 search for the full phrase.
+        """
+        # Tier 1: Exact match
+        normalized = normalize_entity_id(candidate)
+        raw = self.db._store.get_entity(normalized)
+        if raw:
+            cc = raw.get("claim_count", 0) if isinstance(raw, dict) else getattr(raw, "claim_count", 0)
+            if cc > 0:
+                name = _entity_name(raw, normalized)
+                etype = raw.get("entity_type", "") if isinstance(raw, dict) else getattr(raw, "entity_type", "")
+                return ResolvedEntity(
+                    entity_id=normalized, name=name or normalized,
+                    entity_type=etype, claim_count=cc,
+                    match_tier=1, original_mention=candidate,
+                )
+
+        # Tier 2: Targeted BM25 — single words only, skip high-frequency terms
+        if len(candidate.split()) > 1:
+            return None
+        if candidate.lower() in _BM25_SKIP:
+            return None
+        hits = self.db.search_entities(candidate, top_k=10)
+        # Pick the hit with highest claim count (not first BM25 rank)
+        best: ResolvedEntity | None = None
+        cand_lower = candidate.lower()
+        cand_words = set(cand_lower.split())
+        for hit in hits:
+            if hit.claim_count > 0:
+                hit_name = (hit.name or hit.id).lower()
+                if any(w in hit_name for w in cand_words if len(w) >= 3):
+                    if best is None or hit.claim_count > best.claim_count:
+                        best = ResolvedEntity(
+                            entity_id=hit.id, name=hit.name or hit.id,
+                            entity_type=hit.entity_type, claim_count=hit.claim_count,
+                            match_tier=2, original_mention=candidate,
+                        )
+        if best:
+            return best
+
+        return None
+
+    def _extract_entities_llm(self, question: str) -> list[tuple[str, str]]:
+        """Tier 3: LLM extraction of entity names from question text."""
+        prompt = (
+            "Extract specific named entities (genes, proteins, diseases, drugs, "
+            "compounds, organisms, pathways, companies, people) from this question. "
+            "Return ONLY a JSON list of [name, type] pairs. No explanation.\n\n"
+            f"Question: {question}\n\n"
+            'Example: [["KRAS", "gene"], ["heart disease", "disease"]]'
+        )
+        response = self._llm_call(prompt, max_tokens=150, temperature=0.0)
+        if not response:
+            return []
+        try:
+            # Strip markdown code fences if present
+            text = response.strip().strip("`")
+            if text.startswith("json"):
+                text = text[4:].strip()
+            parsed = json.loads(text)
+            return [(name, t) for name, t in parsed if isinstance(name, str)]
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return []
+
+    def _extract_question_entities(self, question: str, top_k: int = 10) -> list[ResolvedEntity]:
+        """Master entity extraction: Tier 1 (exact) → Tier 2 (BM25) → Tier 3 (LLM).
+
+        Returns resolved entities sorted by match quality and claim count.
+        """
+        t0 = time.monotonic()
+        candidates = self._generate_candidates(question)
+        resolved: dict[str, ResolvedEntity] = {}
+
+        # Tier 1+2: Try each candidate with exact match then BM25
+        for candidate in candidates:
+            if len(resolved) >= top_k:
+                break
+            entity = self._resolve_entity(candidate)
+            if entity and entity.entity_id not in resolved:
+                resolved[entity.entity_id] = entity
+
+        tier12_time = time.monotonic() - t0
+        logger.info("Entity extraction Tier 1+2: %d entities in %.0fms",
+                     len(resolved), tier12_time * 1000)
+
+        # Tier 3: LLM extraction only if we found 0 entities
+        # (LLM calls add 5-15s; skip if we already have any entity match)
+        if len(resolved) == 0:
+            t1 = time.monotonic()
+            llm_entities = self._extract_entities_llm(question)
+            for name, type_hint in llm_entities:
+                if len(resolved) >= top_k:
+                    break
+                entity = self._resolve_entity(name)
+                if entity and entity.entity_id not in resolved:
+                    entity.match_tier = 3
+                    resolved[entity.entity_id] = entity
+            logger.info("Entity extraction Tier 3 (LLM): +%d entities in %.0fms",
+                         len(resolved) - len([r for r in resolved.values() if r.match_tier <= 2]),
+                         (time.monotonic() - t1) * 1000)
+
+        # Sort: exact matches first, then by claim count
+        result = sorted(resolved.values(), key=lambda r: (-r.match_tier == 1, -r.claim_count))
+        return result[:top_k]
+
+    # ──────────────────────────────────────────────────────────────────
+    # Phase B: Graph-Native Evidence (target < 2s)
+    # ──────────────────────────────────────────────────────────────────
+
+    def _classify_question(self, question: str, entities: list[ResolvedEntity]) -> str:
+        """Classify question type for evidence strategy selection."""
+        q = question.lower()
+        relationship_words = {
+            "cause", "prevent", "inhibit", "affect", "lead", "connect",
+            "interact", "bind", "regulate", "associate", "link", "treat",
+            "target", "pathway", "mechanism", "evidence",
+        }
+        has_rel = any(w in q for w in relationship_words)
+
+        if len(entities) >= 2 and has_rel:
+            return "relationship"
+        if len(entities) == 1:
+            specific = {"bind", "interact", "regulate", "target", "treat", "express", "inhibit"}
+            if any(w in q for w in specific):
+                return "single"
+        return "exploratory"
+
+    def _evidence_single(self, entity: ResolvedEntity) -> tuple[str, list[Citation]]:
+        """Evidence for single-entity questions: predicate summary + top claims."""
+        lines = [f"## {entity.name} ({entity.entity_type}, {entity.claim_count} claims)"]
+        citations: list[Citation] = []
+
+        # Predicate summary (instant — no claim materialization)
+        if hasattr(self.db._store, 'entity_predicate_counts'):
+            pred_counts = self.db._store.entity_predicate_counts(entity.entity_id)
+            if isinstance(pred_counts, list) and pred_counts:
+                lines.append("Relationship types:")
+                for pred, count in pred_counts[:12]:
+                    lines.append(f"  - {pred}: {count} claims")
+
+        # Top claims by confidence — skip for high-degree entities (materialization is too slow)
+        raw_claims = []
+        if entity.claim_count <= 500:
+            raw_claims = _safe_claims_for(self.db._store, entity.entity_id, None, None, 0.3, 30)
+        if raw_claims:
+            lines.append("\nTop relationships:")
+            seen = set()
+            for d in raw_claims:
+                if not isinstance(d, dict):
+                    continue
+                c = claim_from_dict(d)
+                subj = c.subject.display_name or c.subject.id
+                obj = c.object.display_name or c.object.id
+                triple = f"{subj} {c.predicate.id} {obj}"
+                if triple in seen:
+                    continue
+                seen.add(triple)
+                src = c.provenance.source_type if c.provenance else ""
+                lines.append(f"  - {triple} [conf={c.confidence:.2f}, source: {src}]")
+                # Evidence text from payload
+                if c.payload and hasattr(c.payload, 'data') and isinstance(c.payload.data, dict):
+                    ev = c.payload.data.get("evidence_text", "")
+                    if ev:
+                        lines.append(f'    Evidence: "{ev}"')
+                if len(citations) < 50:
+                    citations.append(Citation(
+                        claim_id=c.claim_id, subject=c.subject.id,
+                        predicate=c.predicate.id, object=c.object.id,
+                        confidence=c.confidence,
+                        source_id=c.provenance.source_id,
+                        source_type=c.provenance.source_type,
+                    ))
+                if len(seen) >= 25:
+                    break
+
+        return "\n".join(lines), citations
+
+    def _evidence_relationship(self, entities: list[ResolvedEntity]) -> tuple[str, list[Citation], list[dict], list[str]]:
+        """Evidence for relationship questions using neighborhood intersection.
+
+        Claim-native approach — not graph BFS:
+        1. Get each entity's neighbors by predicate (instant via adjacency index)
+        2. Intersect neighborhoods — shared neighbors are the bridging evidence
+        3. Score by predicate composition semantics
+        4. For low-degree pairs, also try direct path finding
+        """
+        lines: list[str] = []
+        citations: list[Citation] = []
+        contradictions: list[dict] = []
+        gaps: list[str] = []
+
+        # Step 1: Bidirectional neighborhood intersection
+        # Sample neighbors from BOTH entities and intersect the sets.
+        # This is O(sample_a + sample_b) — much faster than BFS.
+        for i in range(len(entities)):
+            for j in range(i + 1, len(entities)):
+                a, b = entities[i], entities[j]
+
+                def _get_neighbors_with_preds(eid: str, claim_count: int) -> dict[str, list[str]]:
+                    """Extract {neighbor_id: [predicates]} from a claims sample."""
+                    if claim_count > 10000:
+                        cap = 100
+                    elif claim_count > 1000:
+                        cap = 200
+                    else:
+                        cap = min(500, claim_count)
+                    raw = _safe_claims_for(self.db._store, eid, None, None, 0.0, cap)
+                    nbrs: dict[str, list[str]] = {}
+                    for d in raw:
+                        if isinstance(d, dict):
+                            s = d.get("subject", {}).get("id", "")
+                            o = d.get("object", {}).get("id", "")
+                            p = d.get("predicate", {}).get("id", "associated_with")
+                            nbr = o if s == eid else s
+                            nbrs.setdefault(nbr, []).append(p)
+                    return nbrs
+
+                nbrs_a = _get_neighbors_with_preds(a.entity_id, a.claim_count)
+                nbrs_b = _get_neighbors_with_preds(b.entity_id, b.claim_count)
+                neighbors_a = set(nbrs_a.keys())
+                neighbors_b = set(nbrs_b.keys())
+
+                # Direct connection?
+                if b.entity_id in neighbors_a or a.entity_id in neighbors_b:
+                    lines.append(f"\n## Direct connection: {a.name} ↔ {b.name}")
+
+                # Set intersection — shared neighbors are bridges
+                shared = neighbors_a & neighbors_b
+                if shared:
+                    # Score bridges by predicate specificity on BOTH sides
+                    scored: list[tuple[str, str, int, float, str, str]] = []
+                    for mid_id in shared:
+                        mid_raw = self.db._store.get_entity(mid_id)
+                        if not mid_raw:
+                            continue
+                        mid_name = _entity_name(mid_raw, mid_id)
+                        mid_cc = mid_raw.get("claim_count", 0) if isinstance(mid_raw, dict) else 0
+                        if mid_cc > 100000:
+                            continue  # skip hubs
+
+                        # Best predicate weight on each side
+                        preds_to_a = nbrs_a.get(mid_id, [])
+                        preds_to_b = nbrs_b.get(mid_id, [])
+                        weight_a = max((_PRED_WEIGHT.get(p, 0.2) for p in preds_to_a), default=0.1)
+                        weight_b = max((_PRED_WEIGHT.get(p, 0.2) for p in preds_to_b), default=0.1)
+                        score = weight_a * weight_b  # geometric — both sides must be specific
+
+                        best_pred_a = max(preds_to_a, key=lambda p: _PRED_WEIGHT.get(p, 0.2)) if preds_to_a else "?"
+                        best_pred_b = max(preds_to_b, key=lambda p: _PRED_WEIGHT.get(p, 0.2)) if preds_to_b else "?"
+                        scored.append((mid_id, mid_name, mid_cc, score, best_pred_a, best_pred_b))
+
+                    scored.sort(key=lambda x: -x[3])  # sort by predicate score
+
+                    n_specific = sum(1 for s in scored if s[3] >= 0.3)
+                    lines.append(f"\n## Bridges: {a.name} ↔ {b.name} ({len(scored)} shared, {n_specific} with specific predicates)")
+                    for mid_id, mid_name, mid_cc, score, pred_a, pred_b in scored[:10]:
+                        lines.append(f"  {a.name} --[{pred_a}]--> {mid_name} --[{pred_b}]--> {b.name}  (score={score:.2f}, {mid_cc} claims)")
+                        if len(citations) < 50:
+                            citations.append(Citation(
+                                claim_id=f"bridge:{a.entity_id}:{mid_id}:{b.entity_id}",
+                                subject=a.entity_id, predicate=f"{pred_a}_via_{pred_b}",
+                                object=b.entity_id, confidence=score,
+                                source_id=f"via:{mid_id}", source_type="neighborhood_intersection",
+                            ))
+                else:
+                    # No shared neighbors in sample — try path_exists on a's neighbors
+                    bridges: list[tuple[str, str, int]] = []
+                    for mid_id in list(neighbors_a)[:100]:
+                        if self.db.path_exists(mid_id, b.entity_id, max_depth=1):
+                            mid_raw = self.db._store.get_entity(mid_id)
+                            if mid_raw:
+                                mid_name = _entity_name(mid_raw, mid_id)
+                                mid_cc = mid_raw.get("claim_count", 0) if isinstance(mid_raw, dict) else 0
+                                bridges.append((mid_id, mid_name, mid_cc))
+                            if len(bridges) >= 10:
+                                break
+                    if bridges:
+                        bridges.sort(key=lambda x: -x[2])
+                        lines.append(f"\n## 2-hop bridges: {a.name} → ? → {b.name} ({len(bridges)} found)")
+                        for mid_id, mid_name, mid_cc in bridges[:8]:
+                            preds = self.db._store.entity_predicate_counts(mid_id) if hasattr(self.db._store, 'entity_predicate_counts') else []
+                            pred_str = ", ".join(f"{p}({c})" for p, c in (preds[:5] if isinstance(preds, list) else []))
+                            lines.append(f"  via {mid_name} ({mid_cc} claims): {pred_str}")
+                            if len(citations) < 50:
+                                citations.append(Citation(
+                                    claim_id=f"2hop:{a.entity_id}:{mid_id}:{b.entity_id}",
+                                    subject=a.entity_id, predicate="connected_via",
+                                    object=b.entity_id, confidence=0.5,
+                                    source_id=f"via:{mid_id}", source_type="graph_2hop",
+                                ))
+                    else:
+                        gaps.append(f"No 2-hop connection found between {a.name} and {b.name} (sampled {len(neighbors_a)}+{len(neighbors_b)} neighbors)")
+
+        # Add predicate summaries for each entity (instant, no materialization)
+        for entity in entities[:4]:
+            if hasattr(self.db._store, 'entity_predicate_counts'):
+                pred_counts = self.db._store.entity_predicate_counts(entity.entity_id)
+                if isinstance(pred_counts, list) and pred_counts:
+                    lines.append(f"\n## {entity.name} — relationship summary ({entity.claim_count} claims):")
+                    for pred, count in pred_counts[:10]:
+                        lines.append(f"  - {pred}: {count} claims")
+                    # Build summary citations for high-degree entities
+                    if entity.claim_count > 500 and len(citations) < 50:
+                        for pred, count in pred_counts[:8]:
+                            citations.append(Citation(
+                                claim_id=f"summary:{entity.entity_id}:{pred}",
+                                subject=entity.entity_id, predicate=pred,
+                                object=f"{count} targets",
+                                confidence=min(0.7, count / 100),
+                                source_id="predicate_summary",
+                                source_type="aggregate",
+                            ))
+
+        return "\n".join(lines), citations, contradictions, gaps
+
+    def _evidence_exploratory(self, entity: ResolvedEntity) -> tuple[str, list[Citation]]:
+        """Evidence for exploratory questions: BFS depth-1 + full summary."""
+        # Reuse single-entity evidence (it's already comprehensive)
+        return self._evidence_single(entity)
+
+    def _assemble_evidence(
+        self, entities: list[ResolvedEntity], question_type: str,
+    ) -> tuple[str, list[Citation], list[dict], list[str]]:
+        """Dispatch to appropriate evidence strategy."""
+        if question_type == "relationship" and len(entities) >= 2:
+            return self._evidence_relationship(entities)
+        elif question_type == "single" and entities:
+            text, cites = self._evidence_single(entities[0])
+            return text, cites, [], []
+        elif entities:
+            text, cites = self._evidence_exploratory(entities[0])
+            return text, cites, [], []
+        return "", [], [], []
+
+    # ──────────────────────────────────────────────────────────────────
+    # Main entry point
+    # ──────────────────────────────────────────────────────────────────
+
+    def ask(self, question: str, top_k: int = 10) -> AskResult:
+        """Answer a natural-language question using the knowledge graph.
+
+        V2 pipeline: entity extraction → graph evidence → LLM synthesis.
+        Target: complex questions < 10s, simple questions < 3s.
+        """
+        t_start = time.monotonic()
+
+        # Phase A: Entity extraction (< 500ms)
+        entities = self._extract_question_entities(question, top_k=top_k)
+        t_a = time.monotonic()
+
+        if not entities:
+            return AskResult(
+                answer=None,
+                meta={"pipeline": "v2", "phase_a_ms": int((t_a - t_start) * 1000),
+                       "n_searched": 0, "n_search_hits": 0,
+                       "selected_types": [], "n_clusters": 0,
+                       "cluster_sizes": [], "cluster_labels": []},
+            )
+
+        # Phase B: Evidence assembly (< 2s)
+        q_type = self._classify_question(question, entities)
+        evidence, citations, contradictions, gaps = self._assemble_evidence(entities, q_type)
+        t_b = time.monotonic()
+
+        logger.info("Phase A: %.0fms (%d entities), Phase B: %.0fms (%s, %d chars evidence)",
+                     (t_a - t_start) * 1000, len(entities),
+                     (t_b - t_a) * 1000, q_type, len(evidence))
+
+        # Phase C: LLM synthesis (< 8s)
+        gap_note = ""
+        if gaps:
+            gap_note = (
+                "\n\nIMPORTANT: The knowledge graph found gaps — "
+                + "; ".join(gaps[:3])
+                + ". If no bridging evidence was found, say so clearly. "
+                "Do NOT infer connections from predicate summaries alone "
+                "(e.g. 'both have inhibits relationships' is not evidence). "
+                "State what IS known and what IS NOT."
+            )
+        prompt = (
+            "You are answering questions about a knowledge graph with "
+            f"{self.db._store.stats().get('total_claims', 0):,} claims from "
+            "30+ curated sources. Below is evidence.\n\n"
+            f"{evidence}\n\n"
+            "---\n\n"
+            f"Question: {question}{gap_note}\n\n"
+            "Instructions:\n"
+            "- If bridging entities were found, trace the multi-hop chain explicitly.\n"
+            "- If no connection was found, say so — this is a knowledge gap, not a failure.\n"
+            "- Distinguish direct evidence from inferences.\n"
+            "- Answer in 3-8 sentences using specific entity names from the evidence."
+        )
+        answer = self._llm_call(prompt, max_tokens=1024)
+        t_c = time.monotonic()
+
+        logger.info("Phase C (LLM): %.0fms. Total: %.1fs",
+                     (t_c - t_b) * 1000, t_c - t_start)
+
+        # Build entity summaries for response
+        entity_summaries = []
+        for e in entities[:top_k]:
+            from attestdb.core.types import EntitySummary
+            entity_summaries.append(EntitySummary(
+                id=e.entity_id, name=e.name,
+                entity_type=e.entity_type,
+                claim_count=e.claim_count,
+            ))
+
+        return AskResult(
+            answer=answer,
+            citations=citations,
+            contradictions=contradictions,
+            gaps=gaps,
+            entities=entity_summaries,
+            evidence=evidence,
+            meta={
+                "pipeline": "v2",
+                "question_type": q_type,
+                "phase_a_ms": int((t_a - t_start) * 1000),
+                "phase_b_ms": int((t_b - t_a) * 1000),
+                "phase_c_ms": int((t_c - t_b) * 1000),
+                "total_ms": int((t_c - t_start) * 1000),
+                "n_searched": len(entities),
+                "n_search_hits": len(entities),
+                "selected_types": sorted({e.entity_type for e in entities if e.entity_type}),
+                "n_clusters": 0,
+                "cluster_sizes": [],
+                "cluster_labels": [],
+                "entity_tiers": {e.entity_id: e.match_tier for e in entities},
+            },
+        )
+
+    # ──────────────────────────────────────────────────────────────────
+    # Legacy helpers (kept for tests and attest_db.py delegates)
+    # ──────────────────────────────────────────────────────────────────
+
+    _LARGE_ENTITY_THRESHOLD = 200
+    _NEIGHBOR_CLAIMS_CAP = 200
+
+    def _label_cluster(self, cluster: list[str], entity_map: dict[str, "EntitySummary"]) -> str:
+        """Generate a human-readable label for a cluster of entities."""
+        type_counts: dict[str, int] = {}
+        for eid in cluster:
+            e = entity_map.get(eid)
+            if e:
+                etype = e.entity_type or "unknown"
+                type_counts[etype] = type_counts.get(etype, 0) + 1
+        dominant = max(type_counts, key=type_counts.get) if type_counts else "unknown"
+        ranked = sorted(
+            (entity_map[eid] for eid in cluster if eid in entity_map),
+            key=lambda e: -e.claim_count,
+        )
+        names = [e.name or e.id for e in ranked[:2]]
+        if names:
+            return f"{dominant} ({', '.join(names)})"
+        return dominant
 
     def _cluster_entities(self, entity_ids: list[str]) -> list[list[str]]:
-        """Cluster candidate entities by 2-hop graph connectivity.
-
-        Two candidates are "topic-connected" if directly adjacent OR share
-        at least one graph neighbor.  Returns connected components sorted
-        by size descending.
-        """
+        """Cluster candidate entities by 2-hop graph connectivity."""
         if len(entity_ids) <= 1:
             return [list(entity_ids)] if entity_ids else []
 
-        # Build neighbor sets — cap at 200 claims per entity to avoid
-        # materializing 100K+ dicts for high-degree entities.
-        # Read subject/object IDs from raw dicts (no full Claim deserialization).
         neighbors: dict[str, set[str]] = {}
         for eid in entity_ids:
-            raw = self.db._store.claims_for(eid, None, None, 0.0)
-            if len(raw) > _NEIGHBOR_CLAIMS_CAP:
-                raw = raw[:200]
+            raw = _safe_claims_for(self.db._store, eid, None, None, 0.0, 200)
             adj: set[str] = set()
             for c in raw:
                 if isinstance(c, dict):
@@ -179,23 +733,15 @@ class AskEngine:
                     adj.add(o if s == eid else s)
             neighbors[eid] = adj
 
-        # Build candidate-level adjacency: two candidates are connected if
-        # they share a direct edge OR share >= 1 common neighbor (2-hop)
         cand_adj: dict[str, set[str]] = {eid: set() for eid in entity_ids}
         ids = list(entity_ids)
         for i in range(len(ids)):
             for j in range(i + 1, len(ids)):
                 a, b = ids[i], ids[j]
-                # Direct edge?
-                if b in neighbors[a]:
-                    cand_adj[a].add(b)
-                    cand_adj[b].add(a)
-                # Shared neighbor (2-hop)?
-                elif neighbors[a] & neighbors[b]:
+                if b in neighbors[a] or neighbors[a] & neighbors[b]:
                     cand_adj[a].add(b)
                     cand_adj[b].add(a)
 
-        # BFS connected components
         visited: set[str] = set()
         clusters: list[list[str]] = []
         for eid in entity_ids:
@@ -212,350 +758,8 @@ class AskEngine:
                         visited.add(nb)
                         queue.append(nb)
             clusters.append(component)
-
         clusters.sort(key=lambda c: -len(c))
         return clusters
-
-    def _label_cluster(self, cluster: list[str], entity_map: dict[str, "EntitySummary"]) -> str:
-        """Generate a human-readable label for a cluster of entities.
-
-        Uses topology community labels if computed, otherwise falls back
-        to dominant entity type + top 2 entity names.
-        """
-        # Try topology labels (opportunistic — only if already computed)
-        if hasattr(self.db, "_topology") and self.db._topology is not None:
-            # Find the community that contains the most cluster members
-            best_label = ""
-            best_overlap = 0
-            cluster_set = set(cluster)
-            for _res, communities in self.db._topology.communities.items():
-                for comm in communities:
-                    overlap = len(cluster_set & set(comm.members))
-                    if overlap > best_overlap:
-                        best_overlap = overlap
-                        best_label = comm.label
-            if best_label:
-                return best_label
-
-        # Fallback: dominant entity type + top 2 names
-        type_counts: dict[str, int] = {}
-        for eid in cluster:
-            e = entity_map.get(eid)
-            if e:
-                etype = e.entity_type or "unknown"
-                type_counts[etype] = type_counts.get(etype, 0) + 1
-
-        dominant = max(type_counts, key=type_counts.get) if type_counts else "unknown"
-
-        # Top 2 entities by claim count
-        ranked = sorted(
-            (entity_map[eid] for eid in cluster if eid in entity_map),
-            key=lambda e: -e.claim_count,
-        )
-        names = [e.name or e.id for e in ranked[:2]]
-        if names:
-            return f"{dominant} ({', '.join(names)})"
-        return dominant
-
-    def _gather_clustered_evidence(
-        self,
-        clusters: list[list[str]],
-        entity_map: dict[str, "EntitySummary"],
-        max_rels: int = DEFAULT_MAX_RELATIONSHIPS,
-        collect_citations: bool = False,
-    ) -> str | tuple:
-        """Build evidence organized by topic cluster.
-
-        Each cluster gets a ``# Topic: {label}`` section header.
-        Budget is allocated proportionally (at least 60 rels per cluster).
-        Capped at 5 topic sections.
-        """
-        clusters = clusters[:5]
-        total_entities = sum(len(c) for c in clusters)
-
-        sections: list[str] = []
-        all_citations: list[Citation] = []
-        all_contradictions: list[dict] = []
-        all_gaps: list[str] = []
-        for cluster in clusters:
-            label = self._label_cluster(cluster, entity_map)
-            budget = max(ENTITY_BUDGET_FLOOR, int(max_rels * len(cluster) / max(total_entities, 1)))
-            if collect_citations:
-                evidence, cit, contra, gaps = self._gather_evidence(
-                    cluster, max_rels=budget, collect_citations=True,
-                )
-                all_citations.extend(cit)
-                all_contradictions.extend(contra)
-                for g in gaps:
-                    if g not in all_gaps:
-                        all_gaps.append(g)
-            else:
-                evidence = self._gather_evidence(cluster, max_rels=budget)
-            if evidence.strip():
-                sections.append(f"# Topic: {label}\n{evidence}")
-
-        text = "\n\n".join(sections)
-        if collect_citations:
-            return text, all_citations, all_contradictions, all_gaps
-        return text
-
-    def ask(self, question: str, top_k: int = 10) -> AskResult:
-        """Answer a natural-language question using the knowledge graph.
-
-        Fast path (search hits >= 3): search -> evidence -> single LLM call.
-        Slow path (few search hits): adds type catalog + LLM type selection.
-
-        Returns AskResult with structured citations, contradictions, and gaps.
-        Dict-compatible for backward compat (r["answer"] works).
-        """
-        # Step 1: Search for entities whose names match the question
-        _stop = frozenset({
-            "what", "who", "how", "why", "when", "where", "which", "does",
-            "the", "are", "for", "and", "that", "this", "with", "from",
-            "about", "has", "have", "been", "is", "was", "were", "tell",
-            "me", "show", "find", "get", "list", "of", "in", "on", "at",
-            "by", "an", "a", "do", "did", "our", "we", "us", "made",
-            "being", "last", "recent", "done", "any", "all", "some",
-            "much", "many", "can", "could", "would", "should", "will",
-            "to", "it", "its", "be", "not", "no", "or", "but", "if",
-            "than", "them", "they", "their", "there", "then", "top",
-            "best", "most", "also", "just", "only", "very", "more",
-            "good", "bad", "new", "old", "like", "use", "used", "using",
-            "target", "role", "effect", "type", "cause", "work", "works",
-            "related", "involved", "between", "affect", "impact",
-        })
-        words = [w.strip("?.,!\"'()[]{}:;") for w in question.lower().split()]
-        query_terms = " ".join(w for w in words if w and len(w) >= 2 and w not in _stop)
-
-        search_hits: list = []
-        if query_terms:
-            search_hits = self.db.search_entities(query_terms, top_k=30)
-
-            # Also search individual content words (catches entities whose
-            # names match only one query term, e.g. "Pain" for "gpr55 pain")
-            # and progressively shorter prefixes for stem variations.
-            hit_ids = {e.id for e in search_hits}
-            content_words = [w for w in query_terms.split() if len(w) >= 3]
-            for word in content_words:
-                for hit in self.db.search_entities(word, top_k=10):
-                    if hit.id not in hit_ids:
-                        search_hits.append(hit)
-                        hit_ids.add(hit.id)
-                if len(word) >= 7:
-                    for plen in range(len(word) - 2, 4, -1):
-                        prefix = word[:plen]
-                        before = len(hit_ids)
-                        for hit in self.db.search_entities(prefix, top_k=10):
-                            if hit.id not in hit_ids:
-                                search_hits.append(hit)
-                                hit_ids.add(hit.id)
-                        if len(hit_ids) > before:
-                            break
-
-            search_hits.sort(key=lambda e: -e.claim_count)
-            search_hits = search_hits[:top_k]
-
-        # Step 2: Build entity set
-        # Fast path: search hits are sufficient — skip type catalog + LLM type selection
-        # Filter to entities whose names actually contain a query term (BM25 can
-        # return high-claim-count entities with marginal text overlap in small DBs)
-        selected_types: set[str] = set()
-        if search_hits and query_terms:
-            terms_lower = set(query_terms.lower().split())
-            relevant_hits: list = []
-            for e in search_hits:
-                ename = (e.name or e.id).lower()
-                if any(t in ename for t in terms_lower):
-                    relevant_hits.append(e)
-            if relevant_hits:
-                search_hits = relevant_hits
-            # Drop entities with 0 claims — they produce no evidence
-            search_hits = [e for e in search_hits if e.claim_count > 0]
-            # Deduplicate by display name — keep highest-claim-count per name
-            seen_names: dict[str, int] = {}  # name -> best claim_count
-            deduped: list = []
-            for e in search_hits:
-                key = (e.name or e.id).lower()
-                if key not in seen_names or e.claim_count > seen_names[key]:
-                    if key in seen_names:
-                        deduped = [x for x in deduped if (x.name or x.id).lower() != key]
-                    seen_names[key] = e.claim_count
-                    deduped.append(e)
-            search_hits = deduped
-
-        clusters: list[list[str]] = []
-        cluster_labels: list[str] = []
-        entity_map: dict = {}
-
-        if len(search_hits) >= 1:
-            # Fast path: search hits found — go straight to evidence
-            selected = list(search_hits)
-        else:
-            # Slow path: no search hits — type catalog + LLM + clustering
-            selected = list(search_hits)
-            selected, selected_types = self._ask_type_expand(
-                question, selected, top_k,
-            )
-            # Cluster and filter/organize by topic
-            entity_map = {e.id: e for e in selected[:20]}
-            entity_ids_for_cluster = [e.id for e in selected[:20]]
-            clusters = self._cluster_entities(entity_ids_for_cluster)
-            search_hit_ids = {e.id for e in search_hits}
-            if len(clusters) > 1 and search_hit_ids:
-                relevant = [c for c in clusters if search_hit_ids & set(c)]
-                if relevant:
-                    clusters = relevant
-                    kept = set()
-                    for c in clusters:
-                        kept.update(c)
-                    selected = [e for e in selected if e.id in kept]
-
-        if not selected:
-            return AskResult(meta={
-                "n_searched": 0, "n_search_hits": len(search_hits),
-                "selected_types": sorted(selected_types),
-            })
-
-        # Step 3: Gather evidence AND citations in a single pass (no re-querying)
-        # On large databases, cap entities and hop-2 depth to keep latency bounded
-        _large_db = False
-        try:
-            _large_db = self.db._store.count_claims() > 1_000_000
-        except Exception:
-            pass
-
-        multi_topic = len(clusters) > 1
-        if multi_topic:
-            evidence, citations, all_contradictions, gaps = self._gather_clustered_evidence(
-                clusters, entity_map, max_rels=DEFAULT_MAX_RELATIONSHIPS,
-                collect_citations=True,
-            )
-            cluster_labels = [
-                self._label_cluster(c, entity_map) for c in clusters
-            ]
-        else:
-            # Cap entities for evidence gathering — each triggers query() calls
-            evidence_cap = 2 if _large_db else top_k
-            entity_ids = [e.id for e in selected[:evidence_cap]]
-            evidence, citations, all_contradictions, gaps = self._gather_evidence(
-                entity_ids, max_rels=DEFAULT_MAX_RELATIONSHIPS, collect_citations=True,
-            )
-
-        # Step 4: Single LLM synthesis call
-        base_instructions = (
-            "- Trace multi-hop reasoning chains explicitly (A \u2192 B \u2192 C) when they "
-            "answer the question.\n"
-            "- Distinguish well-supported facts (high confidence, multiple sources) "
-            "from weaker inferences.\n"
-            "- Note contradictions when present \u2014 don't hide conflicting evidence.\n"
-            "- Items tagged with \u26a0 WARNING, BUG, VULNERABILITY, or PATTERN are "
-            "knowledge annotations \u2014 surface these prominently as they represent "
-            "critical operational learnings.\n"
-            "- Quote evidence text when available and relevant.\n"
-            "- Answer in 3-8 sentences using specific names, facts, and "
-            "relationships from the evidence. Synthesize directly from the "
-            "evidence \u2014 do not hedge or say information is unavailable if the "
-            "evidence contains relevant facts."
-        )
-        if multi_topic:
-            base_instructions += (
-                "\n- The evidence is organized by topic area. Address each topic "
-                "area separately.\n"
-                "- Do not mix evidence from different topic areas in the same "
-                "paragraph.\n"
-                "- Use the topic labels as section headers in your answer."
-            )
-        prompt = (
-            "You are answering questions about an organization's knowledge "
-            "graph. Below is detailed evidence \u2014 entities, their relationships, "
-            "multi-hop chains (marked [2-hop]), confidence scores, source counts, "
-            "and evidence quotes from real conversations and documents.\n\n"
-            f"{evidence}\n\n"
-            "---\n\n"
-            f"Question: {question}\n\n"
-            f"Instructions:\n{base_instructions}"
-        )
-        answer = self._llm_call(prompt, max_tokens=1024)
-
-        selected.sort(key=lambda e: -e.claim_count)
-
-        return AskResult(
-            answer=answer,
-            citations=citations,
-            contradictions=all_contradictions,
-            gaps=gaps,
-            entities=selected[:top_k],
-            evidence=evidence,
-            meta={
-                "n_searched": len(selected),
-                "n_search_hits": len(search_hits),
-                "selected_types": sorted(selected_types),
-                "n_clusters": len(clusters),
-                "cluster_sizes": [len(c) for c in clusters],
-                "cluster_labels": cluster_labels,
-            },
-        )
-
-    def _ask_type_expand(
-        self,
-        question: str,
-        search_hits: list,
-        top_k: int,
-    ) -> tuple:
-        """Slow path: use type catalog + LLM to find relevant entity types.
-
-        Called when search_entities() returns fewer than 3 hits, so we need
-        LLM guidance to figure out which entity types are relevant.
-
-        Returns (selected_entities, selected_types).
-        """
-        db_stats = self.db.stats()
-        type_counts: dict[str, int] = db_stats.get("entity_types", {})
-        if not type_counts:
-            return list(search_hits), set()
-
-        min_type_size = 3
-        eligible_types = sorted(
-            ((t, c) for t, c in type_counts.items() if c >= min_type_size),
-            key=lambda x: -x[1],
-        )
-        catalog_parts = []
-        for t, count in eligible_types[:20]:
-            examples = self.db.list_entities(entity_type=t, limit=2)
-            name_str = ", ".join((e.name or e.id) for e in examples)
-            catalog_parts.append(f"{t} ({count}: {name_str})")
-        type_catalog = ", ".join(catalog_parts)
-        type_prompt = (
-            f"Entity types in a knowledge graph: {type_catalog}\n\n"
-            f"Question: {question}\n\n"
-            "Which 5-8 entity types contain the most interesting "
-            "domain-specific knowledge for answering this question? "
-            "Avoid generic types like process, concept, information, "
-            "activity, task, or change. "
-            "Return ONLY type names, comma-separated."
-        )
-        type_response = self._llm_call(type_prompt, max_tokens=100, temperature=0.0)
-
-        selected_types: set[str] = set()
-        if type_response:
-            for part in type_response.split(","):
-                t = part.strip().lower()
-                if t in type_counts and type_counts[t] >= min_type_size:
-                    selected_types.add(t)
-
-        seen_ids: set[str] = set()
-        selected: list = []
-        for e in search_hits:
-            if e.id not in seen_ids:
-                seen_ids.add(e.id)
-                selected.append(e)
-        for t in selected_types:
-            for e in self.db.list_entities(entity_type=t, limit=3):
-                if e.id not in seen_ids and len(selected) < top_k:
-                    seen_ids.add(e.id)
-                    selected.append(e)
-
-        return selected, selected_types
 
     def _gather_evidence(
         self,
@@ -563,16 +767,7 @@ class AskEngine:
         max_rels: int = 60,
         collect_citations: bool = False,
     ) -> str | tuple:
-        """Build rich evidence from claims for a set of entities.
-
-        Uses claims_for() directly (O(1) LMDB index lookup) instead of
-        query() (which does full BFS + contradiction detection per call).
-        This keeps latency sub-second on databases of any size.
-
-        If *collect_citations* is True, returns
-        ``(evidence_text, citations, contradictions, gaps)`` so ask() can
-        reuse the data (no redundant re-queries).
-        """
+        """Build rich evidence from claims for a set of entities (legacy v1)."""
         from attestdb.core.vocabulary import KNOWLEDGE_PRIORITY, knowledge_label, OPPOSITE_PREDICATES
 
         lines: list[str] = []
@@ -581,29 +776,24 @@ class AskEngine:
         all_gaps: list[str] = []
         seen: set[str] = set()
         seen_claim_ids: set[str] = set()
-
-        # Budget: distribute max_rels across entities
         per_entity = max(max_rels // max(len(entity_ids), 1), 5)
 
         for eid in entity_ids:
             entity = self.db._store.get_entity(eid)
             if not entity:
                 continue
-            ename = entity.get("display_name", eid)
+            ename = _entity_name(entity, eid)
             etype = entity.get("entity_type", "entity")
             claim_count = entity.get("claim_count", 0)
             lines.append(f"\n## {ename} ({etype}, {claim_count} claims)")
 
             budgeted = []
 
-            # For large entities (>200 claims), use predicate summary (instant)
-            # instead of materializing all claims across Rust→Python boundary.
-            if claim_count > _LARGE_ENTITY_THRESHOLD and hasattr(self.db._store, 'entity_predicate_counts'):
+            if claim_count > self._LARGE_ENTITY_THRESHOLD and hasattr(self.db._store, 'entity_predicate_counts'):
                 pred_counts = self.db._store.entity_predicate_counts(eid)
                 if isinstance(pred_counts, list):
                     for pred, count in pred_counts[:per_entity]:
                         lines.append(f"- {ename} {pred} ({count} claims)")
-                    # Build summary citations (aggregate, not individual claims)
                     if collect_citations:
                         for pred, count in pred_counts[:10]:
                             if len(citations) >= 50:
@@ -617,15 +807,13 @@ class AskEngine:
                                 source_type="aggregate",
                             ))
 
-            if not budgeted and claim_count <= _LARGE_ENTITY_THRESHOLD:
-                # Small entity: safe to materialize all claims
-                raw_claims = self.db._store.claims_for(eid, None, None, 0.0)
+            if not budgeted and claim_count <= self._LARGE_ENTITY_THRESHOLD:
+                raw_claims = _safe_claims_for(self.db._store, eid, None, None, 0.0, 0)
                 raw_claims = [d for d in raw_claims if isinstance(d, dict)]
                 raw_claims.sort(key=lambda d: -d.get("confidence", 0))
                 budgeted = [claim_from_dict(d) for d in raw_claims[:per_entity]]
 
-            # Group by predicate for contradiction detection
-            pred_targets: dict[str, list] = {}  # (subj, obj) -> [predicate_ids]
+            pred_targets: dict[str, list] = {}
             for c in budgeted:
                 key = (c.subject.id, c.object.id)
                 pred_targets.setdefault(key, []).append(c.predicate.id)
@@ -637,37 +825,27 @@ class AskEngine:
                 if triple in seen:
                     continue
                 seen.add(triple)
-
-                # Tag knowledge claims
                 tag = ""
                 if c.predicate.id in KNOWLEDGE_PRIORITY:
                     tag = f" \u26a0 {knowledge_label(c.predicate.id).upper()}"
-
                 src = c.provenance.source_type if c.provenance else ""
                 ann = f"[conf={c.confidence:.2f}, source: {src}]{tag}"
                 lines.append(f"- {triple} {ann}")
-
-                # Evidence text from payload
                 if c.payload and hasattr(c.payload, 'data') and isinstance(c.payload.data, dict):
                     ev = c.payload.data.get("evidence_text", "")
                     if ev:
                         lines.append(f'    Evidence: "{ev}"')
-
-                # Collect citation
                 if collect_citations and len(citations) < 50:
                     if c.claim_id not in seen_claim_ids:
                         seen_claim_ids.add(c.claim_id)
                         citations.append(Citation(
-                            claim_id=c.claim_id,
-                            subject=c.subject.id,
-                            predicate=c.predicate.id,
-                            object=c.object.id,
+                            claim_id=c.claim_id, subject=c.subject.id,
+                            predicate=c.predicate.id, object=c.object.id,
                             confidence=c.confidence,
                             source_id=c.provenance.source_id if c.provenance else "",
                             source_type=c.provenance.source_type if c.provenance else "",
                         ))
 
-            # Detect contradictions from opposing predicates in this entity's claims
             for (subj, obj), preds in pred_targets.items():
                 pred_set = set(preds)
                 for p1, p2 in OPPOSITE_PREDICATES.items():
@@ -680,7 +858,6 @@ class AskEngine:
                                 "description": desc, "status": "unresolved",
                             })
 
-        # Detect knowledge gaps: entities with very few relationship types
         if collect_citations:
             from attestdb.core.vocabulary import BUILT_IN_PREDICATE_TYPES
             for eid in entity_ids:
@@ -691,10 +868,44 @@ class AskEngine:
                 if cc > 0 and hasattr(self.db._store, 'entity_predicate_counts'):
                     preds = self.db._store.entity_predicate_counts(eid)
                     if isinstance(preds, list) and len(preds) <= 2 and cc > 10:
-                        ename = entity.get("display_name", eid)
+                        ename = _entity_name(entity, eid)
                         all_gaps.append(f"{ename} has {cc} claims but only {len(preds)} relationship types")
 
         evidence_text = "\n".join(lines)
         if collect_citations:
             return evidence_text, citations, all_contradictions, all_gaps
         return evidence_text
+
+    def _gather_clustered_evidence(
+        self,
+        clusters: list[list[str]],
+        entity_map: dict[str, "EntitySummary"],
+        max_rels: int = 60,
+        collect_citations: bool = False,
+    ) -> str | tuple:
+        """Build evidence organized by topic cluster (legacy v1)."""
+        clusters = clusters[:5]
+        total_entities = sum(len(c) for c in clusters)
+        sections: list[str] = []
+        all_citations: list[Citation] = []
+        all_contradictions: list[dict] = []
+        all_gaps: list[str] = []
+        for cluster in clusters:
+            budget = max(15, int(max_rels * len(cluster) / max(total_entities, 1)))
+            if collect_citations:
+                evidence, cit, contra, gaps = self._gather_evidence(
+                    cluster, max_rels=budget, collect_citations=True,
+                )
+                all_citations.extend(cit)
+                all_contradictions.extend(contra)
+                for g in gaps:
+                    if g not in all_gaps:
+                        all_gaps.append(g)
+            else:
+                evidence = self._gather_evidence(cluster, max_rels=budget)
+            if evidence.strip():
+                sections.append(evidence)
+        text = "\n\n".join(sections)
+        if collect_citations:
+            return text, all_citations, all_contradictions, all_gaps
+        return text

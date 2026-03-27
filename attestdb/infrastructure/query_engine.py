@@ -203,9 +203,12 @@ class QueryEngine:
                 # Cap claims per entity to avoid materializing 100K+ dicts
                 # for high-degree entities like TP53. Uses min_confidence to
                 # pre-filter at the Rust level when possible.
-                raw = self._store.claims_for(eid, None, None, effective_min_conf)
-                if len(raw) > max_claims:
-                    raw = raw[:max_claims]
+                try:
+                    raw = self._store.claims_for(eid, None, None, effective_min_conf, max_claims)
+                except TypeError:
+                    raw = self._store.claims_for(eid, None, None, effective_min_conf)
+                    if len(raw) > max_claims:
+                        raw = raw[:max_claims]
                 for claim in [self._convert_claim(d) for d in raw]:
                     if claim.claim_id in seen_claim_ids:
                         continue
@@ -444,7 +447,11 @@ class QueryEngine:
         try:
             # Filter by predicate_type="inquiry" — works because inquiry claims
             # are ingested with predicate=("inquiry", "inquiry") (id == type).
-            for d in self._store.claims_for(canonical, "inquiry", None, 0.0):
+            try:
+                _inq = self._store.claims_for(canonical, "inquiry", None, 0.0, 100)
+            except TypeError:
+                _inq = self._store.claims_for(canonical, "inquiry", None, 0.0)
+            for d in _inq:
                 ic = self._convert_claim(d)
                 if ic.status == ClaimStatus.ACTIVE:
                     inquiry_ids.append(ic.claim_id)
@@ -593,7 +600,10 @@ class QueryEngine:
                 break
             next_frontier: set[str] = set()
             for eid in list(frontier):
-                raw = self._store.claims_for(eid, None, None, 0.0)
+                try:
+                    raw = self._store.claims_for(eid, None, None, 0.0, 500)
+                except TypeError:
+                    raw = self._store.claims_for(eid, None, None, 0.0)
                 if len(raw) > 500:
                     # For path search: always check target edges first before capping,
                     # so we don't miss a direct connection on high-degree entities.

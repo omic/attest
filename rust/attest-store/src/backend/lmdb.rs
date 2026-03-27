@@ -262,6 +262,7 @@ impl LmdbBackend {
             EnvOpenOptions::new()
                 .map_size(map_size)
                 .max_dbs(MAX_DBS)
+                .max_readers(512)
                 .open(&path)
                 .map_err(|e| {
                     let msg = e.to_string();
@@ -353,6 +354,7 @@ impl LmdbBackend {
             EnvOpenOptions::new()
                 .map_size(map_size)
                 .max_dbs(MAX_DBS)
+                .max_readers(512)
                 .open(&path)
                 .map_err(|e| lmdb_err("open read-only LMDB", e))?
         };

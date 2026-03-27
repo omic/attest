@@ -1246,7 +1246,7 @@ def _claim_from_dict_inner(d: dict) -> Claim:
     subject = EntityRef(
         id=subj["id"],
         entity_type=subj["entity_type"],
-        display_name=subj.get("display_name", ""),
+        display_name=subj.get("display_name") or subj.get("name", ""),
         external_ids=subj.get("external_ids", {}),
     )
 
@@ -1257,7 +1257,7 @@ def _claim_from_dict_inner(d: dict) -> Claim:
     object_ = EntityRef(
         id=obj["id"],
         entity_type=obj["entity_type"],
-        display_name=obj.get("display_name", ""),
+        display_name=obj.get("display_name") or obj.get("name", ""),
         external_ids=obj.get("external_ids", {}),
     )
 

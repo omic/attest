@@ -249,10 +249,10 @@ class TopicThreads:
                 target_id = rel.target.id
                 entities_seen.add(target_id)
                 # Get claims for this entity-relationship pair
-                for c in self.db.claims_for(eid):
+                for c in self.db.claims_for(eid)[:200]:
                     all_claims[c.claim_id] = c
             # Also get claims directly for the seed entity
-            for c in self.db.claims_for(eid):
+            for c in self.db.claims_for(eid)[:200]:
                 all_claims[c.claim_id] = c
 
             all_contradictions.extend(frame.contradictions)
@@ -264,7 +264,10 @@ class TopicThreads:
                 entities_seen.add(tid)
                 # Check if this target has more unexplored edges
                 try:
-                    further = self.db._store.claims_for(tid, None, None, 0.0)
+                    try:
+                        further = self.db._store.claims_for(tid, None, None, 0.0, 100)
+                    except TypeError:
+                        further = self.db._store.claims_for(tid, None, None, 0.0)[:100]
                     targets_of_target = {d.get("subject", {}).get("id") for d in further}
                     targets_of_target |= {d.get("object", {}).get("id") for d in further}
                     unexplored = targets_of_target - entities_seen - {eid}
@@ -389,7 +392,7 @@ class TopicThreads:
                 )
             except Exception:
                 continue
-            for c in self.db.claims_for(eid):
+            for c in self.db.claims_for(eid)[:200]:
                 all_claims[c.claim_id] = c
             for rel in frame.direct_relationships:
                 entities_seen.add(rel.target.id)
@@ -807,7 +810,7 @@ class TopicThreads:
     def _load_thread_state(self, thread_id: str) -> "ThreadState | None":
         """Load a thread's state from its most recent claim payload."""
         from attestdb.core.types import ThreadState
-        claims = self.db.claims_for(thread_id)
+        claims = self.db.claims_for(thread_id)[:100]
         # Find the most recent claim with a thread payload (highest timestamp)
         best = None
         for c in claims:

@@ -318,7 +318,7 @@ def claims_for(
 ) -> str:
     """Get claims about an entity, optionally filtered."""
     db = _get_db()
-    claims = db.claims_for(entity_id, predicate_type=predicate_type, min_confidence=min_confidence)
+    claims = db.claims_for(entity_id, predicate_type=predicate_type, min_confidence=min_confidence)[:500]
     return json.dumps([
         {
             "claim_id": c.claim_id,
