@@ -860,6 +860,24 @@ impl MemoryBackend {
     // ── Graph traversal ────────────────────────────────────────────────
 
     /// BFS traversal collecting claims at each hop depth.
+    pub fn neighbors(&mut self, entity_id: &str) -> Vec<String> {
+        let resolved = self.resolve(entity_id);
+        let aliases = self.get_alias_group(&resolved);
+        let mut nbrs: HashSet<String> = HashSet::new();
+        for claim in self.claims.for_entity(&resolved) {
+            if !self.should_include_claim(&claim.claim_id) || !self.should_include_namespace(&claim.namespace) {
+                continue;
+            }
+            let other = if aliases.contains(&claim.subject.id) {
+                &claim.object.id
+            } else {
+                &claim.subject.id
+            };
+            nbrs.insert(other.clone());
+        }
+        nbrs.into_iter().collect()
+    }
+
     pub fn bfs_claims(&mut self, entity_id: &str, max_depth: usize) -> Vec<(Claim, usize)> {
         let resolved = self.resolve(entity_id);
         let aliases = self.get_alias_group(&resolved);

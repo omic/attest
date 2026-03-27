@@ -579,6 +579,16 @@ impl PyRustStore {
 
     // ── Graph traversal ────────────────────────────────────────────
 
+    /// Get neighbor entity IDs from adjacency index — no claim materialization.
+    fn neighbors<'py>(&mut self, entity_id: &str, py: Python<'py>) -> PyResult<PyObject> {
+        let nbrs = self.inner.neighbors(entity_id);
+        let list = PyList::empty(py);
+        for n in &nbrs {
+            list.append(n)?;
+        }
+        Ok(list.into())
+    }
+
     #[pyo3(signature = (entity_id, max_depth=2))]
     fn bfs_claims<'py>(
         &mut self,

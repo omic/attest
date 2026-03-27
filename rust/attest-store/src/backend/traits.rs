@@ -225,6 +225,9 @@ pub trait StorageBackend {
 
     // ── Graph traversal ────────────────────────────────────────────────
 
+    /// Get neighbor entity IDs from adjacency index — no claim materialization.
+    fn neighbors(&mut self, entity_id: &str) -> Vec<String>;
+
     /// BFS traversal collecting claims at each hop depth.
     fn bfs_claims(&mut self, entity_id: &str, max_depth: usize) -> Vec<(Claim, usize)>;
 

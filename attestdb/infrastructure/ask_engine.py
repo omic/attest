@@ -11,13 +11,8 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from attestdb.core.types import EntitySummary
-
 from attestdb.core.normalization import normalize_entity_id
-from attestdb.core.types import AskResult, Citation, PathResult, claim_from_dict
+from attestdb.core.types import AskResult, Citation, EntitySummary, PathResult, claim_from_dict
 
 logger = logging.getLogger(__name__)
 
@@ -27,9 +22,10 @@ def _safe_claims_for(store, eid, pred=None, src=None, min_conf=0.0, limit=0):
     try:
         return store.claims_for(eid, pred, src, min_conf, limit)
     except TypeError:
-        # Old wheel without limit param — slice in Python
+        # Old wheel without limit param — always cap to prevent OOM
         result = store.claims_for(eid, pred, src, min_conf)
-        return result[:limit] if limit > 0 else result
+        cap = limit if limit > 0 else 500
+        return result[:cap]
 
 
 # Stop words for candidate generation
@@ -71,6 +67,9 @@ _PRED_WEIGHT = {
     "expressed_in": 0.4, "participates_in": 0.3,
     "associated_with": 0.1, "associates": 0.1,
 }
+
+
+from attestdb.core.vocabulary import compose_predicates as _compose
 
 
 def _entity_name(raw, fallback: str = "?") -> str:
@@ -137,8 +136,8 @@ class AskEngine:
             ext = self.db._get_text_extractor()
             if ext._client and ext._llm_model:
                 return ext._client, ext._llm_model
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("_get_llm_client: text extractor unavailable: %s", exc)
 
         return None, None
 
@@ -458,29 +457,47 @@ class AskEngine:
             for j in range(i + 1, len(entities)):
                 a, b = entities[i], entities[j]
 
-                def _get_neighbors_with_preds(eid: str, claim_count: int) -> dict[str, list[str]]:
-                    """Extract {neighbor_id: [predicates]} from a claims sample."""
-                    if claim_count > 10000:
-                        cap = 100
-                    elif claim_count > 1000:
-                        cap = 200
-                    else:
-                        cap = min(500, claim_count)
+                def _get_neighbors_with_preds(eid: str, claim_count: int) -> tuple[set[str], dict[str, list[str]]]:
+                    """Get neighbor IDs and predicate annotations.
+
+                    Uses Rust-native neighbors() for IDs (no materialization),
+                    then samples claims for predicate annotations on shared bridges.
+                    """
+                    # Fast path: Rust adjacency index (O(degree), no claim deserialization)
+                    try:
+                        nbr_ids = set(self.db._store.neighbors(eid))
+                    except (AttributeError, TypeError):
+                        # Fallback: sample claims (old wheel without neighbors())
+                        if claim_count > 10000:
+                            cap = 100
+                        elif claim_count > 1000:
+                            cap = 200
+                        else:
+                            cap = min(500, claim_count)
+                        raw = _safe_claims_for(self.db._store, eid, None, None, 0.0, cap)
+                        nbr_ids = set()
+                        for d in raw:
+                            if isinstance(d, dict):
+                                s = d.get("subject", {}).get("id", "")
+                                o = d.get("object", {}).get("id", "")
+                                nbr_ids.add(o if s == eid else s)
+
+                    # Predicate annotations: sample claims for the predicates
+                    # (only needed for shared bridges, done lazily below)
+                    preds: dict[str, list[str]] = {}
+                    cap = 100 if claim_count > 5000 else 200
                     raw = _safe_claims_for(self.db._store, eid, None, None, 0.0, cap)
-                    nbrs: dict[str, list[str]] = {}
                     for d in raw:
                         if isinstance(d, dict):
                             s = d.get("subject", {}).get("id", "")
                             o = d.get("object", {}).get("id", "")
                             p = d.get("predicate", {}).get("id", "associated_with")
                             nbr = o if s == eid else s
-                            nbrs.setdefault(nbr, []).append(p)
-                    return nbrs
+                            preds.setdefault(nbr, []).append(p)
+                    return nbr_ids, preds
 
-                nbrs_a = _get_neighbors_with_preds(a.entity_id, a.claim_count)
-                nbrs_b = _get_neighbors_with_preds(b.entity_id, b.claim_count)
-                neighbors_a = set(nbrs_a.keys())
-                neighbors_b = set(nbrs_b.keys())
+                neighbors_a, nbrs_a = _get_neighbors_with_preds(a.entity_id, a.claim_count)
+                neighbors_b, nbrs_b = _get_neighbors_with_preds(b.entity_id, b.claim_count)
 
                 # Direct connection?
                 if b.entity_id in neighbors_a or a.entity_id in neighbors_b:
@@ -497,8 +514,8 @@ class AskEngine:
                             continue
                         mid_name = _entity_name(mid_raw, mid_id)
                         mid_cc = mid_raw.get("claim_count", 0) if isinstance(mid_raw, dict) else 0
-                        if mid_cc > 100000:
-                            continue  # skip hubs
+                        if mid_cc > 200000:
+                            continue  # skip mega-hubs
 
                         # Best predicate weight on each side
                         preds_to_a = nbrs_a.get(mid_id, [])
@@ -509,20 +526,25 @@ class AskEngine:
 
                         best_pred_a = max(preds_to_a, key=lambda p: _PRED_WEIGHT.get(p, 0.2)) if preds_to_a else "?"
                         best_pred_b = max(preds_to_b, key=lambda p: _PRED_WEIGHT.get(p, 0.2)) if preds_to_b else "?"
-                        scored.append((mid_id, mid_name, mid_cc, score, best_pred_a, best_pred_b))
+
+                        # Compose predicates: inhibits + causes = prevents
+                        composed = _compose(best_pred_a, best_pred_b)
+
+                        scored.append((mid_id, mid_name, mid_cc, score, best_pred_a, best_pred_b, composed))
 
                     scored.sort(key=lambda x: -x[3])  # sort by predicate score
 
                     n_specific = sum(1 for s in scored if s[3] >= 0.3)
                     lines.append(f"\n## Bridges: {a.name} ↔ {b.name} ({len(scored)} shared, {n_specific} with specific predicates)")
-                    for mid_id, mid_name, mid_cc, score, pred_a, pred_b in scored[:10]:
-                        lines.append(f"  {a.name} --[{pred_a}]--> {mid_name} --[{pred_b}]--> {b.name}  (score={score:.2f}, {mid_cc} claims)")
+                    for mid_id, mid_name, mid_cc, score, pred_a, pred_b, composed in scored[:10]:
+                        composed_tag = f" → inferred: {a.name} {composed} {b.name}" if composed != "associated_with" else ""
+                        lines.append(f"  {a.name} --[{pred_a}]--> {mid_name} --[{pred_b}]--> {b.name}  (score={score:.2f}, {mid_cc} claims){composed_tag}")
                         if len(citations) < 50:
                             citations.append(Citation(
                                 claim_id=f"bridge:{a.entity_id}:{mid_id}:{b.entity_id}",
-                                subject=a.entity_id, predicate=f"{pred_a}_via_{pred_b}",
+                                subject=a.entity_id, predicate=composed,
                                 object=b.entity_id, confidence=score,
-                                source_id=f"via:{mid_id}", source_type="neighborhood_intersection",
+                                source_id=f"via:{mid_name}", source_type="causal_composition",
                             ))
                 else:
                     # No shared neighbors in sample — try path_exists on a's neighbors
@@ -661,7 +683,6 @@ class AskEngine:
         # Build entity summaries for response
         entity_summaries = []
         for e in entities[:top_k]:
-            from attestdb.core.types import EntitySummary
             entity_summaries.append(EntitySummary(
                 id=e.entity_id, name=e.name,
                 entity_type=e.entity_type,

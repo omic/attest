@@ -344,6 +344,13 @@ impl StorageBackend for Backend {
         }
     }
 
+    fn neighbors(&mut self, entity_id: &str) -> Vec<String> {
+        match self {
+            Backend::InMemory(m) => m.neighbors(entity_id),
+            Backend::Lmdb(l) => l.neighbors_pub(entity_id),
+        }
+    }
+
     fn bfs_claims(&mut self, entity_id: &str, max_depth: usize) -> Vec<(Claim, usize)> {
         match self {
             Backend::InMemory(m) => m.bfs_claims(entity_id, max_depth),

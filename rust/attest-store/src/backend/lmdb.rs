@@ -890,6 +890,15 @@ impl LmdbBackend {
     }
 
     /// Get neighbor entity IDs from the DUP_SORT adjacency index.
+    pub fn neighbors_pub(&mut self, entity_id: &str) -> Vec<String> {
+        let resolved = self.resolve(entity_id);
+        let rtxn = match self.env().read_txn() {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+        self.neighbors(&rtxn, &resolved).into_iter().collect()
+    }
+
     fn neighbors(&self, rtxn: &heed::RoTxn, entity_id: &str) -> HashSet<String> {
         match self.dbs.adjacency_idx.get_duplicates(rtxn, entity_id) {
             Ok(Some(iter)) => {

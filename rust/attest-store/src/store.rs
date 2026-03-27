@@ -518,6 +518,11 @@ impl RustStore {
 
     // ── Graph traversal ────────────────────────────────────────────────
 
+    /// Get neighbor entity IDs from adjacency index — no claim materialization.
+    pub fn neighbors(&mut self, entity_id: &str) -> Vec<String> {
+        self.backend.neighbors(entity_id)
+    }
+
     /// BFS traversal collecting claims at each hop depth.
     pub fn bfs_claims(&mut self, entity_id: &str, max_depth: usize) -> Vec<(Claim, usize)> {
         self.backend.bfs_claims(entity_id, max_depth)
