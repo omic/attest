@@ -71,6 +71,71 @@ class Principal:
     org_id: str | None = None
     roles: list[str] = field(default_factory=list)
     clearance: SensitivityLevel = SensitivityLevel.PUBLIC
+    groups: list[str] = field(default_factory=list)
+
+
+# ── Enterprise RBAC types ──────────────────────────────────────────────
+
+
+@dataclass
+class Group:
+    """A team or organizational unit for access control."""
+    group_id: str                          # e.g. "engineering", "sales:west"
+    org_id: str = ""
+    display_name: str = ""
+    parent_group_id: str | None = None     # hierarchical groups
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass
+class GroupMembership:
+    """Links a principal to a group with an intra-group role."""
+    principal_id: str                      # e.g. "alice@corp.com"
+    group_id: str
+    role_in_group: str = "member"          # "member" | "manager" | "owner"
+    added_by: str = ""
+    added_at: int = 0
+
+
+@dataclass
+class PolicyRule:
+    """Declarative access policy rule. Policy-as-data, not code."""
+    rule_id: str
+    org_id: str = ""
+    priority: int = 0                      # higher = evaluated first
+    effect: str = "allow"                  # "allow" | "deny"
+    # Subject selectors (who)
+    principal_ids: list[str] = field(default_factory=list)
+    group_ids: list[str] = field(default_factory=list)
+    roles: list[str] = field(default_factory=list)
+    # Resource selectors (what)
+    namespaces: list[str] = field(default_factory=list)    # [] = all
+    sensitivity_max: SensitivityLevel = SensitivityLevel.RESTRICTED
+    entity_types: list[str] = field(default_factory=list)  # [] = all
+    source_types: list[str] = field(default_factory=list)  # [] = all
+    predicates: list[str] = field(default_factory=list)    # [] = all
+    # Action selectors (how)
+    actions: list[str] = field(default_factory=list)       # "read","write","admin"; [] = all
+    # Audit
+    created_by: str = ""
+    created_at: int = 0
+    description: str = ""
+
+
+@dataclass
+class Entitlement:
+    """Resolved effective access for a principal. Computed at request time."""
+    principal_id: str
+    org_id: str = ""
+    effective_role: str = "reader"         # highest role across all groups
+    allowed_namespaces: list[str] = field(default_factory=list)  # union of grants
+    denied_namespaces: list[str] = field(default_factory=list)   # explicit denies
+    clearance: SensitivityLevel = SensitivityLevel.PUBLIC
+    allowed_entity_types: list[str] = field(default_factory=list)
+    allowed_source_types: list[str] = field(default_factory=list)
+    allowed_predicates: list[str] = field(default_factory=list)
+    is_org_admin: bool = False
+    computed_at: int = 0
 
 
 @dataclass

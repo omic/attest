@@ -646,6 +646,15 @@ class AttestDB:
             self._security_path = self._db_path + ".security.json"
             self._load_security_meta()
 
+        # Enterprise RBAC — groups, policies, secure store proxy
+        from attestdb.infrastructure.policy_store import PolicyStore
+        from attestdb.infrastructure.access_resolver import AccessResolver
+        from attestdb.infrastructure.secure_store_proxy import SecureStoreProxy
+        policy_path = None if self._is_memory_db else self._db_path + ".policy.json"
+        self._policy_store = PolicyStore(policy_path, audit_log=self._audit)
+        self._access_resolver = AccessResolver(self._policy_store)
+        self._secure_proxy = SecureStoreProxy(self._store, self._access_resolver)
+
         # Entity-thread index (entity_id → set of thread_ids)
         self._entity_thread_index: dict[str, set[str]] = {}
 
@@ -1122,6 +1131,128 @@ class AttestDB:
     def _get_actor_role(self, namespace: str = "") -> str | None:
         """Get the current actor's effective role for a namespace."""
         return self._rbac_mgr.get_actor_role(namespace)
+
+    # ── Enterprise RBAC (groups, policies, secure proxy) ────────────
+
+    def enable_enterprise_rbac(self) -> None:
+        """Enable enterprise RBAC with group-based policies and secure proxy.
+
+        When enabled, all claim-returning store methods are filtered
+        through the SecureStoreProxy based on the active user's entitlement.
+        Auto-imports legacy RBAC grants as PolicyRules on first enable.
+        """
+        # Auto-import legacy RBAC grants if they exist
+        if self._rbac_mgr._enabled:
+            grants = self._rbac_mgr.list_grants()
+            if grants:
+                self._policy_store.import_legacy_rbac(grants)
+        self._secure_proxy.enable()
+
+    def disable_enterprise_rbac(self) -> None:
+        """Disable enterprise RBAC (passthrough mode)."""
+        self._secure_proxy.disable()
+
+    def set_user(self, principal_id: str, org_id: str = "") -> None:
+        """Set the active user for enterprise RBAC filtering.
+
+        Resolves the user's groups and policies into an Entitlement,
+        then activates namespace + sensitivity filtering on all queries.
+
+        Args:
+            principal_id: User identity (e.g. "alice@corp.com").
+            org_id: Organization/tenant ID.
+        """
+        principal = self._access_resolver.build_principal(principal_id, org_id)
+        self._secure_proxy.set_principal(principal)
+        # Also set actor for audit trail
+        self.set_actor(principal_id)
+
+    def create_group(self, group_id: str, org_id: str = "",
+                     display_name: str = "", parent_group_id: str | None = None) -> None:
+        """Create a team/organizational unit for access control."""
+        from attestdb.core.types import Group
+        self._policy_store.create_group(
+            Group(group_id=group_id, org_id=org_id,
+                  display_name=display_name or group_id,
+                  parent_group_id=parent_group_id),
+            actor=self._audit.actor or "",
+        )
+
+    def add_to_group(self, principal_id: str, group_id: str,
+                     role_in_group: str = "member") -> None:
+        """Add a user to a group."""
+        from attestdb.core.types import GroupMembership
+        self._policy_store.add_member(
+            GroupMembership(principal_id=principal_id, group_id=group_id,
+                           role_in_group=role_in_group),
+            actor=self._audit.actor or "",
+        )
+
+    def remove_from_group(self, principal_id: str, group_id: str) -> None:
+        """Remove a user from a group."""
+        self._policy_store.remove_member(
+            principal_id, group_id,
+            actor=self._audit.actor or "",
+        )
+
+    def add_policy(self, rule_id: str, group_ids: list[str] | None = None,
+                   namespaces: list[str] | None = None,
+                   actions: list[str] | None = None,
+                   sensitivity_max: str = "RESTRICTED",
+                   effect: str = "allow", priority: int = 100,
+                   org_id: str = "", description: str = "") -> None:
+        """Add a declarative access policy rule.
+
+        Args:
+            rule_id: Unique rule identifier.
+            group_ids: Groups this rule applies to.
+            namespaces: Namespaces granted. [] = all.
+            actions: "read", "write", "admin". [] = all.
+            sensitivity_max: Max sensitivity level (default RESTRICTED).
+            effect: "allow" or "deny".
+            priority: Higher = evaluated first. Deny at same priority wins.
+        """
+        from attestdb.core.types import PolicyRule, SensitivityLevel
+        level = SensitivityLevel[sensitivity_max.upper()] if isinstance(sensitivity_max, str) else sensitivity_max
+        self._policy_store.add_rule(
+            PolicyRule(
+                rule_id=rule_id, org_id=org_id, priority=priority,
+                effect=effect, group_ids=group_ids or [],
+                namespaces=namespaces or [],
+                sensitivity_max=level,
+                actions=actions or [],
+                description=description,
+            ),
+            actor=self._audit.actor or "",
+        )
+
+    def remove_policy(self, rule_id: str) -> None:
+        """Remove a policy rule."""
+        self._policy_store.remove_rule(rule_id, actor=self._audit.actor or "")
+
+    def delete_group(self, group_id: str) -> None:
+        """Delete a group and its memberships/policies."""
+        self._policy_store.delete_group(group_id, actor=self._audit.actor or "")
+
+    def get_group_members(self, group_id: str) -> list:
+        """List members of a group."""
+        return self._policy_store.get_group_members(group_id)
+
+    def get_user_groups(self, principal_id: str) -> list:
+        """List groups a user belongs to."""
+        return self._policy_store.get_memberships(principal_id)
+
+    def list_groups(self, org_id: str = "") -> list:
+        """List all groups."""
+        return self._policy_store.list_groups(org_id)
+
+    def list_policies(self, org_id: str = "") -> list:
+        """List all policy rules."""
+        return self._policy_store.list_rules(org_id)
+
+    def get_entitlement(self, principal_id: str, org_id: str = ""):
+        """Resolve a user's effective access rights."""
+        return self._access_resolver.resolve_entitlement(principal_id, org_id)
 
     def _check_permission(self, required_role: str) -> None:
         """Raise PermissionError if RBAC is enabled and actor lacks permission.

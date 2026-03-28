@@ -43,7 +43,7 @@ _STOP = frozenset({
     "good", "bad", "new", "old", "like", "use", "used", "using",
     "target", "role", "effect", "type", "cause", "work", "works",
     "related", "involved", "between", "affect", "impact",
-    "evidence", "suggest", "prevent", "inhibiting", "inhibit",
+    "evidence", "suggest", "prevent", "inhibiting", "inhibit", "inhibition",
     "activate", "activating", "regulate", "know", "known",
 })
 
@@ -54,6 +54,8 @@ _BM25_SKIP = frozenset({
     "treatment", "therapy", "receptor", "enzyme", "tissue",
     "organ", "syndrome", "disorder", "condition", "mutation",
     "variant", "expression", "level", "factor", "response",
+    "inhibition", "activation", "regulation", "suppression",
+    "complement", "signaling", "process", "mechanism",
 })
 
 # Predicate specificity weights for bridge scoring.
@@ -399,10 +401,9 @@ class AskEngine:
                 for pred, count in pred_counts[:12]:
                     lines.append(f"  - {pred}: {count} claims")
 
-        # Top claims by confidence — skip for high-degree entities (materialization is too slow)
-        raw_claims = []
-        if entity.claim_count <= 500:
-            raw_claims = _safe_claims_for(self.db._store, entity.entity_id, None, None, 0.3, 30)
+        # Top claims by confidence — always fetch a small sample for graph citations
+        # Rust-side limit=30 prevents full materialization even on 100K+ entities
+        raw_claims = _safe_claims_for(self.db._store, entity.entity_id, None, None, 0.3, 30)
         if raw_claims:
             lines.append("\nTop relationships:")
             seen = set()
@@ -457,123 +458,73 @@ class AskEngine:
             for j in range(i + 1, len(entities)):
                 a, b = entities[i], entities[j]
 
-                def _get_neighbors_with_preds(eid: str, claim_count: int) -> tuple[set[str], dict[str, list[str]]]:
-                    """Get neighbor IDs and predicate annotations.
-
-                    Uses Rust-native neighbors() for IDs (no materialization),
-                    then samples claims for predicate annotations on shared bridges.
-                    """
-                    # Fast path: Rust adjacency index (O(degree), no claim deserialization)
+                # Get neighbor IDs from Rust adjacency index (instant, no materialization)
+                def _get_neighbors(eid: str) -> set[str]:
                     try:
-                        nbr_ids = set(self.db._store.neighbors(eid))
+                        return set(self.db._store.neighbors(eid))
                     except (AttributeError, TypeError):
-                        # Fallback: sample claims (old wheel without neighbors())
-                        if claim_count > 10000:
-                            cap = 100
-                        elif claim_count > 1000:
-                            cap = 200
-                        else:
-                            cap = min(500, claim_count)
-                        raw = _safe_claims_for(self.db._store, eid, None, None, 0.0, cap)
-                        nbr_ids = set()
-                        for d in raw:
-                            if isinstance(d, dict):
-                                s = d.get("subject", {}).get("id", "")
-                                o = d.get("object", {}).get("id", "")
-                                nbr_ids.add(o if s == eid else s)
+                        raw = _safe_claims_for(self.db._store, eid, None, None, 0.0, 200)
+                        return {(d.get("object",{}).get("id","") if d.get("subject",{}).get("id","") == eid else d.get("subject",{}).get("id","")) for d in raw if isinstance(d, dict)}
 
-                    # Predicate annotations: sample claims for the predicates
-                    # (only needed for shared bridges, done lazily below)
-                    preds: dict[str, list[str]] = {}
-                    cap = 100 if claim_count > 5000 else 200
-                    raw = _safe_claims_for(self.db._store, eid, None, None, 0.0, cap)
-                    for d in raw:
-                        if isinstance(d, dict):
-                            s = d.get("subject", {}).get("id", "")
-                            o = d.get("object", {}).get("id", "")
-                            p = d.get("predicate", {}).get("id", "associated_with")
-                            nbr = o if s == eid else s
-                            preds.setdefault(nbr, []).append(p)
-                    return nbr_ids, preds
-
-                neighbors_a, nbrs_a = _get_neighbors_with_preds(a.entity_id, a.claim_count)
-                neighbors_b, nbrs_b = _get_neighbors_with_preds(b.entity_id, b.claim_count)
+                neighbors_a = _get_neighbors(a.entity_id)
+                neighbors_b = _get_neighbors(b.entity_id)
 
                 # Direct connection?
                 if b.entity_id in neighbors_a or a.entity_id in neighbors_b:
                     lines.append(f"\n## Direct connection: {a.name} ↔ {b.name}")
 
-                # Set intersection — shared neighbors are bridges
+                # Intersect — shared neighbors are bridges
                 shared = neighbors_a & neighbors_b
-                if shared:
-                    # Score bridges by predicate specificity on BOTH sides
-                    scored: list[tuple[str, str, int, float, str, str]] = []
-                    for mid_id in shared:
-                        mid_raw = self.db._store.get_entity(mid_id)
-                        if not mid_raw:
-                            continue
-                        mid_name = _entity_name(mid_raw, mid_id)
-                        mid_cc = mid_raw.get("claim_count", 0) if isinstance(mid_raw, dict) else 0
-                        if mid_cc > 200000:
-                            continue  # skip mega-hubs
+                if not shared:
+                    gaps.append(f"No shared neighbors between {a.name} and {b.name} ({len(neighbors_a)}+{len(neighbors_b)} neighbors)")
+                    continue
 
-                        # Best predicate weight on each side
-                        preds_to_a = nbrs_a.get(mid_id, [])
-                        preds_to_b = nbrs_b.get(mid_id, [])
-                        weight_a = max((_PRED_WEIGHT.get(p, 0.2) for p in preds_to_a), default=0.1)
-                        weight_b = max((_PRED_WEIGHT.get(p, 0.2) for p in preds_to_b), default=0.1)
-                        score = weight_a * weight_b  # geometric — both sides must be specific
+                # Score each bridge using entity_predicate_counts (instant, no claims)
+                scored: list[tuple] = []
+                for mid_id in shared:
+                    mid_raw = self.db._store.get_entity(mid_id)
+                    if not mid_raw:
+                        continue
+                    mid_name = _entity_name(mid_raw, mid_id)
+                    mid_cc = mid_raw.get("claim_count", 0) if isinstance(mid_raw, dict) else 0
+                    if mid_cc > 200000:
+                        continue  # skip mega-hubs
 
-                        best_pred_a = max(preds_to_a, key=lambda p: _PRED_WEIGHT.get(p, 0.2)) if preds_to_a else "?"
-                        best_pred_b = max(preds_to_b, key=lambda p: _PRED_WEIGHT.get(p, 0.2)) if preds_to_b else "?"
+                    # Get bridge entity's predicates (instant from counter table)
+                    mid_preds = self.db._store.entity_predicate_counts(mid_id) if hasattr(self.db._store, 'entity_predicate_counts') else []
+                    if not isinstance(mid_preds, list) or not mid_preds:
+                        continue
 
-                        # Compose predicates: inhibits + causes = prevents
-                        composed = _compose(best_pred_a, best_pred_b)
+                    # Use top 2 predicates as proxy for A→Bridge and Bridge→B
+                    pred_a = mid_preds[0][0]
+                    pred_b = mid_preds[1][0] if len(mid_preds) > 1 else pred_a
+                    weight_a = _PRED_WEIGHT.get(pred_a, 0.2)
+                    weight_b = _PRED_WEIGHT.get(pred_b, 0.2)
+                    score = weight_a * weight_b
 
-                        scored.append((mid_id, mid_name, mid_cc, score, best_pred_a, best_pred_b, composed))
+                    composed = _compose(pred_a, pred_b)
+                    scored.append((mid_id, mid_name, mid_cc, score, pred_a, pred_b, composed))
 
-                    scored.sort(key=lambda x: -x[3])  # sort by predicate score
+                scored.sort(key=lambda x: -x[3])
+                n_specific = sum(1 for s in scored if s[3] >= 0.3)
+                lines.append(f"\n## Bridges: {a.name} ↔ {b.name} ({len(scored)} shared, {n_specific} with specific predicates)")
 
-                    n_specific = sum(1 for s in scored if s[3] >= 0.3)
-                    lines.append(f"\n## Bridges: {a.name} ↔ {b.name} ({len(scored)} shared, {n_specific} with specific predicates)")
-                    for mid_id, mid_name, mid_cc, score, pred_a, pred_b, composed in scored[:10]:
-                        composed_tag = f" → inferred: {a.name} {composed} {b.name}" if composed != "associated_with" else ""
-                        lines.append(f"  {a.name} --[{pred_a}]--> {mid_name} --[{pred_b}]--> {b.name}  (score={score:.2f}, {mid_cc} claims){composed_tag}")
-                        if len(citations) < 50:
-                            citations.append(Citation(
-                                claim_id=f"bridge:{a.entity_id}:{mid_id}:{b.entity_id}",
-                                subject=a.entity_id, predicate=composed,
-                                object=b.entity_id, confidence=score,
-                                source_id=f"via:{mid_name}", source_type="causal_composition",
-                            ))
-                else:
-                    # No shared neighbors in sample — try path_exists on a's neighbors
-                    bridges: list[tuple[str, str, int]] = []
-                    for mid_id in list(neighbors_a)[:100]:
-                        if self.db.path_exists(mid_id, b.entity_id, max_depth=1):
-                            mid_raw = self.db._store.get_entity(mid_id)
-                            if mid_raw:
-                                mid_name = _entity_name(mid_raw, mid_id)
-                                mid_cc = mid_raw.get("claim_count", 0) if isinstance(mid_raw, dict) else 0
-                                bridges.append((mid_id, mid_name, mid_cc))
-                            if len(bridges) >= 10:
-                                break
-                    if bridges:
-                        bridges.sort(key=lambda x: -x[2])
-                        lines.append(f"\n## 2-hop bridges: {a.name} → ? → {b.name} ({len(bridges)} found)")
-                        for mid_id, mid_name, mid_cc in bridges[:8]:
-                            preds = self.db._store.entity_predicate_counts(mid_id) if hasattr(self.db._store, 'entity_predicate_counts') else []
-                            pred_str = ", ".join(f"{p}({c})" for p, c in (preds[:5] if isinstance(preds, list) else []))
-                            lines.append(f"  via {mid_name} ({mid_cc} claims): {pred_str}")
-                            if len(citations) < 50:
-                                citations.append(Citation(
-                                    claim_id=f"2hop:{a.entity_id}:{mid_id}:{b.entity_id}",
-                                    subject=a.entity_id, predicate="connected_via",
-                                    object=b.entity_id, confidence=0.5,
-                                    source_id=f"via:{mid_id}", source_type="graph_2hop",
-                                ))
-                    else:
-                        gaps.append(f"No 2-hop connection found between {a.name} and {b.name} (sampled {len(neighbors_a)}+{len(neighbors_b)} neighbors)")
+                for mid_id, mid_name, mid_cc, score, pred_a, pred_b, composed in scored[:5]:
+                    composed_tag = f" → inferred: {a.name} {composed} {b.name}" if composed != "associated_with" else ""
+                    lines.append(f"  {a.name} --[{pred_a}]--> {mid_name} --[{pred_b}]--> {b.name}  (score={score:.2f}, {mid_cc} claims){composed_tag}")
+                    if len(citations) < 48:
+                        citations.append(Citation(
+                            claim_id=f"bridge:{a.entity_id}:{mid_id}:leg1",
+                            subject=a.entity_id, predicate=pred_a,
+                            object=mid_id, confidence=score,
+                            source_id="bridge", source_type="causal_composition",
+                        ))
+                        citations.append(Citation(
+                            claim_id=f"bridge:{mid_id}:{b.entity_id}:leg2",
+                            subject=mid_id, predicate=pred_b,
+                            object=b.entity_id, confidence=score,
+                            source_id="bridge", source_type="causal_composition",
+                        ))
 
         # Add predicate summaries for each entity (instant, no materialization)
         for entity in entities[:4]:
