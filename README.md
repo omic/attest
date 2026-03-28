@@ -28,7 +28,7 @@ db.ingest(
     subject=("BRCA1", "gene"),
     predicate=("associated_with", "relates_to"),
     object=("Breast Cancer", "disease"),
-    provenance={"source_type": "literature_extraction", "source_id": "PMID:12345"},
+    provenance={"source_type": "database_import", "source_id": "PMID:12345"},
     confidence=0.9,
 )
 
@@ -132,10 +132,12 @@ Attest uses the Rust backend automatically when available. LMDB storage: instant
 - **Audit chain** -- tamper-evident Merkle hash chain on append-only log
 - **Multi-agent research** -- agent registration, task queue, federation
 - **Negative results** -- first-class claims that prune the search tree
+- **Enterprise RBAC** -- groups, policies, entitlements for 10K+ person orgs (enterprise)
+- **V2 ask engine** -- entity-first retrieval, 2.5s on 85M claims (enterprise)
 
 ## Intelligence Layer (Enterprise)
 
-LLM-powered features (curation, text extraction, chat ingestion, connectors, insight engine) are available in `attestdb-enterprise`:
+LLM-powered features (curation, text extraction, chat ingestion, connectors, insight engine, enterprise RBAC) are available in `attestdb-enterprise`:
 
 ```bash
 pip install attestdb-enterprise

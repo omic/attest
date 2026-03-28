@@ -4,14 +4,14 @@ build-backend = "maturin"
 
 [project]
 name = "attest-py"
-version = "0.1.34"
-description = "Rust storage engine for AttestDB (PyO3 bindings)"
+version = "0.1.35"
+description = "Rust storage engine for AttestDB — 1.3M claims/sec, LMDB, 8µs query. Install with: pip install attestdb attest-py"
 requires-python = ">=3.11"
 license = {text = "BSL-1.1"}
 authors = [
     {name = "Omic Research"},
 ]
-keywords = ["knowledge-graph", "database", "rust", "storage-engine"]
+keywords = ["knowledge-graph", "database", "rust", "storage-engine", "lmdb", "pyO3", "claims"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",

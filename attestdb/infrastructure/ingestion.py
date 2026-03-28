@@ -218,24 +218,24 @@ class IngestionPipeline:
         if source_type not in self._get_valid_source_types():
             if self._strict:
                 raise VocabularyError(f"Unknown source_type: {source_type}")
-            logger.warning("Unknown source_type: %s (allowed in non-strict mode)", source_type)
+            logger.debug("Custom source_type: %s (allowed in non-strict mode)", source_type)
 
         # Rule 7: Validate entity types
         valid_entity_types = self._get_valid_entity_types()
         if subj_type not in valid_entity_types:
             if self._strict:
                 raise VocabularyError(f"Unknown entity_type for subject: {subj_type}")
-            logger.warning("Unknown entity_type: %s", subj_type)
+            logger.debug("Custom entity_type: %s", subj_type)
         if obj_type not in valid_entity_types:
             if self._strict:
                 raise VocabularyError(f"Unknown entity_type for object: {obj_type}")
-            logger.warning("Unknown entity_type: %s", obj_type)
+            logger.debug("Custom entity_type: %s", obj_type)
 
         # Rule 8: Validate predicate type
         if pred_type not in self._get_valid_predicate_types():
             if self._strict:
                 raise VocabularyError(f"Unknown predicate_type: {pred_type}")
-            logger.warning("Unknown predicate_type: %s", pred_type)
+            logger.debug("Custom predicate_type: %s", pred_type)
 
         # Rule 9: Predicate constraints
         constraints = self._store.get_predicate_constraints().get(pred_id)
