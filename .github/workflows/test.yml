@@ -21,17 +21,17 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'
 
-      - name: Create virtualenv and install dependencies
+      - name: Build Rust extension first (attestdb depends on attest-py)
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install -e ".[dev,mcp]"
-
-      - name: Build Rust extension
-        run: |
-          source .venv/bin/activate
           pip install maturin
           cd rust/attest-py && maturin develop --release
+
+      - name: Install Python package and dev dependencies
+        run: |
+          source .venv/bin/activate
+          pip install -e ".[dev,mcp]"
 
       - name: Run unit tests
         run: |
