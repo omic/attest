@@ -1,7 +1,7 @@
 [project]
 name = "attestdb"
-version = "0.1.35"
-description = "Claim-native database for agents — 1.3M claims/sec, provenance-tracked, 84 MCP tools. pip install attestdb attest-py"
+version = "0.1.36"
+description = "A brain for AI agents that actually learns — confidence scoring, negative results, gap detection. pip install attestdb && attest brain install"
 readme = "README.md"
 license = {text = "BSL-1.1"}
 requires-python = ">=3.11"
@@ -59,6 +59,7 @@ Repository = "https://github.com/omic/attest"
 attest-mcp = "attestdb.mcp_install:main"
 attest-mcp-http = "attestdb.mcp_server_http:main"
 attest = "attestdb.__main__:main"
+attest-brain = "attestdb.brain:_cli_main"
 
 [build-system]
 requires = ["hatchling"]

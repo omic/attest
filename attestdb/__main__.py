@@ -524,6 +524,28 @@ def main():
         help="Local path to save (default: ~/.attest/memory.attest)",
     )
 
+    # --- brain ---
+    p_brain = sub.add_parser(
+        "brain",
+        help="Personal knowledge brain for AI agents (install/status/uninstall)",
+    )
+    brain_sub = p_brain.add_subparsers(dest="brain_command", help="Brain commands")
+    p_brain_install = brain_sub.add_parser("install", help="Install brain into coding tools")
+    p_brain_install.add_argument(
+        "--tool", choices=["claude", "cursor", "windsurf", "codex", "gemini"],
+        help="Specific tool (default: auto-detect)",
+    )
+    p_brain_install.add_argument(
+        "--project", dest="scope", action="store_const", const="project", default="user",
+        help="Install for current project only (default: user-wide)",
+    )
+    brain_sub.add_parser("status", help="Show brain stats and health")
+    p_brain_uninstall = brain_sub.add_parser("uninstall", help="Remove brain from coding tools")
+    p_brain_uninstall.add_argument(
+        "--tool", choices=["claude", "cursor", "windsurf", "codex", "gemini"],
+        help="Specific tool (default: all)",
+    )
+
     # --- status ---
     sub.add_parser("status", help="Show cloud connection info and DB stats")
 
@@ -532,7 +554,17 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    if args.command == "chat":
+    if args.command == "brain":
+        from attestdb.brain import install as brain_install, uninstall as brain_uninstall, status as brain_status
+        if args.brain_command == "install":
+            brain_install(tool=args.tool, scope=args.scope)
+        elif args.brain_command == "uninstall":
+            brain_uninstall(tool=getattr(args, "tool", None))
+        elif args.brain_command == "status":
+            brain_status()
+        else:
+            p_brain.print_help()
+    elif args.command == "chat":
         cmd_chat(args)
     elif args.command == "ingest":
         cmd_ingest(args)

@@ -8,13 +8,35 @@
 
 > Licensed under the [Business Source License 1.1](LICENSE). Free to use, modify, and self-host. Cannot be offered as a competing managed service. Converts to Apache 2.0 after 4 years.
 
-**The database for agents.** Persistent memory that compounds across sessions -- every fact sourced, every claim confidence-weighted, every failure a data point that prunes the search tree for everyone. `pip install`, single file, no server. 1.3M claims/sec ingestion, 8us entity query.
-
-## Install
+**A brain for AI agents that actually learns.** Give Claude Code, Cursor, OpenClaw, and any MCP-compatible agent a persistent knowledge system that tracks confidence, records what failed, detects gaps, and gets smarter every session. Free, open source, runs 100% locally.
 
 ```bash
 pip install attestdb
+attest brain install
 ```
+
+## What It Does
+
+Your agent forgets everything between sessions. Attest Brain fixes that:
+
+- **Session recall** -- prior knowledge (warnings, patterns, dead ends) injected at session start
+- **Pre-edit warnings** -- known bugs and patterns surface before you edit a file
+- **Post-test fixes** -- prior solutions appear when tests fail
+- **Negative results** -- records what was tried and *didn't* work, so nobody repeats the search
+- **Confidence scoring** -- every fact has a 0-1 score that updates as evidence arrives
+- **Contradiction resolution** -- conflicting claims resolved with principled reasoning
+- **Gap detection** -- finds what the brain doesn't know and flags it
+
+Works with **Claude Code**, **OpenClaw**, **Cursor**, **Windsurf**, **Codex**, and **Gemini CLI**.
+
+### Without Brain vs With Brain
+
+| | Without | With Brain |
+|---|---|---|
+| Same bug, second time | Debug from scratch (40 min) | Brain recalls the fix (3 min) |
+| Preferences | Asks the same questions every time | Remembers and applies automatically |
+| Dead ends | Re-investigates failed approaches | Skips known failures |
+| Knowledge | Resets to zero each session | Compounds over time |
 
 ## Quick Start
 
@@ -41,139 +63,77 @@ for rel in frame.direct_relationships:
 db.close()
 ```
 
-## AI Agent Memory
+## MCP Tools (84 total)
 
-Attest gives AI coding agents persistent, cross-session memory. Install the MCP server and your agent learns from every session -- warnings, patterns, dead ends, and fixes are recalled automatically.
-
-```bash
-pip install attestdb[mcp]
-attest-mcp install          # Auto-detect Claude Code, Cursor, Windsurf, Codex
-```
-
-What it does:
-
-- **Recall hook** -- injects prior knowledge at session start (warnings, patterns, next steps from last session)
-- **Pre-edit check** -- surfaces known bugs/warnings before you edit a file
-- **Post-test check** -- surfaces prior fixes when tests fail
-- **Negative results** -- records what you investigated and *didn't* find, so future sessions don't repeat the search
-- **Research context** -- shows what's been tried, what failed, and active strategies before starting work
+The brain exposes 84 MCP tools. Key ones for everyday use:
 
 ```python
-# Record a finding
-attest_learned("ClaimInput API", "must use provenance= dict, not source_id= kwarg", "warning")
+# Record knowledge
+attest_learned("redis client", "v7 needs decode_responses=True", "warning")
+attest_negative_result("session auth", "msgpack doesn't work for Redis 7 serialization")
+attest_session_end("success", "Fixed auth tests after Redis upgrade")
 
-# Record a dead end
-attest_negative_result("RustStore", "streaming query API", "read all 27 PyO3 methods")
+# Recall knowledge
+attest_get_prior_approaches("Redis serialization error")
+attest_check_file("payment_handler.py")
+attest_research_context("session management")
 
-# Get research context before starting work
-attest_research_context("bincode serialization")
-# Returns: dead ends, prior findings, active strategies, prior investigators
-```
-
-84 MCP tools total. Works with Claude Code, Cursor, Windsurf, and Codex.
-
-## Multi-Agent Collaborative Research
-
-Multiple agents can collaborate on knowledge expansion -- submitting research, claiming tasks from a gap-driven queue, and sharing negative results so failed investigations prune the search tree for everyone.
-
-```python
-from attestdb.infrastructure.agents import (
-    register_agent, submit_research, submit_negative_result,
-    generate_tasks, claim_task, complete_task, get_task_context,
-)
-
-# Register agents
-register_agent(db, "agent-alpha", capabilities=["literature"], model="gpt-4o")
-
-# Submit research with gaps discovered
-submit_research(db, "agent-alpha", claims=[...],
-    topic="tp53", gaps_discovered=["mutation spectrum in rare cancers"])
-
-# Record what didn't work (prunes the search tree for other agents)
-submit_negative_result(db, "agent-alpha",
-    subject=("tp53", "gene"),
-    hypothesis=("direct kinase activity", "mechanism"),
-    search_strategy="PubMed + STRING + Reactome")
-
-# Task queue auto-generates from knowledge gaps
-tasks = generate_tasks(db)  # Entities with 3+ negative results get deprioritized
-
-# Get context before starting (dead ends, strategies, prior findings)
-context = get_task_context(db, "tp53")
-
-# Federation: sync claims between instances via NDJSON
-export_claims_since(db, since_ns=0, stream=output_file)
-import_claims_from_stream(db2, stream=input_file)
-```
-
-Content-addressed claims (`content_id` = SHA-256 of subject+predicate+object) enable conflict-free dedup across federated instances. Same fact from different agents = automatic corroboration.
-
-## Rust Backend
-
-The Rust storage engine powers all operations (1.3M claims/sec ingestion, 8us entity query). Install separately if not bundled:
-
-```bash
-pip install attest-py
-```
-
-Attest uses the Rust backend automatically when available. LMDB storage: instant crash recovery, concurrent readers, O(1) memory open for any database size.
-
-## Core Capabilities
-
-- **Provenance-tracked claims** -- every fact has a source chain
-- **Confidence scoring** -- Tier 1 (direct evidence) + Tier 2 (corroboration)
-- **Retraction with cascade** -- `db.retract("source_123")` propagates downstream
-- **Time travel** -- `db.at(timestamp)` for point-in-time views
-- **Graph algorithms** -- PageRank, betweenness centrality, SVD embeddings, causal prediction
-- **Contradiction resolution** -- evidence-weighted voting across corroboration, source tier, recency
-- **Snapshot/Restore** -- `db.snapshot(path)` and `AttestDB.restore(path)`
-- **MCP server** -- 84 tools for AI agent integration
-- **Embedding index** -- HNSW similarity search via usearch
-- **Audit chain** -- tamper-evident Merkle hash chain on append-only log
-- **Multi-agent research** -- agent registration, task queue, federation
-- **Negative results** -- first-class claims that prune the search tree
-- **Enterprise RBAC** -- groups, policies, entitlements for 10K+ person orgs (enterprise)
-- **V2 ask engine** -- entity-first retrieval, 2.5s on 85M claims (enterprise)
-
-## Intelligence Layer (Enterprise)
-
-LLM-powered features (curation, text extraction, chat ingestion, connectors, insight engine, enterprise RBAC) are available in `attestdb-enterprise`:
-
-```bash
-pip install attestdb-enterprise
+# Analyze knowledge
+attest_blindspots()           # Find gaps
+attest_confidence_trail("redis client")  # See confidence evolution
+attest_predict("entity_a", "entity_b")   # Causal prediction via graph
 ```
 
 ## CLI
 
 ```bash
+attest brain install            # Install brain into your coding tools
+attest brain status             # View brain statistics
+attest brain uninstall          # Remove brain from coding tools
 attest stats my.db              # Show database statistics
 attest query my.db BRCA1        # Query knowledge around an entity
-attest schema my.db             # Show knowledge graph schema
-attest serve --port 8892        # Start MCP server
-attest ingest file.json --db my.db  # Ingest claims from file
-attest-mcp install              # Install MCP for your coding tool
-attest-mcp metrics              # View hook performance metrics
+attest serve --port 8892        # Start MCP server (SSE/HTTP)
+```
+
+## Under the Hood
+
+Attest isn't a thin wrapper over SQLite or a vector store. It's a purpose-built claim-native database with a Rust storage engine.
+
+- **1.3M claims/sec** ingestion, **8us** entity query (LMDB via heed)
+- **Atomic claims** -- every fact is a (subject, predicate, object) triple with provenance
+- **Dual IDs** -- `claim_id` (SHA-256, globally unique) + `content_id` (SHA-256 of S+P+O, for corroboration)
+- **13 validation rules** on every write
+- **Merkle audit chain** -- tamper-evident append-only log
+- **Graph algorithms** -- PageRank, betweenness centrality, SVD embeddings, causal prediction
+
+## Core Capabilities
+
+- **Provenance-tracked claims** -- every fact has a source chain
+- **Confidence scoring** -- evidence-weighted, updates on corroboration
+- **Confidence decay** -- stale knowledge loses confidence over time
+- **Retraction with cascade** -- `db.retract("source_123")` propagates downstream
+- **Contradiction resolution** -- evidence-weighted voting across sources
+- **Snapshot/Restore** -- `db.snapshot(path)` for backups
+- **Embedding index** -- HNSW similarity search via usearch
+- **Multi-agent research** -- agent registration, task queue, federation
+- **Negative results** -- first-class claims that prune the search tree
+- **Enterprise RBAC** -- groups, policies, entitlements for 10K+ orgs (enterprise)
+
+## Intelligence Layer (Enterprise)
+
+LLM-powered features (curation, text extraction, connectors, insight engine) are available in `attestdb-enterprise`:
+
+```bash
+pip install attestdb-enterprise
 ```
 
 ## Common Errors
 
-**`ProvenanceError`** -- Every claim needs `provenance={"source_type": "...", "source_id": "..."}`. This is by design: claims without provenance can't be verified.
+**`ProvenanceError`** -- Every claim needs `provenance={"source_type": "...", "source_id": "..."}`. By design: claims without provenance can't be verified.
 
-**`ImportError: requires attestdb-enterprise`** -- Methods like `ingest_chat()`, `ingest_text()`, and `connect()` need the enterprise package. Use `db.ingest()` for structured claims without it.
-
-**`ValueError: Unknown vocabulary`** -- Valid vocab names are `bio`, `devops`, `ml`, `ai_tools`, or `all`. Not `biology`.
+**`ImportError: requires attestdb-enterprise`** -- Methods like `ingest_chat()` and `connect()` need the enterprise package. Use `db.ingest()` for structured claims without it.
 
 **`database is locked`** -- Only one process can write to a `.attest` file. Kill stale processes or use `:memory:` for testing.
-
-See `docs/10_getting_started.md` for a full troubleshooting guide.
-
-## Documentation
-
-See `docs/` for full architecture and design documentation:
-- `docs/02_architecture.md` -- Full technical architecture
-- `docs/06_api_spec.md` -- API contract and validation rules
-- `docs/07_design_decisions.md` -- Critical decisions with rationale
-- `docs/10_getting_started.md` -- Getting started + troubleshooting
 
 ## Running Tests
 
@@ -182,6 +142,13 @@ pip install attestdb[dev]
 pytest tests/unit/ tests/integration/   # ~1100 tests, <75s
 cd rust && cargo test                   # Rust unit + golden vectors
 ```
+
+## Documentation
+
+- [attestdb.com/brain.html](https://attestdb.com/brain.html) -- Brain landing page
+- [attestdb.com/quickstart.html](https://attestdb.com/quickstart.html) -- Quick start guide
+- `docs/02_architecture.md` -- Technical architecture
+- `docs/07_design_decisions.md` -- Design decisions with rationale
 
 ## License
 
