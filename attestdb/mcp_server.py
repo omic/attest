@@ -535,7 +535,10 @@ def attest_ask(question: str, namespace: str = "", top_k: int = 10) -> str:
     _track_tool_call("attest_ask", question[:100])
     db = _get_db()
 
-    from attestdb.mcp_tools_learning import attest_ask_impl
+    try:
+        from attestdb.mcp_tools_learning import attest_ask_impl
+    except ImportError:
+        return {"error": "attest_ask requires attestdb-enterprise. Install with: pip install attestdb-enterprise"}
 
     if namespace:
         with _namespace_scope(db, namespace):
@@ -786,20 +789,34 @@ def attest_hypothetical(
 # Register tool groups from submodules
 # ---------------------------------------------------------------------------
 
-from attestdb.mcp_tools_learning import register_tools as _reg_learning
-from attestdb.mcp_tools_learning import (  # re-export helpers used by tests
-    _retrieve_candidates,
-    _ASK_STOP_WORDS,
-    attest_ask_impl as _attest_ask_impl,
-)
-from attestdb.mcp_tools_viz import register_tools as _reg_viz
-from attestdb.mcp_tools_autonomous import register_tools as _reg_autonomous
-from attestdb.mcp_tools_analysis import register_tools as _reg_analysis
+try:
+    from attestdb.mcp_tools_learning import register_tools as _reg_learning
+    from attestdb.mcp_tools_learning import (  # re-export helpers used by tests
+        _retrieve_candidates,
+        _ASK_STOP_WORDS,
+        attest_ask_impl as _attest_ask_impl,
+    )
+    _reg_learning(mcp, _get_db)
+except ImportError:
+    pass
 
-_reg_learning(mcp, _get_db)
-_reg_viz(mcp, _get_db)
-_reg_autonomous(mcp, _get_db)
-_reg_analysis(mcp, _get_db)
+try:
+    from attestdb.mcp_tools_viz import register_tools as _reg_viz
+    _reg_viz(mcp, _get_db)
+except ImportError:
+    pass
+
+try:
+    from attestdb.mcp_tools_autonomous import register_tools as _reg_autonomous
+    _reg_autonomous(mcp, _get_db)
+except ImportError:
+    pass
+
+try:
+    from attestdb.mcp_tools_analysis import register_tools as _reg_analysis
+    _reg_analysis(mcp, _get_db)
+except ImportError:
+    pass
 
 # Re-export tool functions from submodules so tests and external code can
 # import them from attestdb.mcp_server (backward compatibility).
