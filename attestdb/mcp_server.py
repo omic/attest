@@ -23,7 +23,26 @@ from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("attest", instructions="Knowledge graph database with provenance-tracked claims")
+_BRAIN_INSTRUCTIONS = """\
+You have a persistent knowledge brain that remembers across sessions. USE IT PROACTIVELY:
+
+**Always do these during every session:**
+1. When you discover a bug, pattern, or gotcha: call `attest_learned(subject, description, type)` \
+— types: bug, fix, pattern, warning, decision, tip
+2. When something fails or doesn't work: call `attest_negative_result(topic, finding)` \
+— prevents repeating dead ends
+3. Before editing a file you haven't touched recently: call `attest_check_file(path)` for known issues
+4. Before starting a complex task: call `attest_get_prior_approaches(problem)` to see what worked before
+5. When the user's task is done: call `attest_session_end(outcome, summary, next_steps, files_changed)`
+
+**These happen automatically via hooks (no action needed):**
+- Session start: prior warnings/bugs/patterns injected based on git context
+- Before edits: known issues for the file surface via PreToolUse hook
+- After test failures: prior fixes surfaced via PostToolUse hook
+
+Record knowledge liberally — anything that would save time if encountered again."""
+
+mcp = FastMCP("attest", instructions=_BRAIN_INSTRUCTIONS)
 
 # Global DB reference — set by main() or configure()
 _db = None

@@ -122,7 +122,6 @@ def _mcp_server_entry() -> dict:
         # Cloud mode — point MCP client at the cloud endpoint
         endpoint = cloud["endpoint"].rstrip("/")
         return {
-            "type": "url",
             "url": f"{endpoint}/mcp",
             "headers": {
                 "Authorization": f"Bearer {cloud['api_key']}",
@@ -141,7 +140,6 @@ def _mcp_server_entry() -> dict:
     db_path = str(DEFAULT_MEMORY_DB)
 
     entry = {
-        "type": "stdio",
         "command": attest_mcp,
         "args": args + ["--db", db_path],
         "env": {
@@ -207,7 +205,7 @@ def install(tools: list[str] | None = None, scope: str = "project") -> list[str]
         config_path = config_path_fn()
         existing = _read_json(config_path)
         servers = existing.setdefault("mcpServers", {})
-        servers["attest"] = entry
+        servers["brain"] = entry
         _write_json(config_path, existing)
         configured.append(tool_key)
         print(f"  {tool['name']}: {config_path}")
@@ -1649,8 +1647,8 @@ def uninstall(tools: list[str] | None = None) -> list[str]:
                 continue
             data = _read_json(path)
             servers = data.get("mcpServers", {})
-            if "attest" in servers:
-                del servers["attest"]
+            if "brain" in servers:
+                del servers["brain"]
                 _write_json(path, data)
                 if tool_key not in removed:
                     removed.append(tool_key)
