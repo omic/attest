@@ -70,9 +70,6 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["attestdb"]
 
-[tool.hatch.build.targets.wheel.force-include]
-"attestdb/data" = "attestdb/data"
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
