@@ -1,6 +1,6 @@
 [project]
 name = "attestdb"
-version = "0.1.38"
+version = "0.1.39"
 description = "A brain for AI agents that actually learns — confidence scoring, negative results, gap detection. pip install attestdb && attest brain install"
 readme = "README.md"
 license = {text = "BSL-1.1"}
