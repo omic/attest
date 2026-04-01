@@ -1430,3 +1430,95 @@ def entity_summary_from_dict(d: dict) -> EntitySummary:
         external_ids=d.get("external_ids", {}),
         claim_count=d.get("claim_count", 0),
     )
+
+
+# ---------------------------------------------------------------------------
+# Team monitoring types (Attest Manager)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TeamMemberConfig:
+    """Configuration for a monitored team member."""
+
+    email: str
+    slack_id: str = ""
+    github_login: str = ""
+    gitlab_login: str = ""
+    jira_name: str = ""
+    linear_name: str = ""
+    role: str = "engineer"
+    timezone: str = "US/Pacific"
+    work_start: int = 9   # hour, 24h format
+    work_end: int = 17
+
+
+@dataclass
+class TeamConfig:
+    """Configuration for a monitored team."""
+
+    name: str
+    members: list[TeamMemberConfig] = field(default_factory=list)
+    manager_email: str = ""
+    tone: str = "supportive"  # supportive, direct, casual
+    check_interval_minutes: int = 15
+    enabled_detectors: list[str] = field(default_factory=list)  # empty = all
+
+
+@dataclass
+class AnomalyResult:
+    """A detected anomaly for a team member."""
+
+    member_email: str
+    anomaly_type: str  # commit_silence, stale_pr, velocity_drop, communication_gap, blocker_signal, topic_drift
+    severity: str = "medium"  # low, medium, high
+    detail: str = ""
+    baseline_value: float = 0.0
+    current_value: float = 0.0
+    window_days: int = 0
+    related_entities: list[str] = field(default_factory=list)  # ticket IDs, PR numbers
+    timestamp: float = 0.0
+
+
+@dataclass
+class DraftMessage:
+    """A draft Slack DM for the manager to review."""
+
+    draft_id: str = ""
+    intended_for: str = ""  # team member email
+    anomaly_type: str = ""
+    draft_text: str = ""
+    tone: str = "supportive"
+    context: str = ""  # summary of why this was generated
+    status: str = "pending_review"  # pending_review, approved, sent, dismissed
+    created_at: float = 0.0
+    reviewed_at: float = 0.0
+    sent_at: float = 0.0
+
+
+@dataclass
+class MonitorCycleReport:
+    """Report from a single team monitor cycle."""
+
+    cycle_number: int
+    started_at: float
+    finished_at: float
+    members_checked: int = 0
+    anomalies_detected: int = 0
+    drafts_generated: int = 0
+    llm_calls: int = 0
+    estimated_cost: float = 0.0
+    errors: list[str] = field(default_factory=list)
+
+
+@dataclass
+class MonitorStatus:
+    """Status of the team monitor daemon."""
+
+    enabled: bool = False
+    running: bool = False
+    team_name: str = ""
+    cycle_count: int = 0
+    total_anomalies: int = 0
+    pending_drafts: int = 0
+    last_cycle: MonitorCycleReport | None = None
+    next_cycle_at: float = 0.0

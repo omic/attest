@@ -89,7 +89,7 @@ Phase 1 and Phase 2 are **complete**. The intelligence layer, Rust engine, and f
 
 **Domain vocabularies:** Biology (Omic), DevOps (service/deployment/incident), and ML experiment tracking (model/dataset/experiment) vocabularies ship with the engine. All importable from top-level `attestdb` module.
 
-**Rust engine (Phase 2 — complete):** Three crates: `attest-core` (locked invariants), `attest-store` (27-method API with file locking, crash recovery, atomic writes), `attest-py` (PyO3 bindings). Benchmarks: 1.3M claims/sec insert, 8us entity query, 15us BFS. NDJSON migration tooling for export/import.
+**Rust engine (Phase 2 — complete):** Three crates: `attest-core` (locked invariants), `attest-store` (27-method API with file locking, crash recovery, atomic writes), `attest-py` (PyO3 bindings). Benchmarks: 1.3M claims/sec insert, ~12µs entity query, 15µs BFS. NDJSON migration tooling for export/import.
 
 ### Quantitative Results
 

@@ -41,6 +41,8 @@ fn make_claim(claim_id: &str, subj: &str, pred: &str, obj: &str) -> Claim {
         payload: None,
         timestamp: 1000,
         status: ClaimStatus::Active,
+        namespace: String::new(),
+        expires_at: 0,
     }
 }
 
@@ -77,7 +79,7 @@ fn bench_claims_for(c: &mut Criterion) {
 
     c.bench_function("claims_for_entity", |b| {
         b.iter(|| {
-            store.claims_for(black_box("entity_0"), None, None, 0.0)
+            store.claims_for(black_box("entity_0"), None, None, 0.0, 0)
         });
     });
 }
@@ -114,11 +116,75 @@ fn bench_get_adjacency_list(c: &mut Criterion) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// LMDB benchmarks — more realistic conditions (disk-backed, larger datasets)
+// ---------------------------------------------------------------------------
+
+/// Query claims_for on LMDB with 100K claims (warm cache).
+fn bench_lmdb_claims_for_100k(c: &mut Criterion) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bench.attest");
+    let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
+    for i in 0..100_000 {
+        let subj = format!("entity_{}", i % 10_000);
+        let obj = format!("entity_{}", (i + 1) % 10_000);
+        store.insert_claim(make_claim(&format!("claim_{i}"), &subj, "relates_to", &obj));
+    }
+
+    c.bench_function("lmdb_claims_for_100k", |b| {
+        b.iter(|| {
+            store.claims_for(black_box("entity_0"), None, None, 0.0, 0)
+        });
+    });
+    let _ = store.close();
+}
+
+/// Query claims_for on LMDB with 100K claims, limit=10 (paginated).
+fn bench_lmdb_claims_for_100k_limit10(c: &mut Criterion) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bench.attest");
+    let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
+    for i in 0..100_000 {
+        let subj = format!("entity_{}", i % 10_000);
+        let obj = format!("entity_{}", (i + 1) % 10_000);
+        store.insert_claim(make_claim(&format!("claim_{i}"), &subj, "relates_to", &obj));
+    }
+
+    c.bench_function("lmdb_claims_for_100k_limit10", |b| {
+        b.iter(|| {
+            store.claims_for(black_box("entity_0"), None, None, 0.0, 10)
+        });
+    });
+    let _ = store.close();
+}
+
+/// BFS depth-2 on LMDB with 100K claims.
+fn bench_lmdb_bfs_100k(c: &mut Criterion) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bench.attest");
+    let mut store = RustStore::new(path.to_str().unwrap()).unwrap();
+    for i in 0..100_000 {
+        let subj = format!("entity_{}", i % 10_000);
+        let obj = format!("entity_{}", (i * 7 + 3) % 10_000);
+        store.insert_claim(make_claim(&format!("claim_{i}"), &subj, "relates_to", &obj));
+    }
+
+    c.bench_function("lmdb_bfs_depth2_100k", |b| {
+        b.iter(|| {
+            store.bfs_claims(black_box("entity_0"), black_box(2))
+        });
+    });
+    let _ = store.close();
+}
+
 criterion_group!(
     benches,
     bench_insert_claim,
     bench_claims_for,
     bench_bfs_depth_2,
     bench_get_adjacency_list,
+    bench_lmdb_claims_for_100k,
+    bench_lmdb_claims_for_100k_limit10,
+    bench_lmdb_bfs_100k,
 );
 criterion_main!(benches);

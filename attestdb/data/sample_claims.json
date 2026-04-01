@@ -1,0 +1,177 @@
+[
+  {
+    "subject_id": "tp53", "subject_type": "gene",
+    "predicate_id": "causes", "predicate_type": "causal",
+    "object_id": "apoptosis", "object_type": "biological_process",
+    "confidence": 0.95,
+    "provenance": {"source_type": "paper", "source_id": "pmid:8242752"}
+  },
+  {
+    "subject_id": "tp53", "subject_type": "gene",
+    "predicate_id": "interacts_with", "predicate_type": "physical",
+    "object_id": "mdm2", "object_type": "gene",
+    "confidence": 0.98,
+    "provenance": {"source_type": "paper", "source_id": "pmid:8319905"}
+  },
+  {
+    "subject_id": "mdm2", "subject_type": "gene",
+    "predicate_id": "inhibits", "predicate_type": "regulatory",
+    "object_id": "tp53", "object_type": "gene",
+    "confidence": 0.97,
+    "provenance": {"source_type": "paper", "source_id": "pmid:8319905"}
+  },
+  {
+    "subject_id": "brca1", "subject_type": "gene",
+    "predicate_id": "associated_with", "predicate_type": "correlative",
+    "object_id": "breast cancer", "object_type": "disease",
+    "confidence": 0.99,
+    "provenance": {"source_type": "paper", "source_id": "pmid:7545954"}
+  },
+  {
+    "subject_id": "brca1", "subject_type": "gene",
+    "predicate_id": "interacts_with", "predicate_type": "physical",
+    "object_id": "rad51", "object_type": "gene",
+    "confidence": 0.92,
+    "provenance": {"source_type": "paper", "source_id": "pmid:9150142"}
+  },
+  {
+    "subject_id": "rad51", "subject_type": "gene",
+    "predicate_id": "involved_in", "predicate_type": "functional",
+    "object_id": "dna repair", "object_type": "biological_process",
+    "confidence": 0.96,
+    "provenance": {"source_type": "paper", "source_id": "pmid:9150142"}
+  },
+  {
+    "subject_id": "egfr", "subject_type": "gene",
+    "predicate_id": "associated_with", "predicate_type": "correlative",
+    "object_id": "non-small cell lung cancer", "object_type": "disease",
+    "confidence": 0.94,
+    "provenance": {"source_type": "paper", "source_id": "pmid:15118073"}
+  },
+  {
+    "subject_id": "erlotinib", "subject_type": "drug",
+    "predicate_id": "inhibits", "predicate_type": "pharmacological",
+    "object_id": "egfr", "object_type": "gene",
+    "confidence": 0.97,
+    "provenance": {"source_type": "clinical_trial", "source_id": "nct:00036647"}
+  },
+  {
+    "subject_id": "egfr", "subject_type": "gene",
+    "predicate_id": "causes", "predicate_type": "causal",
+    "object_id": "cell proliferation", "object_type": "biological_process",
+    "confidence": 0.91,
+    "provenance": {"source_type": "paper", "source_id": "pmid:17599062"}
+  },
+  {
+    "subject_id": "kras", "subject_type": "gene",
+    "predicate_id": "associated_with", "predicate_type": "correlative",
+    "object_id": "pancreatic cancer", "object_type": "disease",
+    "confidence": 0.96,
+    "provenance": {"source_type": "paper", "source_id": "pmid:18316791"}
+  },
+  {
+    "subject_id": "kras", "subject_type": "gene",
+    "predicate_id": "activates", "predicate_type": "regulatory",
+    "object_id": "mapk pathway", "object_type": "pathway",
+    "confidence": 0.93,
+    "provenance": {"source_type": "paper", "source_id": "pmid:17496910"}
+  },
+  {
+    "subject_id": "cisplatin", "subject_type": "drug",
+    "predicate_id": "treats", "predicate_type": "therapeutic",
+    "object_id": "non-small cell lung cancer", "object_type": "disease",
+    "confidence": 0.88,
+    "provenance": {"source_type": "clinical_trial", "source_id": "nct:00003299"}
+  },
+  {
+    "subject_id": "tp53", "subject_type": "gene",
+    "predicate_id": "associated_with", "predicate_type": "correlative",
+    "object_id": "li-fraumeni syndrome", "object_type": "disease",
+    "confidence": 0.99,
+    "provenance": {"source_type": "paper", "source_id": "pmid:2259385"}
+  },
+  {
+    "subject_id": "imatinib", "subject_type": "drug",
+    "predicate_id": "inhibits", "predicate_type": "pharmacological",
+    "object_id": "bcr-abl", "object_type": "gene",
+    "confidence": 0.99,
+    "provenance": {"source_type": "clinical_trial", "source_id": "nct:00006343"}
+  },
+  {
+    "subject_id": "bcr-abl", "subject_type": "gene",
+    "predicate_id": "causes", "predicate_type": "causal",
+    "object_id": "chronic myeloid leukemia", "object_type": "disease",
+    "confidence": 0.98,
+    "provenance": {"source_type": "paper", "source_id": "pmid:10698507"}
+  },
+  {
+    "subject_id": "vegf", "subject_type": "gene",
+    "predicate_id": "promotes", "predicate_type": "regulatory",
+    "object_id": "angiogenesis", "object_type": "biological_process",
+    "confidence": 0.97,
+    "provenance": {"source_type": "paper", "source_id": "pmid:11052440"}
+  },
+  {
+    "subject_id": "bevacizumab", "subject_type": "drug",
+    "predicate_id": "inhibits", "predicate_type": "pharmacological",
+    "object_id": "vegf", "object_type": "gene",
+    "confidence": 0.96,
+    "provenance": {"source_type": "clinical_trial", "source_id": "nct:00109070"}
+  },
+  {
+    "subject_id": "pik3ca", "subject_type": "gene",
+    "predicate_id": "associated_with", "predicate_type": "correlative",
+    "object_id": "breast cancer", "object_type": "disease",
+    "confidence": 0.89,
+    "provenance": {"source_type": "paper", "source_id": "pmid:15016963"}
+  },
+  {
+    "subject_id": "tp53", "subject_type": "gene",
+    "predicate_id": "involved_in", "predicate_type": "functional",
+    "object_id": "cell cycle arrest", "object_type": "biological_process",
+    "confidence": 0.96,
+    "provenance": {"source_type": "paper", "source_id": "pmid:1535557"}
+  },
+  {
+    "subject_id": "her2", "subject_type": "gene",
+    "predicate_id": "associated_with", "predicate_type": "correlative",
+    "object_id": "breast cancer", "object_type": "disease",
+    "confidence": 0.97,
+    "provenance": {"source_type": "paper", "source_id": "pmid:3798106"}
+  },
+  {
+    "subject_id": "trastuzumab", "subject_type": "drug",
+    "predicate_id": "inhibits", "predicate_type": "pharmacological",
+    "object_id": "her2", "object_type": "gene",
+    "confidence": 0.98,
+    "provenance": {"source_type": "clinical_trial", "source_id": "nct:00045032"}
+  },
+  {
+    "subject_id": "brca2", "subject_type": "gene",
+    "predicate_id": "associated_with", "predicate_type": "correlative",
+    "object_id": "breast cancer", "object_type": "disease",
+    "confidence": 0.97,
+    "provenance": {"source_type": "paper", "source_id": "pmid:8524414"}
+  },
+  {
+    "subject_id": "brca2", "subject_type": "gene",
+    "predicate_id": "involved_in", "predicate_type": "functional",
+    "object_id": "dna repair", "object_type": "biological_process",
+    "confidence": 0.95,
+    "provenance": {"source_type": "paper", "source_id": "pmid:10783165"}
+  },
+  {
+    "subject_id": "erlotinib", "subject_type": "drug",
+    "predicate_id": "treats", "predicate_type": "therapeutic",
+    "object_id": "non-small cell lung cancer", "object_type": "disease",
+    "confidence": 0.91,
+    "provenance": {"source_type": "clinical_trial", "source_id": "nct:00036647"}
+  },
+  {
+    "subject_id": "tp53", "subject_type": "gene",
+    "predicate_id": "associated_with", "predicate_type": "correlative",
+    "object_id": "breast cancer", "object_type": "disease",
+    "confidence": 0.87,
+    "provenance": {"source_type": "paper", "source_id": "pmid:15489334"}
+  }
+]

@@ -4,8 +4,8 @@ build-backend = "maturin"
 
 [project]
 name = "attest-py"
-version = "0.1.37"
-description = "Rust storage engine for AttestDB — 1.3M claims/sec, LMDB, 8µs query. Install with: pip install attestdb attest-py"
+version = "0.1.38"
+description = "Rust storage engine for AttestDB — 1.3M claims/sec, LMDB, ~12µs queries. Install with: pip install attestdb attest-py"
 requires-python = ">=3.11"
 license = {text = "BSL-1.1"}
 authors = [

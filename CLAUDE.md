@@ -60,7 +60,7 @@ python scripts/generate_golden_vectors.py       # Regenerate golden vectors from
 **Rust engine:**
 - 27 PyO3 methods including temporal queries and text search
 - File locking via `fs2`, atomic writes (`.tmp` + rename), CRC32 crash recovery
-- 1.3M claims/sec insert, 8us entity query, 15us BFS
+- 1.3M claims/sec insert, sub-millisecond entity query (~12µs indexed lookups in-memory), 15us BFS
 - Rust store only persists to disk on `close()`. Snapshot does close+reopen to flush.
 
 ### Build Steps for attest-py

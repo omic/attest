@@ -636,6 +636,13 @@ def recall(task: str | None = None, db_path: str | None = None) -> None:
         lines.append("*Use `attest_learned` to record findings. "
                      "Use `attest_session_end` when done.*")
 
+        # Auto-regenerate skills if claims changed (hash check makes this fast)
+        try:
+            from attestdb.intelligence.skill_generator import generate_skills
+            generate_skills(db, output_dir=".claude/skills")
+        except Exception:
+            pass  # skill regeneration is optional
+
         print("\n".join(lines))
     finally:
         db.close()

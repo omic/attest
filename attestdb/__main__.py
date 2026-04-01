@@ -438,9 +438,51 @@ def main():
         help="Vocabularies to register (default: bio)",
     )
 
+    # --- quickstart ---
+    p_qs = sub.add_parser("quickstart", help="60-second demo with sample data")
+    p_qs.add_argument("--db", default=None, help="Database path (default: temp)")
+
+    # --- mcp-config ---
+    p_mcp_cfg = sub.add_parser("mcp-config", help="Generate MCP config for Claude Code / Cursor")
+    p_mcp_cfg.add_argument("--print-only", action="store_true", help="Print JSON without writing")
+    p_mcp_cfg.add_argument("--cursor", action="store_true", help="Write Cursor config instead")
+
+    # --- doctor ---
+    sub.add_parser("doctor", help="Run health checks and diagnose issues")
+
+    # --- trial ---
+    p_trial = sub.add_parser("trial", help="7-day Pro trial (no credit card)")
+    trial_sub = p_trial.add_subparsers(dest="trial_command", help="Trial commands")
+    p_trial_start = trial_sub.add_parser("start", help="Start a 7-day Pro trial")
+    p_trial_start.add_argument("--email", help="Email address")
+    trial_sub.add_parser("status", help="Show trial status")
+
+    # --- upgrade ---
+    p_upgrade = sub.add_parser("upgrade", help="Upgrade to a paid plan")
+    p_upgrade.add_argument(
+        "--tier", choices=["pro", "growth", "team"], default="pro",
+        help="Plan tier (default: pro)",
+    )
+    p_upgrade.add_argument(
+        "--interval", choices=["month", "year"], default="month",
+        help="Billing interval (default: month)",
+    )
+
+    # --- share ---
+    p_share = sub.add_parser("share", help="Generate a shareable claim graph link")
+    p_share.add_argument("--db", default=None, help="Database path")
+    p_share.add_argument("--private", action="store_true", help="Open locally without sharing")
+
+    # --- telemetry ---
+    p_telem = sub.add_parser("telemetry", help="Manage anonymous usage telemetry")
+    telem_sub = p_telem.add_subparsers(dest="telemetry_action", help="Telemetry commands")
+    telem_sub.add_parser("on", help="Enable telemetry")
+    telem_sub.add_parser("off", help="Disable telemetry")
+    telem_sub.add_parser("status", help="Show telemetry status")
+
     # --- stats ---
     p_stats = sub.add_parser("stats", help="Show database statistics")
-    p_stats.add_argument("db", help="Database path")
+    p_stats.add_argument("db", nargs="?", default=None, help="Database path (default: ~/.attest/memory.attest)")
 
     # --- query ---
     p_query = sub.add_parser("query", help="Query knowledge around an entity")
@@ -546,13 +588,90 @@ def main():
         help="Specific tool (default: all)",
     )
 
+    # --- manager ---
+    p_manager = sub.add_parser(
+        "manager",
+        help="Team activity intelligence (install/status/uninstall)",
+    )
+    manager_sub = p_manager.add_subparsers(dest="manager_command", help="Manager commands")
+    p_mgr_install = manager_sub.add_parser("install", help="Install manager into coding tools")
+    p_mgr_install.add_argument(
+        "--tool", choices=["claude", "cursor", "windsurf", "codex", "gemini"],
+        help="Specific tool (default: auto-detect)",
+    )
+    manager_sub.add_parser("status", help="Show manager stats")
+    p_mgr_uninstall = manager_sub.add_parser("uninstall", help="Remove manager from coding tools")
+    p_mgr_uninstall.add_argument("--tool", help="Specific tool (default: all)")
+
     # --- status ---
     sub.add_parser("status", help="Show cloud connection info and DB stats")
 
     args = parser.parse_args()
     if args.command is None:
+        print("AttestDB — claim-native knowledge graph for AI agents")
+        print()
+        print("  Quick start:  attestdb quickstart    (60-second demo with sample data)")
+        print("  Try cloud:    attestdb trial start    (7-day Pro trial, no credit card)")
+        print("  Agent memory: attestdb mcp-config     (give your AI agent persistent memory)")
+        print("  Health check: attestdb doctor")
+        print("  Full docs:    https://attestdb.com/quickstart.html")
+        print()
         parser.print_help()
-        sys.exit(1)
+        sys.exit(0)
+
+    # --- Trial expiry nudge (runs on every CLI invocation) ---
+    try:
+        from attestdb import config as _cfg
+        import datetime as _dt
+        _trial = _cfg.get_trial_info()
+        if _trial and _trial.get("expires_at"):
+            _exp = _dt.datetime.fromisoformat(_trial["expires_at"])
+            _remaining = (_exp - _dt.datetime.now(_dt.timezone.utc)).days
+            if _remaining <= 0:
+                print(f"Your Pro trial has ended. Your local instance and all claims are intact.")
+                print(f"  Restore cloud access: attestdb upgrade")
+                print()
+            elif _remaining <= 2:
+                print(f"Your Pro trial ends in {_remaining} day{'s' if _remaining != 1 else ''}.")
+                print(f"  Keep cloud running: attestdb upgrade")
+                print()
+    except Exception:
+        pass
+
+    # --- New launch CLI commands ---
+    if args.command == "quickstart":
+        from attestdb.cli_commands import cmd_quickstart
+        cmd_quickstart(args)
+        return
+    elif args.command == "mcp-config":
+        from attestdb.cli_commands import cmd_mcp_config
+        cmd_mcp_config(args)
+        return
+    elif args.command == "doctor":
+        from attestdb.cli_commands import cmd_doctor
+        cmd_doctor(args)
+        return
+    elif args.command == "trial":
+        from attestdb.cli_commands import cmd_trial_start, cmd_trial_status
+        if getattr(args, "trial_command", None) == "start":
+            cmd_trial_start(args)
+        elif getattr(args, "trial_command", None) == "status":
+            cmd_trial_status(args)
+        else:
+            print("Usage: attest trial {start|status}")
+        return
+    elif args.command == "upgrade":
+        from attestdb.cli_commands import cmd_upgrade
+        cmd_upgrade(args)
+        return
+    elif args.command == "share":
+        from attestdb.cli_commands import cmd_share
+        cmd_share(args)
+        return
+    elif args.command == "telemetry":
+        from attestdb.cli_commands import cmd_telemetry
+        cmd_telemetry(args)
+        return
 
     if args.command == "brain":
         from attestdb.brain import install as brain_install, uninstall as brain_uninstall, status as brain_status
@@ -564,12 +683,26 @@ def main():
             brain_status()
         else:
             p_brain.print_help()
+    elif args.command == "manager":
+        from attestdb.manager import install as mgr_install, uninstall as mgr_uninstall, status as mgr_status
+        if args.manager_command == "install":
+            mgr_install(tool=getattr(args, "tool", None))
+        elif args.manager_command == "uninstall":
+            mgr_uninstall(tool=getattr(args, "tool", None))
+        elif args.manager_command == "status":
+            mgr_status()
+        else:
+            p_manager.print_help()
     elif args.command == "chat":
         cmd_chat(args)
     elif args.command == "ingest":
         cmd_ingest(args)
     elif args.command == "stats":
-        cmd_stats(args)
+        if getattr(args, "db", None):
+            cmd_stats(args)
+        else:
+            from attestdb.cli_commands import cmd_stats_new
+            cmd_stats_new(args)
     elif args.command == "query":
         cmd_query(args)
     elif args.command == "schema":

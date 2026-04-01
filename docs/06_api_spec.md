@@ -674,7 +674,7 @@ class QueryBudgetExceeded(AttestError): pass   # query hit max_claims or max_tok
 | `db.density_map()` | ✅ Built | Statistics over topic hierarchy |
 | `db.cross_domain_bridges()` | ✅ Built | Topology-aware bridge entities |
 | `db.path_exists()` | ✅ Built | BFS graph traversal |
-| `db.connect()` | ✅ Built | 21 connectors + encrypted token store |
+| `db.connect()` | ✅ Built | 30 connectors + encrypted token store |
 | `db.sync()` | ✅ Built | Continuous ingestion with ConnectorScheduler |
 | `db.set_namespace()` | ✅ Built | Per-namespace isolation |
 | `db.changes()` | ✅ Built | Cursor-based change feed |

@@ -818,6 +818,12 @@ try:
 except ImportError:
     pass
 
+try:
+    from attestdb.mcp_tools_team import register_tools as _reg_team
+    _reg_team(mcp, _get_db)
+except ImportError:
+    pass
+
 # Re-export tool functions from submodules so tests and external code can
 # import them from attestdb.mcp_server (backward compatibility).
 _tool_lookup = {t.name: t.fn for t in mcp._tool_manager.list_tools()}

@@ -102,6 +102,10 @@ class AskEngine:
 
     def __init__(self, db):
         self.db = db
+        self._last_prompt_tokens: int = 0
+        self._last_completion_tokens: int = 0
+        self._total_prompt_tokens: int = 0
+        self._total_completion_tokens: int = 0
 
     # ──────────────────────────────────────────────────────────────────
     # LLM access (unchanged from v1)
@@ -185,6 +189,10 @@ class AskEngine:
                     content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
                     if content and content.strip():
                         logger.info("_llm_call_requests: %s/%s succeeded", provider_name, provider["default_model"])
+                        # Track token usage
+                        usage = data.get("usage", {})
+                        self._last_prompt_tokens = usage.get("prompt_tokens", 0)
+                        self._last_completion_tokens = usage.get("completion_tokens", 0)
                         return content.strip()
             except Exception as exc:
                 logger.debug("_llm_call_requests: %s failed: %s", provider_name, exc)
@@ -195,9 +203,13 @@ class AskEngine:
     def _llm_call(self, prompt: str, max_tokens: int = 512, temperature: float = 0.1) -> str | None:
         """LLM call with provider fallback. Tries requests first (uvicorn-safe),
         falls back to openai library."""
+        self._last_prompt_tokens = 0
+        self._last_completion_tokens = 0
         # Prefer requests library — avoids httpx/uvicorn deadlock
         result = self._llm_call_via_requests(prompt, max_tokens, temperature)
         if result:
+            self._total_prompt_tokens += self._last_prompt_tokens
+            self._total_completion_tokens += self._last_completion_tokens
             return result
 
         # Fallback: openai library (works from CLI, may deadlock in uvicorn)
@@ -219,6 +231,11 @@ class AskEngine:
                 )
                 content = r.choices[0].message.content
                 if content and content.strip():
+                    if hasattr(r, "usage") and r.usage:
+                        self._last_prompt_tokens = getattr(r.usage, "prompt_tokens", 0) or 0
+                        self._last_completion_tokens = getattr(r.usage, "completion_tokens", 0) or 0
+                    self._total_prompt_tokens += self._last_prompt_tokens
+                    self._total_completion_tokens += self._last_completion_tokens
                     return content.strip()
             except Exception:
                 continue
@@ -578,6 +595,8 @@ class AskEngine:
         Target: complex questions < 10s, simple questions < 3s.
         """
         t_start = time.monotonic()
+        self._total_prompt_tokens = 0
+        self._total_completion_tokens = 0
 
         # Phase A: Entity extraction (< 500ms)
         entities = self._extract_question_entities(question, top_k=top_k)
@@ -589,7 +608,9 @@ class AskEngine:
                 meta={"pipeline": "v2", "phase_a_ms": int((t_a - t_start) * 1000),
                        "n_searched": 0, "n_search_hits": 0,
                        "selected_types": [], "n_clusters": 0,
-                       "cluster_sizes": [], "cluster_labels": []},
+                       "cluster_sizes": [], "cluster_labels": [],
+                       "prompt_tokens": self._total_prompt_tokens,
+                       "completion_tokens": self._total_completion_tokens},
             )
 
         # Phase B: Evidence assembly (< 2s)
@@ -661,6 +682,8 @@ class AskEngine:
                 "cluster_sizes": [],
                 "cluster_labels": [],
                 "entity_tiers": {e.entity_id: e.match_tier for e in entities},
+                "prompt_tokens": self._total_prompt_tokens,
+                "completion_tokens": self._total_completion_tokens,
             },
         )
 

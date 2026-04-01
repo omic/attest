@@ -62,6 +62,20 @@ def install(tool: str | None = None, scope: str = "user") -> None:
 
     print(f"\n  Brain installed for: {', '.join(TOOLS[t]['name'] for t in configured)}")
     print(f"  Memory database: {DEFAULT_MEMORY_DB}")
+
+    # Generate skills from accumulated knowledge
+    if DEFAULT_MEMORY_DB.exists():
+        try:
+            from attestdb.infrastructure.attest_db import AttestDB
+            from attestdb.intelligence.skill_generator import generate_skills
+            db = AttestDB(str(DEFAULT_MEMORY_DB), embedding_dim=None)
+            skills = generate_skills(db, output_dir=".claude/skills")
+            db.close()
+            if skills:
+                print(f"  Skills generated: {len(skills)} (from accumulated knowledge)")
+        except Exception:
+            pass  # skill generation is optional
+
     print()
     _print_usage()
 
