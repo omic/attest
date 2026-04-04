@@ -211,6 +211,8 @@ pub trait StorageBackend {
 
     fn claims_by_predicate_id(&self, predicate_id: &str) -> Vec<Claim>;
 
+    fn claims_by_project(&self, project: &str) -> Vec<Claim>;
+
     fn claims_for(
         &mut self,
         entity_id: &str,

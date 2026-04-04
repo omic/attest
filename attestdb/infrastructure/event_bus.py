@@ -15,6 +15,30 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class EventType:
+    """Canonical event names for the AttestDB event bus.
+
+    Use these constants instead of string literals to prevent typos
+    and enable IDE autocompletion.
+    """
+
+    CLAIM_INGESTED = "claim_ingested"
+    CLAIM_CORROBORATED = "claim_corroborated"
+    INQUIRY_MATCHED = "inquiry_matched"
+    SOURCE_RETRACTED = "source_retracted"
+    SNAPSHOT_CREATED = "snapshot_created"
+    INQUIRY_CREATED = "inquiry_created"
+    SYNC_COMPLETED = "sync_completed"
+    INSIGHT_ALERTS = "insight_alerts"
+    AUTODIDACT_CYCLE_COMPLETED = "autodidact_cycle_completed"
+    AUTODIDACT_BUDGET_EXHAUSTED = "autodidact_budget_exhausted"
+
+
+_KNOWN_EVENTS: frozenset[str] = frozenset(
+    v for k, v in vars(EventType).items() if not k.startswith("_")
+)
+
+
 class EventBus:
     """Manages event hooks and topic subscriptions.
 
@@ -36,6 +60,8 @@ class EventBus:
 
     def on(self, event: str, callback) -> None:
         """Register a callback for a lifecycle event."""
+        if event not in _KNOWN_EVENTS:
+            logger.warning("Unknown event name %r in on() — check EventType constants", event)
         self._hooks.setdefault(event, []).append(callback)
 
     def off(self, event: str, callback) -> None:
@@ -46,6 +72,8 @@ class EventBus:
 
     def fire(self, event: str, **kwargs) -> None:
         """Fire all callbacks for an event and POST to registered webhooks."""
+        if event not in _KNOWN_EVENTS:
+            logger.warning("Unknown event name %r in fire() — check EventType constants", event)
         for cb in self._hooks.get(event, []):
             try:
                 cb(**kwargs)

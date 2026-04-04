@@ -100,12 +100,13 @@ class AskEngine:
     V2 architecture: entity-first resolution → graph evidence → LLM synthesis.
     """
 
-    def __init__(self, db):
+    def __init__(self, db, ops_callback=None):
         self.db = db
         self._last_prompt_tokens: int = 0
         self._last_completion_tokens: int = 0
         self._total_prompt_tokens: int = 0
         self._total_completion_tokens: int = 0
+        self._ops_callback = ops_callback
 
     # ──────────────────────────────────────────────────────────────────
     # LLM access (unchanged from v1)
@@ -686,6 +687,18 @@ class AskEngine:
                 "completion_tokens": self._total_completion_tokens,
             },
         )
+        if self._ops_callback:
+            try:
+                self._ops_callback(
+                    "ask_query",
+                    question=question[:200],
+                    entity_count=len(entities),
+                    prompt_tokens=self._total_prompt_tokens,
+                    completion_tokens=self._total_completion_tokens,
+                    elapsed_ms=int((t_c - t_start) * 1000),
+                )
+            except Exception:
+                pass
 
     # ──────────────────────────────────────────────────────────────────
     # Legacy helpers (kept for tests and attest_db.py delegates)

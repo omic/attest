@@ -55,6 +55,10 @@ class Provenance:
     chain: list[str] = field(default_factory=list)
     model_version: str | None = None
     organization: str | None = None
+    project: str | None = None
+    agent_id: str | None = None
+    source_version: str | None = None
+    labels: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -1334,6 +1338,10 @@ def _claim_from_dict_inner(d: dict) -> Claim:
         chain=prov.get("chain", []),
         model_version=prov.get("model_version"),
         organization=prov.get("organization"),
+        project=prov.get("project"),
+        agent_id=prov.get("agent_id"),
+        source_version=prov.get("source_version"),
+        labels=prov.get("labels", {}),
     )
 
     payload = None

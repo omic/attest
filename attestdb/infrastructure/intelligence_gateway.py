@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from attestdb.infrastructure.attest_db import AttestDB
 
 from attestdb.core.types import ClaimInput
+from attestdb.infrastructure.event_bus import EventType
 
 logger = logging.getLogger(__name__)
 
@@ -65,9 +66,11 @@ class IntelligenceGateway:
     def _get_curator(self):
         if self._curator is None:
             from attestdb.intelligence.curator import CuratorV1
+            ops_cb = getattr(self._db, "_ops_log", None)
             self._curator = CuratorV1(
                 self._db, model=self._curator_model,
                 api_key=self._curator_api_key, env_path=self._curator_env_path,
+                ops_callback=ops_cb.write if ops_cb else None,
             )
         return self._curator
 
@@ -351,7 +354,7 @@ class IntelligenceGateway:
             alerts = engine.find_confidence_alerts(min_claims=3)
             if alerts:
                 self._db._fire(
-                    "insight_alerts", alerts=alerts,
+                    EventType.INSIGHT_ALERTS, alerts=alerts,
                     trigger="sync", connector=connector_name,
                 )
         except Exception as e:
@@ -391,7 +394,7 @@ class IntelligenceGateway:
         """
         # Register post-sync insight hook once
         if not getattr(self._db, '_sync_hook_registered', False):
-            self._db.on("sync_completed", self._post_sync_check)
+            self._db.on(EventType.SYNC_COMPLETED, self._post_sync_check)
             self._db._sync_hook_registered = True
 
         conn = self._db.connect(name, save=save, **connector_kwargs)

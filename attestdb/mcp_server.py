@@ -38,7 +38,17 @@ You have a persistent knowledge brain that remembers across sessions. USE IT PRO
 **These happen automatically via hooks (no action needed):**
 - Session start: prior warnings/bugs/patterns injected based on git context
 - Before edits: known issues for the file surface via PreToolUse hook
+- Before reading PDFs/images: token cost warning via PreToolUse hook
 - After test failures: prior fixes surfaced via PostToolUse hook
+- Long sessions: sprawl warning when tool calls exceed ~30
+
+**Token discipline (proactive):**
+- When a user wants to read or ingest a PDF/image: suggest converting to markdown first \
+(5-20x token savings). Commands: `pandoc file.pdf -o file.md` or `markitdown file.pdf > file.md`.
+- In long sessions (15+ human turns): suggest starting a fresh conversation or using \
+`prompt_kit_rescue` to compress context.
+- For bulk or repeated LLM tasks: call `prompt_kit_optimize(task)` for model routing advice.
+- Token usage from brain LLM calls (ingest_text, attest_ask, agent_consensus) is auto-tracked.
 
 Record knowledge liberally — anything that would save time if encountered again."""
 
@@ -47,10 +57,227 @@ mcp = FastMCP("attest", instructions=_BRAIN_INSTRUCTIONS)
 # Global DB reference — set by main() or configure()
 _db = None
 
+# ---------------------------------------------------------------------------
+# Project / agent auto-detection — set once in main()
+# ---------------------------------------------------------------------------
+
+_current_project: str | None = None
+_current_agent_id: str = "claude-code"
+
+
+def _detect_project() -> str | None:
+    """Derive project from git remote origin, cached once per session."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if result.returncode == 0:
+            url = result.stdout.strip()
+            # Normalize: "git@github.com:omic/attest.git" → "github.com/omic/attest"
+            url = url.rstrip("/")
+            if url.endswith(".git"):
+                url = url[:-4]
+            if url.startswith("git@"):
+                url = url[4:].replace(":", "/", 1)
+            elif url.startswith(("https://", "http://")):
+                url = url.split("://", 1)[1]
+            return url
+    except Exception:
+        pass
+    # Fallback: directory name
+    return os.path.basename(os.getcwd())
+
+
+def _detect_agent_id() -> str:
+    """Detect which coding agent is running."""
+    return os.environ.get("ATTEST_AGENT_ID", "claude-code")
+
+
+# ---------------------------------------------------------------------------
+# Tool category registry
+# ---------------------------------------------------------------------------
+
+# Maps every tool name → category string.  Categories follow the submodule
+# split plus finer-grained subcategories for the 34 core tools.
+TOOL_CATEGORIES: dict[str, str] = {
+    # --- core: query (read-only data retrieval) ---
+    "attest_ask": "query",
+    "search_entities": "query",
+    "get_entity": "query",
+    "query_entity": "query",
+    "claims_for": "query",
+    "claims_in_namespace": "query",
+    "find_bridges": "query",
+    "find_gaps": "query",
+    "find_paths": "query",
+    "knowledge_health": "query",
+    "quality_report": "query",
+    "resolve_source_url": "query",
+    "attest_corroboration": "query",
+    "attest_diagnose_corroboration": "query",
+    "attest_source_health": "query",
+    "attest_source_reliability": "query",
+    "attest_blindspots": "query",
+    "attest_fragile": "query",
+    "attest_stale": "query",
+    "attest_drift": "query",
+    "attest_consensus": "query",
+    "attest_hypothetical": "query",
+    "attest_impact": "query",
+    # --- core: ingestion (write operations) ---
+    "ingest_claim": "ingestion",
+    "ingest_batch": "ingestion",
+    "ingest_text": "ingestion",
+    "retract_source": "ingestion",
+    # --- core: admin ---
+    "schema": "admin",
+    "stats": "admin",
+    "set_namespace": "admin",
+    "audit_log": "admin",
+    "changes": "admin",
+    "attest_build_status": "admin",
+    "attest_audit": "admin",
+    # --- learning (mcp_tools_learning) ---
+    "attest_learned": "learning",
+    "attest_negative_result": "learning",
+    "attest_check_file": "learning",
+    "attest_get_prior_approaches": "learning",
+    "attest_observe_session": "learning",
+    "attest_record_outcome": "learning",
+    "attest_research_context": "learning",
+    "attest_confidence_trail": "learning",
+    "attest_session_end": "learning",
+    # --- analysis (mcp_tools_analysis) ---
+    "attest_verify_claim": "analysis",
+    "attest_verification_status": "analysis",
+    "attest_verification_budget": "analysis",
+    "attest_challenge_claim": "analysis",
+    "attest_predict": "analysis",
+    "attest_what_if": "analysis",
+    "attest_sandbox_create": "analysis",
+    "attest_sandbox_analyze": "analysis",
+    "attest_create_thread": "analysis",
+    "attest_resume_thread": "analysis",
+    "attest_extend_thread": "analysis",
+    "attest_list_threads": "analysis",
+    "attest_thread_context": "analysis",
+    "attest_audit_paper": "analysis",
+    "attest_bulk_audit": "analysis",
+    "attest_check_freshness": "analysis",
+    "attest_sweep_stale": "analysis",
+    "attest_archive": "analysis",
+    "attest_graph_stats": "analysis",
+    "attest_investigate": "analysis",
+    "attest_research": "analysis",
+    "attest_generate_eval": "analysis",
+    "attest_score_eval": "analysis",
+    "attest_register_agent": "analysis",
+    "attest_agent_leaderboard": "analysis",
+    "curator_cost_summary": "analysis",
+    "ops_log": "admin",
+    # --- autonomous (mcp_tools_autonomous) ---
+    "autodidact_enable": "autonomous",
+    "autodidact_disable": "autonomous",
+    "autodidact_status": "autonomous",
+    "autodidact_run_now": "autonomous",
+    "autodidact_history": "autonomous",
+    "autoresearch_log_experiment": "autonomous",
+    "autoresearch_get_priors": "autonomous",
+    "autoresearch_suggest_next": "autonomous",
+    "agent_consensus": "autonomous",
+    "openclaw_ingest_action": "autonomous",
+    "openclaw_ingest_conversation": "autonomous",
+    "openclaw_query_knowledge": "autonomous",
+    "openclaw_heartbeat_check": "autonomous",
+    "openclaw_get_preferences": "autonomous",
+    # --- viz (mcp_tools_viz) ---
+    "attest_dashboard": "viz",
+    "attest_graph": "viz",
+    # --- team (mcp_tools_team) ---
+    "team_setup": "team",
+    "team_configure": "team",
+    "team_add_member": "team",
+    "team_dashboard": "team",
+    "team_digest": "team",
+    "team_member_detail": "team",
+    "team_commitments": "team",
+    "team_check_now": "team",
+    "team_meeting_prep": "team",
+    "team_one_on_one_prep": "team",
+    "team_performance_summary": "team",
+    "team_health_report": "team",
+    "team_risk_report": "team",
+    "team_value_report": "team",
+    "team_review_queue": "team",
+    "team_generate_skills": "team",
+    "team_monitor_enable": "team",
+    "team_monitor_disable": "team",
+    "team_monitor_status": "team",
+    "team_token_usage": "team",
+    "team_edit_draft": "team",
+    "team_send_draft": "team",
+    # --- prompt_kit (mcp_tools_prompt_kit) ---
+    "prompt_kit_track": "prompt_kit",
+    "prompt_kit_diagnose": "prompt_kit",
+    "prompt_kit_optimize": "prompt_kit",
+    "prompt_kit_report": "prompt_kit",
+    "prompt_kit_audit": "prompt_kit",
+    "prompt_kit_rescue": "prompt_kit",
+    # --- review (attestdb/review/mcp_tools) ---
+    "review_queue": "admin",
+    "review_submit": "admin",
+    "review_batch_approve": "admin",
+    "review_stats": "admin",
+    "review_dashboard": "admin",
+    # --- query (attestdb/query/mcp_handler) ---
+    "query_unified": "query",
+    "drill_down": "query",
+}
+
+ALL_CATEGORIES = sorted(set(TOOL_CATEGORIES.values()))
+
+
+def _filter_tools_by_category(allowed_categories: set[str]) -> int:
+    """Remove tools not in allowed categories from the MCP server. Returns count removed."""
+    all_tools = mcp._tool_manager.list_tools()
+    removed = 0
+    for tool in all_tools:
+        cat = TOOL_CATEGORIES.get(tool.name)
+        if cat and cat not in allowed_categories:
+            mcp._tool_manager._tools.pop(tool.name, None)
+            removed += 1
+    return removed
+
 
 def _serialize(obj: object) -> str:
     """Serialize a dataclass to JSON (used by most MCP tool return values)."""
     return json.dumps(asdict(obj))
+
+
+def _cap_response(json_str: str, max_chars: int = 4000) -> str:
+    """Truncate oversized JSON responses with a note."""
+    if len(json_str) <= max_chars:
+        return json_str
+    # Try to truncate at a structural level by parsing
+    try:
+        data = json.loads(json_str)
+    except (json.JSONDecodeError, TypeError):
+        return json_str[:max_chars] + '\n... [truncated]'
+    # For dicts, try trimming list-valued fields from longest to shortest
+    if isinstance(data, dict):
+        for key in sorted(data, key=lambda k: len(json.dumps(data[k], default=str)), reverse=True):
+            if isinstance(data[key], list) and len(data[key]) > 5:
+                data[key] = data[key][:5]
+                data[key].append("... truncated")
+                result = json.dumps(data, default=str)
+                if len(result) <= max_chars:
+                    return result
+    result = json.dumps(data, default=str)
+    if len(result) <= max_chars:
+        return result
+    return result[:max_chars] + '\n... [truncated]'
 
 # ---------------------------------------------------------------------------
 # Auto-observe session tracking
@@ -98,8 +325,23 @@ def _track_claims_ingested(count: int):
         _session_tracker["claims_ingested"] += count
 
 
+def _track_token_event(model: str, prompt_tokens: int, completion_tokens: int, purpose: str):
+    """Accumulate a token usage event for end-of-session flushing."""
+    if _session_tracker is None:
+        return
+    if prompt_tokens <= 0 and completion_tokens <= 0:
+        return
+    _session_tracker.setdefault("token_events", []).append({
+        "model": model,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "purpose": purpose,
+        "timestamp": time.time(),
+    })
+
+
 def _flush_session():
-    """On process exit, record session summary as structured claims."""
+    """On process exit, record session summary + token events as claims."""
     if _session_tracker is None or not _session_tracker["tool_calls"]:
         return
     try:
@@ -132,6 +374,38 @@ def _flush_session():
                 },
             },
         )
+
+        # Flush accumulated token events as used_tokens claims
+        from attestdb.core.providers import estimate_cost
+        for evt in _session_tracker.get("token_events", []):
+            try:
+                cost = estimate_cost(
+                    evt["model"], evt["prompt_tokens"], evt["completion_tokens"],
+                )
+                db.ingest(
+                    subject=("system", "person"),
+                    predicate=("used_tokens", "token_usage"),
+                    object=(evt["model"], "llm_model"),
+                    provenance={
+                        "source_type": "prompt_kit",
+                        "source_id": f"auto:{evt['timestamp']:.6f}",
+                    },
+                    confidence=1.0,
+                    payload={
+                        "schema_ref": "token_usage/v2",
+                        "data": {
+                            "prompt_tokens": evt["prompt_tokens"],
+                            "completion_tokens": evt["completion_tokens"],
+                            "total_tokens": evt["prompt_tokens"] + evt["completion_tokens"],
+                            "purpose": evt["purpose"],
+                            "cost_usd": round(cost, 6),
+                            "model_tier": "execution",
+                            "cache_hit": False,
+                        },
+                    },
+                )
+            except Exception:
+                pass
     except Exception:
         pass  # Best-effort — process is exiting
 
@@ -224,9 +498,35 @@ def ingest_text(text: str, source_id: str = "") -> str:
     normal, not an error. Requires attestdb-enterprise for LLM extraction;
     falls back to heuristic patterns without it.
     """
+    _track_tool_call("ingest_text", source_id or text[:80])
     db = _get_db()
     result = db.ingest_text(text, source_id=source_id)
-    return json.dumps(result, default=str)
+
+    # Auto-track token usage from the extraction LLM call
+    if hasattr(result, "prompt_tokens"):
+        _track_token_event("auto", result.prompt_tokens, result.completion_tokens, "ingest_text")
+    elif isinstance(result, dict):
+        _track_token_event(
+            "auto",
+            result.get("prompt_tokens", 0),
+            result.get("completion_tokens", 0),
+            "ingest_text",
+        )
+
+    # Warn about raw document formats
+    result_dict = json.loads(json.dumps(result, default=str))
+    text_head = text[:200].lower()
+    if text_head.startswith("%pdf") or "\x00" in text[:100]:
+        result_dict["token_warning"] = (
+            "Raw PDF detected. This costs 5-20x more tokens than markdown. "
+            "Convert first: pandoc file.pdf -o file.md"
+        )
+    elif text_head.startswith("<!doctype") or text_head.startswith("<html"):
+        result_dict["token_warning"] = (
+            "Raw HTML detected. Convert to markdown first for significant token savings."
+        )
+
+    return json.dumps(result_dict)
 
 
 def _to_pair(val: str | list | tuple, default_type: str = "entity") -> tuple[str, str]:
@@ -394,7 +694,7 @@ def quality_report() -> str:
     """Knowledge graph quality analysis."""
     db = _get_db()
     report = db.quality_report()
-    return _serialize(report)
+    return _cap_response(_serialize(report))
 
 
 @mcp.tool()
@@ -414,7 +714,7 @@ def knowledge_health() -> str:
     """Quantified health metrics for the knowledge graph."""
     db = _get_db()
     health = db.knowledge_health()
-    return _serialize(health)
+    return _cap_response(_serialize(health))
 
 
 @mcp.tool()
@@ -542,9 +842,10 @@ def attest_ask(question: str, namespace: str = "", top_k: int = 10) -> str:
 
     if namespace:
         with _namespace_scope(db, namespace):
-            return attest_ask_impl(db, question, top_k)
+            result = attest_ask_impl(db, question, top_k)
     else:
-        return attest_ask_impl(db, question, top_k)
+        result = attest_ask_impl(db, question, top_k)
+    return _cap_response(result) if isinstance(result, str) else result
 
 
 @mcp.tool()
@@ -602,7 +903,19 @@ def attest_blindspots(min_claims: int = 5) -> str:
     """Find single-source entities, knowledge gaps, low-confidence areas, and unresolved warnings."""
     db = _get_db()
     report = db.blindspots(min_claims=min_claims)
-    return _serialize(report)
+    d = asdict(report)
+
+    # Filter out session/metadata noise from single_source_entities
+    _NOISE_PREFIXES = ("auto-stop:", "tool_session:", "outcome_value:", "status:")
+    d["single_source_entities"] = [
+        e for e in d.get("single_source_entities", [])
+        if not any(e.lower().startswith(p) for p in _NOISE_PREFIXES)
+    ][:20]
+
+    # Cap knowledge_gaps
+    d["knowledge_gaps"] = d.get("knowledge_gaps", [])[:10]
+
+    return _cap_response(json.dumps(d, default=str))
 
 
 @mcp.tool()
@@ -658,7 +971,8 @@ def attest_corroboration(min_sources: int = 2) -> str:
                 f"(conf={c['confidence']:.2f}, source: {c['source_type']})"
             )
 
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    return result[:4000] + "\n... [truncated]" if len(result) > 4000 else result
 
 
 @mcp.tool()
@@ -785,6 +1099,15 @@ def attest_hypothetical(
     return _serialize(report)
 
 
+@mcp.tool()
+def list_tool_categories() -> str:
+    """List all tool categories and their tools. Always available (never filtered)."""
+    by_cat: dict[str, list[str]] = {}
+    for tool_name, cat in sorted(TOOL_CATEGORIES.items()):
+        by_cat.setdefault(cat, []).append(tool_name)
+    return json.dumps({"categories": ALL_CATEGORIES, "tools_by_category": by_cat})
+
+
 # ---------------------------------------------------------------------------
 # Register tool groups from submodules
 # ---------------------------------------------------------------------------
@@ -821,6 +1144,24 @@ except ImportError:
 try:
     from attestdb.mcp_tools_team import register_tools as _reg_team
     _reg_team(mcp, _get_db)
+except ImportError:
+    pass
+
+try:
+    from attestdb.mcp_tools_prompt_kit import register_tools as _reg_prompt_kit
+    _reg_prompt_kit(mcp, _get_db)
+except ImportError:
+    pass
+
+try:
+    from attestdb.review.mcp_tools import register_review_tools as _reg_review
+    _reg_review(mcp, _get_db)
+except ImportError:
+    pass
+
+try:
+    from attestdb.query.mcp_handler import register_query_tools as _reg_query
+    _reg_query(mcp, _get_db)
 except ImportError:
     pass
 
@@ -873,6 +1214,12 @@ attest_archive = _tool_lookup["attest_archive"]
 attest_graph_stats = _tool_lookup["attest_graph_stats"]
 attest_investigate = _tool_lookup["attest_investigate"]
 attest_research = _tool_lookup["attest_research"]
+prompt_kit_track = _tool_lookup.get("prompt_kit_track")
+prompt_kit_diagnose = _tool_lookup.get("prompt_kit_diagnose")
+prompt_kit_report = _tool_lookup.get("prompt_kit_report")
+prompt_kit_optimize = _tool_lookup.get("prompt_kit_optimize")
+prompt_kit_audit = _tool_lookup.get("prompt_kit_audit")
+prompt_kit_rescue = _tool_lookup.get("prompt_kit_rescue")
 del _tool_lookup
 
 
@@ -929,7 +1276,27 @@ def main():
         help="Bind port for SSE/HTTP (default: 8892)",
     )
     parser.add_argument("--db", default=None, help="DB path (overrides ATTEST_DB_PATH)")
+    parser.add_argument(
+        "--tools",
+        default=None,
+        help=(
+            "Comma-separated tool categories to expose (e.g. query,ingestion,admin). "
+            "Also settable via ATTEST_MCP_TOOLS env var. "
+            f"Available: {', '.join(ALL_CATEGORIES)}"
+        ),
+    )
     args = parser.parse_args()
+
+    # Filter tools by category if requested
+    tools_spec = args.tools or os.environ.get("ATTEST_MCP_TOOLS")
+    if tools_spec:
+        allowed = {c.strip() for c in tools_spec.split(",")}
+        unknown = allowed - set(ALL_CATEGORIES)
+        if unknown:
+            logger.warning("Unknown tool categories ignored: %s", ", ".join(sorted(unknown)))
+            allowed -= unknown
+        removed = _filter_tools_by_category(allowed)
+        logger.info("Tool filter: keeping %s, removed %d tools", ", ".join(sorted(allowed)), removed)
 
     global _db
     from attestdb.infrastructure.attest_db import AttestDB
@@ -944,6 +1311,11 @@ def main():
         embed_dim = 768  # text-embedding-3-small default
 
     _db = AttestDB(db_path, embedding_dim=embed_dim)
+
+    global _current_project, _current_agent_id
+    _current_project = _detect_project()
+    _current_agent_id = _detect_agent_id()
+    logger.info("Project: %s, Agent: %s", _current_project, _current_agent_id)
 
     if embed_dim and os.environ.get("OPENAI_API_KEY"):
         try:

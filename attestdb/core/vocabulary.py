@@ -336,6 +336,13 @@ CAUSAL_PREDICATES: set[str] = {
     "regulates",  # non-directional but still indicates regulatory relationship
 }
 
+# Predicate type values (PredicateRef.predicate_type) that indicate causal semantics.
+# Claims with these predicate_types are treated as causal edges even if their
+# predicate ID is not in CAUSAL_PREDICATES. This enables domain-agnostic causal
+# prediction — e.g. cybersec "uses" or pharma "has_adverse_event" predicates
+# work when the bulk loader sets predicate_type="causes".
+CAUSAL_PREDICATE_TYPES: set[str] = {"causes"}
+
 # Predicate equivalence — semantically close predicates that should match
 # when comparing predictions against expected outcomes.
 # "upregulates" and "activates" both mean positive regulation;

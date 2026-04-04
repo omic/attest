@@ -1,4 +1,4 @@
-"""Append-only JSONL audit log for mutation tracking."""
+"""Append-only JSONL audit log for mutation tracking and operational event logging."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import time
+from dataclasses import dataclass
 
 from attestdb.core.types import AuditEvent
 
@@ -104,6 +105,76 @@ class AuditLog:
                              if k not in ("event", "timestamp", "actor",
                                           "claim_id", "source_id", "namespace")},
                 ))
+                if len(events) >= limit:
+                    break
+        return events
+
+
+@dataclass
+class OpsEvent:
+    """A single operational event."""
+    event: str
+    timestamp: float
+    details: dict
+
+
+class OpsLog:
+    """Append-only JSONL log for operational (read-path) events.
+
+    Separate from AuditLog (which tracks mutations). Records:
+    - curator_triage: claim identifier, decision, provider, tokens, cost
+    - ask_query: question, entity count, tokens, elapsed time
+    """
+
+    def __init__(self, db_path: str, is_memory: bool) -> None:
+        self._path: str | None = None
+        if not is_memory:
+            self._path = db_path + ".ops.jsonl"
+
+    def write(self, event: str, **kwargs) -> None:
+        """Append an operational event."""
+        if not self._path:
+            return
+        entry = {"event": event, "timestamp": time.time(), **kwargs}
+        try:
+            with builtins.open(self._path, "a") as f:
+                f.write(json.dumps(entry, default=str) + "\n")
+        except Exception as exc:
+            logger.warning("Failed to write ops event: %s", exc)
+
+    def query(
+        self,
+        since: float = 0.0,
+        event_type: str | None = None,
+        limit: int = 1000,
+    ) -> list[OpsEvent]:
+        """Query the ops log.
+
+        Args:
+            since: Unix timestamp. Returns events after this time.
+            event_type: Filter to a specific event type.
+            limit: Max events to return.
+        """
+        if not self._path or not os.path.exists(self._path):
+            return []
+        events: list[OpsEvent] = []
+        with builtins.open(self._path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts = d.get("timestamp", 0.0)
+                if ts <= since:
+                    continue
+                if event_type and d.get("event") != event_type:
+                    continue
+                evt = d.pop("event", "")
+                ts = d.pop("timestamp", 0.0)
+                events.append(OpsEvent(event=evt, timestamp=ts, details=d))
                 if len(events) >= limit:
                     break
         return events

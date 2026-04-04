@@ -103,6 +103,118 @@ def cmd_stats(args):
     db.close()
 
 
+def cmd_discover(args):
+    """Run schema discovery on connected data sources."""
+    import json as _json
+
+    from attestdb.discovery.sampler import analyze_fields, sample_source
+    from attestdb.discovery.analyzer import infer_semantics, detect_deprecated_fields
+    from attestdb.discovery.schema_map import SchemaMap
+    from attestdb.discovery.aligner import align_schemas
+    from attestdb.discovery.claim_templates import generate_claim_templates, templates_to_report
+
+    source_ids = [s.strip() for s in args.sources.split(",")]
+    tenant_id = args.tenant or "default"
+
+    print(f"Discovering schemas for: {', '.join(source_ids)}")
+
+    # Build mock connectors from --connector-type if no real connectors
+    schema_maps: list[SchemaMap] = []
+
+    for source_id in source_ids:
+        print(f"\n--- Sampling {source_id} ---")
+
+        # Try to load as an existing SchemaMap JSON file
+        try:
+            sm = SchemaMap.load(source_id)
+            print(f"  Loaded existing schema from {source_id}")
+            schema_maps.append(sm)
+            continue
+        except Exception:
+            pass
+
+        # Try to use the connector framework
+        try:
+            from attestdb.connectors import connect
+            connector = connect(args.connector_type or source_id)
+        except Exception:
+            print(f"  Error: Cannot connect to '{source_id}'. "
+                  "Provide a SchemaMap JSON path or a valid connector name.",
+                  file=sys.stderr)
+            continue
+
+        samples = sample_source(connector, sample_size=args.sample_size, tenant_id=tenant_id)
+        print(f"  Sampled {len(samples)} records")
+
+        profiles = analyze_fields(samples, parent_object=source_id, tenant_id=tenant_id)
+        print(f"  Profiled {len(profiles)} fields")
+
+        mappings = infer_semantics(profiles, tenant_id=tenant_id)
+        deprecated = detect_deprecated_fields(profiles)
+        if deprecated:
+            print(f"  Deprecated fields: {', '.join(deprecated)}")
+
+        auto_count = sum(1 for m in mappings if m.review_status == "auto_mapped")
+        review_count = sum(1 for m in mappings if m.review_status == "needs_review")
+        unmapped_count = sum(1 for m in mappings if m.review_status == "unmapped")
+        print(f"  Mappings: {auto_count} auto, {review_count} review, {unmapped_count} unmapped")
+
+        sm = SchemaMap(
+            source_id=source_id,
+            source_type=args.connector_type or source_id,
+            tenant_id=tenant_id,
+            field_profiles=profiles,
+            semantic_mappings=mappings,
+            deprecated_fields=deprecated,
+        )
+        schema_maps.append(sm)
+
+        # Save individual schema map
+        out_path = f"{source_id}_schema.json"
+        sm.save(out_path)
+        print(f"  Saved to {out_path}")
+
+    if len(schema_maps) < 2:
+        print("\nNeed at least 2 sources for cross-source alignment.")
+        for sm in schema_maps:
+            print(f"\n{sm.to_review_report()}")
+        return
+
+    # Cross-source alignment
+    print("\n--- Cross-Source Alignment ---")
+    unified = align_schemas(schema_maps, tenant_id=tenant_id)
+    print(unified.to_report())
+
+    # Generate claim templates
+    print("\n--- Claim Templates ---")
+    templates = generate_claim_templates(unified, schema_maps, tenant_id=tenant_id)
+    print(templates_to_report(templates))
+
+    # Output as JSON if requested
+    if args.output:
+        package = {
+            "schemas": [sm.to_dict() for sm in schema_maps],
+            "unified_schema": unified.to_dict(),
+            "templates": [
+                {
+                    "claim_type": t.claim_type,
+                    "entity_key_field": t.entity_key_field,
+                    "value_field": t.value_field,
+                    "source_configs": t.source_configs,
+                    "confidence": t.confidence,
+                }
+                for t in templates
+            ],
+        }
+        with open(args.output, "w") as f:
+            _json.dump(package, f, indent=2)
+        print(f"\nReview package saved to {args.output}")
+
+    if args.auto_approve:
+        approved = sum(1 for t in templates if t.confidence >= 0.90)
+        print(f"\n--auto-approve: {approved}/{len(templates)} templates above 0.90 confidence")
+
+
 def cmd_schema(args):
     """Show knowledge graph schema — entity types, predicates, relationship patterns."""
     from attestdb.infrastructure.attest_db import AttestDB
@@ -497,6 +609,37 @@ def main():
         help="Vocabularies to register (default: bio)",
     )
 
+    # --- discover ---
+    p_discover = sub.add_parser("discover", help="Auto-discover schemas from data sources")
+    p_discover.add_argument(
+        "sources",
+        help="Comma-separated source IDs or SchemaMap JSON paths",
+    )
+    p_discover.add_argument(
+        "--connector-type", default=None,
+        help="Connector type for all sources (e.g., salesforce, postgres)",
+    )
+    p_discover.add_argument(
+        "--sample-size", type=int, default=1000,
+        help="Number of records to sample per source (default: 1000)",
+    )
+    p_discover.add_argument(
+        "--tenant", default="default",
+        help="Tenant ID (default: default)",
+    )
+    p_discover.add_argument(
+        "--output", "-o", default=None,
+        help="Output JSON file for the review package",
+    )
+    p_discover.add_argument(
+        "--auto-approve", action="store_true", default=False,
+        help="Auto-approve high-confidence mappings (for CI/CD)",
+    )
+    p_discover.add_argument(
+        "--dry-run", action="store_true", default=False,
+        help="Show what would be created without writing",
+    )
+
     # --- schema ---
     p_schema = sub.add_parser("schema", help="Show knowledge graph schema")
     p_schema.add_argument("db", help="Database path")
@@ -705,6 +848,8 @@ def main():
             cmd_stats_new(args)
     elif args.command == "query":
         cmd_query(args)
+    elif args.command == "discover":
+        cmd_discover(args)
     elif args.command == "schema":
         cmd_schema(args)
     elif args.command == "install":

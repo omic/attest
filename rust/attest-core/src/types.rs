@@ -85,6 +85,14 @@ pub struct Provenance {
     pub model_version: Option<String>,
     #[serde(default)]
     pub organization: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub source_version: Option<String>,
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
 }
 
 /// Typed payload attached to a claim.

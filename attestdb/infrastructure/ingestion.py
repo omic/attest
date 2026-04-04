@@ -199,6 +199,10 @@ class IngestionPipeline:
         chain = list(prov_dict.get("chain", []))
         model_version = prov_dict.get("model_version")
         organization = prov_dict.get("organization")
+        project = prov_dict.get("project")
+        agent_id = prov_dict.get("agent_id")
+        source_version = prov_dict.get("source_version")
+        labels = dict(prov_dict.get("labels", {}))
 
         timestamp = claim_input.timestamp or int(time.time() * 1_000_000_000)
 
@@ -334,6 +338,11 @@ class IngestionPipeline:
         if ttl_seconds > 0:
             expires_at = timestamp + ttl_seconds * 1_000_000_000
 
+        namespace = getattr(claim_input, "namespace", "") or ""
+        # Auto-populate namespace from project when namespace is empty
+        if not namespace and project:
+            namespace = str(project)
+
         claim = Claim(
             claim_id=claim_id,
             content_id=content_id,
@@ -354,11 +363,15 @@ class IngestionPipeline:
                 chain=chain,
                 model_version=str(model_version) if model_version else None,
                 organization=str(organization) if organization else None,
+                project=str(project) if project else None,
+                agent_id=str(agent_id) if agent_id else None,
+                source_version=str(source_version) if source_version else None,
+                labels=labels,
             ),
             payload=payload,
             timestamp=timestamp,
             status=ClaimStatus.ACTIVE,
-            namespace=getattr(claim_input, "namespace", "") or "",
+            namespace=namespace,
             expires_at=expires_at,
         )
         return claim, embedding

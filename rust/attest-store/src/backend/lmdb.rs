@@ -51,7 +51,7 @@ const CAUSAL_PREDICATES: &[&str] = &[
 ];
 
 /// Current schema version.
-const CURRENT_SCHEMA_VERSION: u32 = 3;
+const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 /// Safe ceiling for LMDB key/DUP_SORT data values.
 /// LMDB hard limit is 511 bytes; we stay 21 bytes under so compound keys
@@ -68,7 +68,84 @@ const DEFAULT_MAP_SIZE: usize = 1 << 30; // 1 GB
 /// Maximum number of named databases in the LMDB environment.
 const MAX_DBS: u32 = 32;
 
-/// Legacy Claim layout (v0.1.11 and earlier) — no `namespace` or `expires_at` fields.
+/// Legacy Provenance layout (pre-v0.1.40) — no project/agent_id/source_version/labels.
+/// Bincode is positional, so extra trailing fields cause deserialization failure.
+#[derive(Deserialize)]
+struct LegacyProvenance {
+    pub source_type: String,
+    pub source_id: String,
+    #[serde(default)]
+    pub method: Option<String>,
+    #[serde(default)]
+    pub chain: Vec<String>,
+    #[serde(default)]
+    pub model_version: Option<String>,
+    #[serde(default)]
+    pub organization: Option<String>,
+}
+
+impl LegacyProvenance {
+    fn into_provenance(self) -> Provenance {
+        Provenance {
+            source_type: self.source_type,
+            source_id: self.source_id,
+            method: self.method,
+            chain: self.chain,
+            model_version: self.model_version,
+            organization: self.organization,
+            project: None,
+            agent_id: None,
+            source_version: None,
+            labels: HashMap::new(),
+        }
+    }
+}
+
+/// Legacy Claim with old Provenance (pre-v0.1.40, but with namespace/expires_at).
+#[derive(Deserialize)]
+struct LegacyProvClaim {
+    pub claim_id: String,
+    pub content_id: String,
+    pub subject: EntityRef,
+    pub predicate: PredicateRef,
+    pub object: EntityRef,
+    pub confidence: f64,
+    pub provenance: LegacyProvenance,
+    #[serde(default)]
+    pub embedding: Option<Vec<f64>>,
+    #[serde(default)]
+    pub payload: Option<Payload>,
+    #[serde(default)]
+    pub timestamp: i64,
+    #[serde(default)]
+    pub status: ClaimStatus,
+    #[serde(default)]
+    pub namespace: String,
+    #[serde(default)]
+    pub expires_at: i64,
+}
+
+impl LegacyProvClaim {
+    fn into_claim(self) -> Claim {
+        Claim {
+            claim_id: self.claim_id,
+            content_id: self.content_id,
+            subject: self.subject,
+            predicate: self.predicate,
+            object: self.object,
+            confidence: self.confidence,
+            provenance: self.provenance.into_provenance(),
+            embedding: self.embedding,
+            payload: self.payload,
+            timestamp: self.timestamp,
+            status: self.status,
+            namespace: self.namespace,
+            expires_at: self.expires_at,
+        }
+    }
+}
+
+/// Legacy Claim layout (v0.1.11 and earlier) — no `namespace`, `expires_at`, or new provenance fields.
 #[derive(Deserialize)]
 struct LegacyClaim {
     pub claim_id: String,
@@ -77,7 +154,7 @@ struct LegacyClaim {
     pub predicate: PredicateRef,
     pub object: EntityRef,
     pub confidence: f64,
-    pub provenance: Provenance,
+    pub provenance: LegacyProvenance,
     #[serde(default)]
     pub embedding: Option<Vec<f64>>,
     #[serde(default)]
@@ -97,7 +174,7 @@ impl LegacyClaim {
             predicate: self.predicate,
             object: self.object,
             confidence: self.confidence,
-            provenance: self.provenance,
+            provenance: self.provenance.into_provenance(),
             embedding: self.embedding,
             payload: self.payload,
             timestamp: self.timestamp,
@@ -165,6 +242,8 @@ struct LmdbDatabases {
     predicate_idx: Database<Str, U64<heed::byteorder::BigEndian>>,
     // namespace → seq (DUP_SORT)
     namespace_idx: Database<Str, U64<heed::byteorder::BigEndian>>,
+    // project → seq (DUP_SORT)
+    project_idx: Database<Str, U64<heed::byteorder::BigEndian>>,
     // entity_id → bincode(EntityData)
     entities: Database<Str, Bytes>,
     // entity_type → entity_id (DUP_SORT)
@@ -456,6 +535,7 @@ impl LmdbBackend {
             source_idx: Self::create_dup_db::<Str, U64<BE>>(env, &mut wtxn, "source_idx")?,
             predicate_idx: Self::create_dup_db::<Str, U64<BE>>(env, &mut wtxn, "predicate_idx")?,
             namespace_idx: Self::create_dup_db::<Str, U64<BE>>(env, &mut wtxn, "namespace_idx")?,
+            project_idx: Self::create_dup_db::<Str, U64<BE>>(env, &mut wtxn, "project_idx")?,
             entity_type_idx: Self::create_dup_db::<Str, Str>(env, &mut wtxn, "entity_type_idx")?,
             text_idx: Self::create_dup_db::<Str, Str>(env, &mut wtxn, "text_idx")?,
             causal_adj: Self::create_dup_db::<Str, Str>(env, &mut wtxn, "causal_adj")?,
@@ -563,6 +643,11 @@ impl LmdbBackend {
         if let Ok(claim) = bincode::deserialize::<Claim>(&raw) {
             return Ok(claim);
         }
+        // Fallback: current Claim layout but old 6-field Provenance
+        if let Ok(claim) = bincode::deserialize::<LegacyProvClaim>(&raw) {
+            return Ok(claim.into_claim());
+        }
+        // Fallback: v0.1.11-era layout (no namespace/expires_at, old Provenance)
         bincode::deserialize::<LegacyClaim>(&raw)
             .map(|lc| lc.into_claim())
             .map_err(|e| lmdb_err("deserialize claim (legacy fallback)", e))
@@ -730,6 +815,14 @@ impl LmdbBackend {
         if !claim.namespace.is_empty() {
             self.dbs.namespace_idx.put(wtxn, &claim.namespace, &seq)
                 .map_err(|e| lmdb_err("put namespace_idx", e))?;
+        }
+
+        // PROJECT_IDX — skip empty project
+        if let Some(ref project) = claim.provenance.project {
+            if !project.is_empty() {
+                self.dbs.project_idx.put(wtxn, project, &seq)
+                    .map_err(|e| lmdb_err("put project_idx", e))?;
+            }
         }
 
         // Stats counters and analytics — skip in bulk load mode
@@ -1669,6 +1762,10 @@ impl LmdbBackend {
 
     pub fn claims_by_predicate_id(&self, predicate_id: &str) -> Vec<Claim> {
         self.claims_by_str_index(&self.dbs.predicate_idx, predicate_id)
+    }
+
+    pub fn claims_by_project(&self, project: &str) -> Vec<Claim> {
+        self.claims_by_str_index(&self.dbs.project_idx, project)
     }
 
     pub fn claims_for(
@@ -3224,6 +3321,10 @@ mod tests {
                 chain: vec![],
                 model_version: None,
                 organization: None,
+                project: None,
+                agent_id: None,
+                source_version: None,
+                labels: HashMap::new(),
             },
             embedding: None,
             payload: None,
@@ -3813,5 +3914,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
         let _ = std::fs::remove_dir_all(&dir_target);
+    }
+
+    /// Verify that claims serialized with the OLD 6-field Provenance
+    /// can still be deserialized by the current code (10-field Provenance).
+    #[test]
+    fn test_bincode_provenance_backward_compat() {
+        // Simulate old Provenance (6 fields, no project/agent_id/source_version/labels)
+        #[derive(serde::Serialize)]
+        struct OldProvenance {
+            source_type: String,
+            source_id: String,
+            method: Option<String>,
+            chain: Vec<String>,
+            model_version: Option<String>,
+            organization: Option<String>,
+        }
+
+        #[derive(serde::Serialize)]
+        struct OldClaim {
+            claim_id: String,
+            content_id: String,
+            subject: EntityRef,
+            predicate: PredicateRef,
+            object: EntityRef,
+            confidence: f64,
+            provenance: OldProvenance,
+            embedding: Option<Vec<f64>>,
+            payload: Option<Payload>,
+            timestamp: i64,
+            status: ClaimStatus,
+            namespace: String,
+            expires_at: i64,
+        }
+
+        let old = OldClaim {
+            claim_id: "c1".into(),
+            content_id: "ct1".into(),
+            subject: EntityRef { id: "a".into(), entity_type: "e".into(), display_name: "A".into(), external_ids: HashMap::new() },
+            predicate: PredicateRef { id: "p".into(), predicate_type: "pt".into() },
+            object: EntityRef { id: "b".into(), entity_type: "e".into(), display_name: "B".into(), external_ids: HashMap::new() },
+            confidence: 0.9,
+            provenance: OldProvenance {
+                source_type: "obs".into(),
+                source_id: "s1".into(),
+                method: None,
+                chain: vec![],
+                model_version: None,
+                organization: None,
+            },
+            embedding: None,
+            payload: None,
+            timestamp: 1711929600_000_000_000i64,
+            status: ClaimStatus::Active,
+            namespace: String::new(),
+            expires_at: 0,
+        };
+
+        let bytes = bincode::serialize(&old).unwrap();
+
+        // Wrap in zstd + header byte (same as real LMDB storage)
+        let compressed = zstd::encode_all(std::io::Cursor::new(&bytes), 3).unwrap();
+        let mut stored = Vec::with_capacity(1 + compressed.len());
+        stored.push(COMPRESSION_ZSTD);
+        stored.extend_from_slice(&compressed);
+
+        // This is the critical test: can decompress_claim handle old-format data?
+        let result = LmdbBackend::decompress_claim(&stored);
+        assert!(result.is_ok(), "Failed to deserialize old-format claim: {:?}", result.err());
+        let claim = result.unwrap();
+        assert_eq!(claim.claim_id, "c1");
+        assert_eq!(claim.provenance.source_type, "obs");
+        assert_eq!(claim.provenance.project, None);
+        assert_eq!(claim.provenance.agent_id, None);
+        assert!(claim.provenance.labels.is_empty());
     }
 }

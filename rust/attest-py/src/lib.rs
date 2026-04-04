@@ -68,6 +68,10 @@ fn claim_to_dict(py: Python<'_>, c: &Claim) -> PyResult<PyObject> {
     prov.set_item("chain", c.provenance.chain.clone().into_py_any(py)?)?;
     prov.set_item("model_version", c.provenance.model_version.as_deref())?;
     prov.set_item("organization", c.provenance.organization.as_deref())?;
+    prov.set_item("project", c.provenance.project.as_deref())?;
+    prov.set_item("agent_id", c.provenance.agent_id.as_deref())?;
+    prov.set_item("source_version", c.provenance.source_version.as_deref())?;
+    prov.set_item("labels", c.provenance.labels.clone().into_py_any(py)?)?;
     dict.set_item("provenance", prov)?;
 
     // Payload
@@ -133,6 +137,12 @@ fn claim_from_py(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Claim> {
         chain: prov_obj.getattr("chain")?.extract().unwrap_or_default(),
         model_version: prov_obj.getattr("model_version")?.extract().ok(),
         organization: prov_obj.getattr("organization")?.extract().ok(),
+        project: prov_obj.getattr("project")?.extract().ok(),
+        agent_id: prov_obj.getattr("agent_id")?.extract().ok(),
+        source_version: prov_obj.getattr("source_version")?.extract().ok(),
+        labels: prov_obj.getattr("labels")
+            .and_then(|v| v.extract::<HashMap<String, String>>())
+            .unwrap_or_default(),
     };
 
     // Payload
@@ -820,6 +830,10 @@ impl PyRustStore {
                         chain: vec![],
                         model_version: None,
                         organization: None,
+                        project: None,
+                        agent_id: None,
+                        source_version: None,
+                        labels: HashMap::new(),
                     },
                     embedding: None,
                     payload: None,

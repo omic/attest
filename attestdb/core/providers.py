@@ -58,6 +58,65 @@ PROVIDERS = {
 # groq (fastest) → gemini → together → openai → deepseek → grok
 EXTRACTION_FALLBACK_CHAIN = ["groq", "gemini", "together", "openai", "deepseek", "grok"]
 
+# Token pricing per 1M tokens (input, output) in USD.
+# Used by prompt_kit tools for cost estimation and waste analysis.
+MODEL_PRICING: dict[str, tuple[float, float]] = {
+    # Anthropic
+    "claude-opus-4-6": (15.0, 75.0),
+    "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-haiku-4-5-20251001": (0.80, 4.0),
+    # OpenAI
+    "gpt-4.1": (2.0, 8.0),
+    "gpt-4.1-mini": (0.40, 1.60),
+    "gpt-4.1-nano": (0.10, 0.40),
+    "o3": (10.0, 40.0),
+    "o4-mini": (1.10, 4.40),
+    # Google
+    "gemini-2.5-pro": (1.25, 10.0),
+    "gemini-2.5-flash": (0.15, 0.60),
+    "gemini-3.1-flash-lite-preview": (0.075, 0.30),
+    # Open-source / inference providers
+    "deepseek-chat": (0.14, 0.28),
+    "grok-4-1-fast-non-reasoning": (3.0, 15.0),
+    "llama-3.3-70b-versatile": (0.59, 0.79),
+    "glm-4-flash": (0.0, 0.0),  # free tier
+    # Fallback for unknown models
+    "_default": (0.50, 1.50),
+}
+
+# Model tier classification for routing recommendations.
+# tier 1 = reasoning (expensive), tier 2 = execution (mid), tier 3 = cleanup (cheap)
+MODEL_TIERS: dict[str, int] = {
+    "claude-opus-4-6": 1,
+    "o3": 1,
+    "gpt-4.1": 1,
+    "gemini-2.5-pro": 1,
+    "grok-4-1-fast-non-reasoning": 1,
+    "claude-sonnet-4-6": 2,
+    "gpt-4.1-mini": 2,
+    "o4-mini": 2,
+    "deepseek-chat": 2,
+    "gemini-2.5-flash": 2,
+    "llama-3.3-70b-versatile": 2,
+    "claude-haiku-4-5-20251001": 3,
+    "gpt-4.1-nano": 3,
+    "gemini-3.1-flash-lite-preview": 3,
+    "glm-4-flash": 3,
+}
+
+TIER_NAMES = {1: "reasoning", 2: "execution", 3: "cleanup"}
+
+
+def estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
+    """Estimate USD cost for a model call."""
+    pricing = MODEL_PRICING.get(model, MODEL_PRICING["_default"])
+    return (prompt_tokens * pricing[0] + completion_tokens * pricing[1]) / 1_000_000
+
+
+def get_model_tier(model: str) -> int:
+    """Return tier (1-3) for a model, defaulting to 2."""
+    return MODEL_TIERS.get(model, 2)
+
 
 def load_env_file(env_path: str) -> dict[str, str]:
     """Load key=value pairs from a .env file."""

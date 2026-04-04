@@ -68,6 +68,59 @@ class AnalyticsEngine:
 
     def __init__(self, db: "AttestDB") -> None:
         self.db = db
+        self._discovered_causal_preds: set[str] | None = None
+
+    def _resolve_causal_predicates(
+        self,
+        extra: set[str] | None = None,
+        directional_only: bool = False,
+    ) -> set[str]:
+        """Build the effective set of causal predicate IDs.
+
+        Combines:
+        1. CAUSAL_PREDICATES (hardcoded, always included for backward compat)
+        2. Predicate IDs discovered from the store where predicate_type is causal
+        3. User-provided extra causal predicates
+        """
+        from attestdb.core.vocabulary import CAUSAL_PREDICATES, CAUSAL_PREDICATE_TYPES
+
+        base = set(CAUSAL_PREDICATES)
+        if directional_only:
+            base.discard("regulates")
+
+        # Discover additional causal predicates from store metadata (once)
+        if self._discovered_causal_preds is None:
+            discovered: set[str] = set()
+            try:
+                if hasattr(self.db._store, "predicate_id_to_type_map"):
+                    type_map = self.db._store.predicate_id_to_type_map()
+                    for pred_id, pred_type in type_map.items():
+                        if pred_type in CAUSAL_PREDICATE_TYPES:
+                            discovered.add(pred_id)
+                else:
+                    # Fallback: sample claims from a few entities
+                    try:
+                        entities = self.db._store.list_entities(
+                            None, 0, 0, 20
+                        )
+                        for e in entities:
+                            eid = e["id"] if isinstance(e, dict) else e.id
+                            claims = self.db._store.claims_for(eid, None, None, 0.0)
+                            for d in claims[:50]:
+                                c = claim_from_dict(d)
+                                if (c.predicate.predicate_type in CAUSAL_PREDICATE_TYPES
+                                        and c.predicate.id not in base):
+                                    discovered.add(c.predicate.id)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            self._discovered_causal_preds = discovered
+
+        result = base | self._discovered_causal_preds
+        if extra:
+            result |= extra
+        return result
 
     def corroboration_report(self, min_sources: int = 2) -> dict:
         """Report on corroboration status across the knowledge graph.
@@ -780,7 +833,8 @@ class AnalyticsEngine:
         )
 
     def what_if(self, subject: tuple, predicate: tuple, object: tuple,
-                confidence: float = 0.6):
+                confidence: float = 0.6,
+                extra_causal_predicates: set[str] | None = None):
         """One-call hypothetical reasoning — queries the knowledge graph directly.
 
         No sandbox creation. Directly analyzes whether a hypothetical claim
@@ -791,11 +845,9 @@ class AnalyticsEngine:
         - Gap detection (does this bridge disconnected entities?)
         - Follow-up suggestions (nearby unconnected entity pairs)
 
-        The causal-priority BFS follows edges with causal predicates
-        (activates, inhibits, upregulates, downregulates, etc.) first,
-        then weak edges only if causal paths are sparse. When both hops
-        are causal, the system composes them: inhibits + inhibits = activates
-        (double negative), upregulates + downregulates = downregulates, etc.
+        The causal-priority BFS follows causal edges first (recognized by
+        predicate name or predicate_type="causes"), then weak edges only
+        if causal paths are sparse.
 
         Works with read-only databases and scales to millions of claims.
 
@@ -804,12 +856,15 @@ class AnalyticsEngine:
         """
         from attestdb.core.types import IndirectEvidence, SandboxVerdict
         from attestdb.core.vocabulary import (
+            CAUSAL_PREDICATE_TYPES,
             CAUSAL_PREDICATES,
             OPPOSITE_PREDICATES,
             PREDICATE_EQUIVALENCE,
             compose_predicates,
             predicates_agree,
         )
+
+        _causal_set = self._resolve_causal_predicates(extra_causal_predicates)
 
         subj_id = subject[0]
         obj_id = object[0]
@@ -833,7 +888,9 @@ class AnalyticsEngine:
             conf = c.confidence
 
             # Direct evidence: count supporting + contradicting claims to target
-            if obj == n_obj_id and pred in CAUSAL_PREDICATES:
+            _is_causal = (pred in _causal_set
+                          or c.predicate.predicate_type in CAUSAL_PREDICATE_TYPES)
+            if obj == n_obj_id and _is_causal:
                 if predicates_agree(pred, hyp_pred):
                     direct_supporting += 1
                 else:
@@ -848,7 +905,7 @@ class AnalyticsEngine:
             # Collect neighbors for BFS
             neighbor = obj if c.subject.id == n_subj_id else c.subject.id
             if neighbor != n_subj_id and neighbor != n_obj_id:
-                if pred in CAUSAL_PREDICATES:
+                if _is_causal:
                     if neighbor not in causal_neighbors or conf > causal_neighbors[neighbor][1]:
                         causal_neighbors[neighbor] = (pred, conf)
                 else:
@@ -1110,13 +1167,13 @@ class AnalyticsEngine:
         min_consensus: float = 0.65,
         directional_only: bool = False,
         entity_aliases: dict[str, str] | None = None,
+        extra_causal_predicates: set[str] | None = None,
     ) -> list["Prediction"]:
         """Discover novel regulatory predictions via causal composition.
 
-        Follows causal edges (activates, inhibits, upregulates, downregulates)
-        from the entity through chemical/gene intermediaries, then composes
-        predicates at each 2-hop path. Filters for convergent predictions
-        where multiple independent intermediaries agree on direction.
+        Follows causal edges from the entity through intermediaries, then
+        composes predicates at each 2-hop path. Filters for convergent
+        predictions where multiple independent intermediaries agree on direction.
 
         Returns predictions ranked by number of supporting intermediaries,
         with genuine gaps (no existing connection) sorted first.
@@ -1131,6 +1188,7 @@ class AnalyticsEngine:
         """
         from attestdb.core.types import IndirectEvidence, Prediction
         from attestdb.core.vocabulary import (
+            CAUSAL_PREDICATE_TYPES,
             CAUSAL_PREDICATES,
             OPPOSITE_PREDICATES,
             PREDICATE_COMPOSITION,
@@ -1160,9 +1218,9 @@ class AnalyticsEngine:
         outgoing_causal: dict[str, tuple[str, float]] = {}
         incoming_causal: dict[str, tuple[str, float]] = {}
 
-        # When directional_only=True, exclude "regulates" — it washes out
-        # directional signal from activates/inhibits/upregulates/downregulates
-        _causal_set = CAUSAL_PREDICATES - {"regulates"} if directional_only else CAUSAL_PREDICATES
+        # Build effective causal predicate set — includes hardcoded bio predicates,
+        # discovered domain predicates (via predicate_type), and user-provided extras
+        _causal_set = self._resolve_causal_predicates(extra_causal_predicates, directional_only)
 
         _used_fast_path = False
         if _has_fast_path:
@@ -1195,7 +1253,9 @@ class AnalyticsEngine:
             claims = self.db._store.claims_for(n_eid, None, None, 0.0)
             for d in claims:
                 c = claim_from_dict(d)
-                if c.predicate.id not in _causal_set:
+                _is_causal = (c.predicate.id in _causal_set
+                              or c.predicate.predicate_type in CAUSAL_PREDICATE_TYPES)
+                if not _is_causal:
                     raw_n = c.object.id if c.subject.id == n_eid else c.subject.id
                     neighbor = _resolve(raw_n)
                     if neighbor != n_eid:

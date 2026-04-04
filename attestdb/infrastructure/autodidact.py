@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from attestdb.infrastructure.attest_db import AttestDB
 
 from attestdb.core.types import AutodidactConfig, AutodidactStatus, ClaimInput, CycleReport
+from attestdb.infrastructure.event_bus import EventType
 
 logger = logging.getLogger(__name__)
 
@@ -125,9 +126,9 @@ class AutodidactDaemon:
 
         # Register event hooks
         if "retraction" in self._config.enabled_triggers:
-            self._db.on("source_retracted", self._on_retraction)
+            self._db.on(EventType.SOURCE_RETRACTED, self._on_retraction)
         if "inquiry" in self._config.enabled_triggers:
-            self._db.on("inquiry_created", self._on_inquiry)
+            self._db.on(EventType.INQUIRY_CREATED, self._on_inquiry)
 
         self._thread = threading.Thread(
             target=self._loop,
@@ -344,7 +345,7 @@ class AutodidactDaemon:
         if not self._budget_ok():
             with self._lock:
                 self._budget_exhausted = True
-            self._db._fire("autodidact_budget_exhausted")
+            self._db._fire(EventType.AUTODIDACT_BUDGET_EXHAUSTED)
             # Still measure blindspots for reporting
             try:
                 bs = self._db.blindspots(min_claims=1)
@@ -387,7 +388,7 @@ class AutodidactDaemon:
             if not self._budget_ok():
                 with self._lock:
                     self._budget_exhausted = True
-                self._db._fire("autodidact_budget_exhausted")
+                self._db._fire(EventType.AUTODIDACT_BUDGET_EXHAUSTED)
                 break
 
             # Check negative result limit
@@ -574,7 +575,7 @@ class AutodidactDaemon:
             logger.debug("Autodidact journal write failed: %s", exc)
 
         self._db._fire(
-            "autodidact_cycle_completed",
+            EventType.AUTODIDACT_CYCLE_COMPLETED,
             cycle_number=report.cycle_number,
             claims_ingested=report.claims_ingested,
             tasks_generated=report.tasks_generated,

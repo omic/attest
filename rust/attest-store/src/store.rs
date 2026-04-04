@@ -473,6 +473,10 @@ impl RustStore {
         self.backend.claims_by_predicate_id(predicate_id)
     }
 
+    pub fn claims_by_project(&self, project: &str) -> Vec<Claim> {
+        self.backend.claims_by_project(project)
+    }
+
     pub fn claims_for(
         &mut self,
         entity_id: &str,
@@ -763,6 +767,10 @@ mod tests {
                 chain: vec![],
                 model_version: None,
                 organization: None,
+                project: None,
+                agent_id: None,
+                source_version: None,
+                labels: HashMap::new(),
             },
             embedding: None,
             payload: None,
@@ -892,6 +900,10 @@ mod tests {
                 chain: vec![],
                 model_version: None,
                 organization: None,
+                project: None,
+                agent_id: None,
+                source_version: None,
+                labels: HashMap::new(),
             },
             embedding: None,
             payload: None,
@@ -1995,6 +2007,10 @@ mod lmdb_tests {
                 chain: vec![],
                 model_version: None,
                 organization: None,
+                project: None,
+                agent_id: None,
+                source_version: None,
+                labels: HashMap::new(),
             },
             embedding: None,
             payload: None,
@@ -2135,6 +2151,10 @@ mod lmdb_tests {
                 chain: vec![],
                 model_version: None,
                 organization: None,
+                project: None,
+                agent_id: None,
+                source_version: None,
+                labels: HashMap::new(),
             },
             embedding: None,
             payload: None,
@@ -2409,6 +2429,10 @@ mod lmdb_tests {
                     chain: vec![],
                     model_version: None,
                     organization: None,
+                    project: None,
+                    agent_id: None,
+                    source_version: None,
+                    labels: HashMap::new(),
                 },
                 embedding: None,
                 payload: None,
@@ -2600,6 +2624,10 @@ mod lmdb_tests {
                 chain: vec![],
                 model_version: None,
                 organization: None,
+                project: None,
+                agent_id: None,
+                source_version: None,
+                labels: HashMap::new(),
             },
             embedding: None,
             payload: None,

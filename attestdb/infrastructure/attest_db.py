@@ -33,6 +33,7 @@ if TYPE_CHECKING:
 
 from attestdb.core.hashing import compute_chain_hash, compute_content_id
 from attestdb.core.normalization import normalize_entity_id
+from attestdb.infrastructure.event_bus import EventType
 from attestdb.core.types import (
     Analogy,
     AskResult,
@@ -459,12 +460,13 @@ class AttestDB:
             claim_converter=_converting,
         )
         # Composed subsystem objects (read-only: minimal setup)
-        from attestdb.infrastructure.audit_log import AuditLog
+        from attestdb.infrastructure.audit_log import AuditLog, OpsLog
         from attestdb.infrastructure.webhooks import WebhookManager
         from attestdb.infrastructure.rbac import RBACManager
         from attestdb.infrastructure.event_bus import EventBus
 
         instance._audit = AuditLog(db_path, True)  # read-only = in-memory audit
+        instance._ops_log = OpsLog(db_path, True)
         instance._webhooks_mgr = WebhookManager(None)
         instance._rbac_mgr = RBACManager(None, instance._audit, lambda: instance._store.get_namespace_filter())
         instance._events = EventBus(instance._webhooks_mgr, lambda cid: instance.get_claim(cid))
@@ -585,15 +587,17 @@ class AttestDB:
         self._query_engine = QueryEngine(self._store, claim_converter=_converting)
 
         # Composed subsystem objects
-        from attestdb.infrastructure.audit_log import AuditLog
+        from attestdb.infrastructure.audit_log import AuditLog, OpsLog
         from attestdb.infrastructure.webhooks import WebhookManager
         from attestdb.infrastructure.rbac import RBACManager
         from attestdb.infrastructure.event_bus import EventBus
 
         is_memory = self._is_memory_db
         self._audit = AuditLog(self._db_path, is_memory)
+        self._ops_log = OpsLog(self._db_path, is_memory)
         webhooks_path = None if is_memory else self._db_path + ".webhooks.json"
-        self._webhooks_mgr = WebhookManager(webhooks_path)
+        failure_log_path = None if is_memory else self._db_path + ".webhooks_failed.jsonl"
+        self._webhooks_mgr = WebhookManager(webhooks_path, failure_log_path)
         rbac_path = None if is_memory else self._db_path + ".rbac.json"
         self._rbac_mgr = RBACManager(rbac_path, self._audit, lambda: self._store.get_namespace_filter())
         self._events = EventBus(self._webhooks_mgr, lambda cid: self.get_claim(cid))
@@ -679,7 +683,7 @@ class AttestDB:
 
         # Ask engine (question-answering subsystem)
         from attestdb.infrastructure.ask_engine import AskEngine
-        self._ask_engine = AskEngine(self)
+        self._ask_engine = AskEngine(self, ops_callback=self._ops_log.write)
 
         # Eval engine (domain evaluation generation and scoring)
         from attestdb.infrastructure.eval_engine import EvalEngine
@@ -1086,6 +1090,24 @@ class AttestDB:
         """
         return self._audit.query(since, event_type, actor, limit)
 
+    def ops_log(
+        self,
+        since: float = 0.0,
+        event_type: str | None = None,
+        limit: int = 1000,
+    ) -> list:
+        """Query the operational event log.
+
+        Args:
+            since: Unix timestamp. Returns events after this time.
+            event_type: Filter (e.g. "curator_triage", "ask_query").
+            limit: Max events to return.
+
+        Returns:
+            List of OpsEvent, oldest first.
+        """
+        return self._ops_log.query(since, event_type, limit)
+
     # --- RBAC (role-based access control) ---
 
     def enable_rbac(self) -> None:
@@ -1449,10 +1471,8 @@ class AttestDB:
     def on(self, event: str, callback) -> None:
         """Register a callback for a lifecycle event.
 
-        Events: "claim_ingested", "source_retracted", "claim_corroborated",
-        "inquiry_matched", "snapshot_created", "inquiry_created",
-        "sync_completed", "insight_alerts", "autodidact_cycle_completed",
-        "autodidact_budget_exhausted"
+        Use :class:`~attestdb.infrastructure.event_bus.EventType` constants
+        for event names (e.g. ``EventType.CLAIM_INGESTED``).
         """
         self._events.on(event, callback)
 
@@ -1781,7 +1801,7 @@ class AttestDB:
                     if os.path.exists(src):
                         shutil.copy2(src, os.path.join(dest_path, os.path.basename(src)))
 
-        self._fire("snapshot_created", dest_path=dest_path)
+        self._fire(EventType.SNAPSHOT_CREATED, dest_path=dest_path)
         return dest_path
 
     @staticmethod
@@ -1944,7 +1964,7 @@ class AttestDB:
             predicate=ci.predicate[0],
             object=ci.object[0],
         )
-        self._fire("claim_ingested", claim_id=claim_id, claim_input=ci)
+        self._fire(EventType.CLAIM_INGESTED, claim_id=claim_id, claim_input=ci)
         self._check_subscriptions(claim_id, ci)
         # Check corroboration (use normalized predicate to match stored claims)
         from attestdb.core.vocabulary import normalize_predicate
@@ -1955,13 +1975,13 @@ class AttestDB:
         )
         existing = self.claims_by_content_id(content_id)
         if len(existing) > 1:
-            self._fire("claim_corroborated", content_id=content_id, count=len(existing))
+            self._fire(EventType.CLAIM_CORROBORATED, content_id=content_id, count=len(existing))
         # Check inquiry matches
         matches = self.check_inquiry_matches(
             subject_id=ci.subject[0], object_id=ci.object[0], predicate_id=ci.predicate[0],
         )
         for m in matches:
-            self._fire("inquiry_matched", inquiry_id=m, claim_id=claim_id)
+            self._fire(EventType.INQUIRY_MATCHED, inquiry_id=m, claim_id=claim_id)
         # Optional verification
         if verify:
             try:
@@ -2685,7 +2705,7 @@ class AttestDB:
             reason=reason,
             retracted_count=len(claim_ids),
         )
-        self._fire("source_retracted", source_id=source_id, reason=reason, claim_ids=claim_ids)
+        self._fire(EventType.SOURCE_RETRACTED, source_id=source_id, reason=reason, claim_ids=claim_ids)
         return result
 
     # --- Provenance cascade ---
@@ -3022,7 +3042,7 @@ class AttestDB:
                 },
             },
         )
-        self._fire("inquiry_created", claim_id=claim_id, question=question)
+        self._fire(EventType.INQUIRY_CREATED, claim_id=claim_id, question=question)
         return claim_id
 
     def open_inquiries(self) -> list[Claim]:
@@ -3416,12 +3436,15 @@ class AttestDB:
             return dict(list(ranked.items())[:top_k])
         return ranked
 
-    def betweenness(self, sample_size: int = 200, top_k: int = 0) -> dict[str, float]:
+    def betweenness(self, sample_size: int = 200, top_k: int = 0, *,
+                    adaptive: bool = True, max_nodes: int = 10_000) -> dict[str, float]:
         """Approximate betweenness centrality (identifies bridge entities).
 
         Args:
             sample_size: Number of source nodes for approximation (200 = fast).
             top_k: If > 0, return only the top-K entities. 0 = all.
+            adaptive: Auto-reduce sample_size and extract subgraph for large graphs.
+            max_nodes: Max nodes for subgraph extraction (0 = disable).
 
         Returns:
             {entity_id: betweenness_score} sorted descending.
@@ -3429,7 +3452,9 @@ class AttestDB:
         from attestdb.intelligence.graph_embeddings import compute_betweenness_centrality
 
         adj = self.get_adjacency_list()
-        scores = compute_betweenness_centrality(adj, sample_size=sample_size)
+        scores = compute_betweenness_centrality(
+            adj, sample_size=sample_size, adaptive=adaptive, max_nodes=max_nodes,
+        )
         ranked = dict(sorted(scores.items(), key=lambda x: x[1], reverse=True))
         if top_k > 0:
             return dict(list(ranked.items())[:top_k])
@@ -3579,17 +3604,17 @@ class AttestDB:
         """What-if analysis: what would happen if this claim were ingested."""
         return self._analytics.hypothetical(claim)
 
-    def what_if(self, subject, predicate, object, confidence=0.6):
+    def what_if(self, subject, predicate, object, confidence=0.6, extra_causal_predicates=None):
         """One-call hypothetical reasoning -- queries the knowledge graph directly."""
-        return self._analytics.what_if(subject, predicate, object, confidence)
+        return self._analytics.what_if(subject, predicate, object, confidence, extra_causal_predicates)
 
     def build_entity_aliases(self, entity_type: str = "gene", batch_size: int = 50000):
         """Build an alias map by matching display names across entity ID formats."""
         return self._analytics.build_entity_aliases(entity_type, batch_size)
 
-    def predict(self, entity_id, max_intermediaries=100, min_paths=3, min_consensus=0.65, directional_only=False, entity_aliases=None):
+    def predict(self, entity_id, max_intermediaries=100, min_paths=3, min_consensus=0.65, directional_only=False, entity_aliases=None, extra_causal_predicates=None):
         """Discover novel regulatory predictions via causal composition."""
-        return self._analytics.predict(entity_id, max_intermediaries, min_paths, min_consensus, directional_only, entity_aliases)
+        return self._analytics.predict(entity_id, max_intermediaries, min_paths, min_consensus, directional_only, entity_aliases, extra_causal_predicates)
 
     # --- Verification (delegated to VerificationEngine) ---
 

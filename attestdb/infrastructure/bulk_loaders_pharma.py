@@ -297,8 +297,10 @@ def load_drug_withdrawals(
     Returns:
         BatchResult with ingestion counts.
     """
+    from datetime import datetime, timezone
+
     t0 = time.time()
-    timestamp = int(t0 * 1_000_000_000)
+    fallback_timestamp = int(t0 * 1_000_000_000)
 
     entities: dict[str, tuple[str, str, str]] = {}
     claim_rows: list[tuple] = []
@@ -309,9 +311,19 @@ def load_drug_withdrawals(
             drug = (row.get("drug") or "").strip()
             reason = (row.get("reason") or "").strip()
             jurisdiction = (row.get("jurisdiction") or "").strip()
+            date_str = (row.get("date") or "").strip()
 
             if not drug or not reason:
                 continue
+
+            # Use withdrawal date as claim timestamp for temporal analysis
+            timestamp = fallback_timestamp
+            if date_str:
+                try:
+                    dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                    timestamp = int(dt.timestamp() * 1_000_000_000)
+                except ValueError:
+                    pass
 
             drug_eid = normalize_entity_id(f"drug_{drug}")
             reason_eid = normalize_entity_id(f"withdrawal_reason_{reason}")

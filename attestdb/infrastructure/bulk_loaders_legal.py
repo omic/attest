@@ -86,8 +86,10 @@ def load_courtlistener_citations(
     Returns:
         BatchResult with ingestion counts.
     """
+    from datetime import datetime, timezone
+
     t0 = time.time()
-    timestamp = int(t0 * 1_000_000_000)
+    fallback_timestamp = int(t0 * 1_000_000_000)
 
     entities: dict[str, tuple[str, str, str]] = {}
     claim_rows: list[tuple] = []
@@ -105,6 +107,16 @@ def load_courtlistener_citations(
             cited_name = row.get("cited_case_name", "").strip()
             citing_court = row.get("citing_court", "").strip()
             cited_court = row.get("cited_court", "").strip()
+
+            # Use citing_date as claim timestamp for temporal analysis
+            citing_date = row.get("citing_date", "").strip()
+            timestamp = fallback_timestamp
+            if citing_date:
+                try:
+                    dt = datetime.strptime(citing_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                    timestamp = int(dt.timestamp() * 1_000_000_000)
+                except ValueError:
+                    pass
 
             if not citing_id or not cited_id:
                 continue
@@ -309,8 +321,10 @@ def load_federal_register_legal(
     Returns:
         BatchResult with ingestion counts.
     """
+    from datetime import datetime, timezone
+
     t0 = time.time()
-    timestamp = int(t0 * 1_000_000_000)
+    fallback_timestamp = int(t0 * 1_000_000_000)
 
     entities: dict[str, tuple[str, str, str]] = {}
     claim_rows: list[tuple] = []
@@ -335,6 +349,16 @@ def load_federal_register_legal(
 
             if not title or not doc_number:
                 continue
+
+            # Use publication_date as claim timestamp for temporal analysis
+            pub_date = (rec.get("publication_date") or "").strip()
+            timestamp = fallback_timestamp
+            if pub_date:
+                try:
+                    dt = datetime.strptime(pub_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                    timestamp = int(dt.timestamp() * 1_000_000_000)
+                except ValueError:
+                    pass
 
             # Entity: regulation
             reg_eid = normalize_entity_id(f"regulation_{doc_number}")
@@ -414,8 +438,10 @@ def load_harvard_cap(
     Returns:
         BatchResult with ingestion counts.
     """
+    from datetime import datetime, timezone
+
     t0 = time.time()
-    timestamp = int(t0 * 1_000_000_000)
+    fallback_timestamp = int(t0 * 1_000_000_000)
 
     entities: dict[str, tuple[str, str, str]] = {}
     claim_rows: list[tuple] = []
@@ -443,6 +469,15 @@ def load_harvard_cap(
             decision_date = (case.get("decision_date") or "").strip()
             citations = case.get("citations", [])
             cites_to = case.get("cites_to", [])
+
+            # Use decision_date as claim timestamp for temporal analysis
+            timestamp = fallback_timestamp
+            if decision_date:
+                try:
+                    dt = datetime.strptime(decision_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                    timestamp = int(dt.timestamp() * 1_000_000_000)
+                except ValueError:
+                    pass
 
             if not case_id or not name:
                 continue

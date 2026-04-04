@@ -4,6 +4,7 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
+use std::collections::HashMap;
 use attest_core::types::{Claim, ClaimStatus, EntityRef, PredicateRef, Provenance};
 use attest_store::RustStore;
 
@@ -36,6 +37,10 @@ fn make_claim(claim_id: &str, subj: &str, pred: &str, obj: &str) -> Claim {
             chain: vec![],
             model_version: None,
             organization: None,
+            project: None,
+            agent_id: None,
+            source_version: None,
+            labels: HashMap::new(),
         },
         embedding: None,
         payload: None,

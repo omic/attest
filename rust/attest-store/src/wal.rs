@@ -277,6 +277,7 @@ fn read_one_entry(file: &mut fs::File) -> Result<WalEntry, WalReadError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use attest_core::types::*;
 
     fn make_test_claim(id: &str) -> Claim {
@@ -307,6 +308,10 @@ mod tests {
                 chain: vec![],
                 model_version: None,
                 organization: None,
+                project: None,
+                agent_id: None,
+                source_version: None,
+                labels: HashMap::new(),
             },
             embedding: None,
             payload: None,

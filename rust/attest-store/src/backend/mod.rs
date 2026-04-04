@@ -323,6 +323,13 @@ impl StorageBackend for Backend {
         }
     }
 
+    fn claims_by_project(&self, project: &str) -> Vec<Claim> {
+        match self {
+            Backend::InMemory(m) => m.claims_by_project(project),
+            Backend::Lmdb(l) => l.claims_by_project(project),
+        }
+    }
+
     fn claims_for(
         &mut self,
         entity_id: &str,

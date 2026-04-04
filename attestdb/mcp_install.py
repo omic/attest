@@ -236,12 +236,14 @@ def _install_claude_hooks(scope: str) -> None:
     if attest_mcp:
         recall_cmd = f"{attest_mcp} recall"
         pre_edit_cmd = f"{attest_mcp} pre-edit-check"
+        pre_read_cmd = f"{attest_mcp} pre-read-check"
         post_test_cmd = f"{attest_mcp} post-test-check"
         stop_cmd = f"{attest_mcp} stop"
     else:
         base = f"{sys.executable} -m attestdb.mcp_install"
         recall_cmd = f"{base} recall"
         pre_edit_cmd = f"{base} pre-edit-check"
+        pre_read_cmd = f"{base} pre-read-check"
         post_test_cmd = f"{base} post-test-check"
         stop_cmd = f"{base} stop"
 
@@ -268,6 +270,10 @@ def _install_claude_hooks(scope: str) -> None:
     pre_hooks.append({
         "matcher": "Edit|Write",
         "hooks": [{"type": "command", "command": pre_edit_cmd, "timeout": 10}],
+    })
+    pre_hooks.append({
+        "matcher": "Read",
+        "hooks": [{"type": "command", "command": pre_read_cmd, "timeout": 3}],
     })
     hooks["PreToolUse"] = pre_hooks
 
@@ -393,12 +399,17 @@ def _merge_session_end(db_path: Path) -> bool:
         import uuid
 
         sid = f"auto-stop:{uuid.uuid4().hex[:12]}"
+        project = data.get("project")
+
+        prov = {"source_type": "session_end", "source_id": sid}
+        if project:
+            prov["project"] = project
 
         db.ingest(
             subject=(sid, "tool_session"),
             predicate=("had_outcome", "had_outcome"),
             object=(outcome, "outcome_value"),
-            provenance={"source_type": "session_end", "source_id": sid},
+            provenance=prov,
             confidence=0.9,
             payload={
                 "schema_ref": "session_outcome",
@@ -406,6 +417,7 @@ def _merge_session_end(db_path: Path) -> bool:
                     "outcome": outcome,
                     "summary": summary,
                     "files_changed": files_changed,
+                    "project": project or "",
                 },
             },
         )
@@ -417,7 +429,7 @@ def _merge_session_end(db_path: Path) -> bool:
                     subject=(sid, "tool_session"),
                     predicate=("modified_file", "predicate"),
                     object=(fname, "source_file"),
-                    provenance={"source_type": "session_end", "source_id": sid},
+                    provenance=prov,
                     confidence=0.7,
                 )
             except Exception:
@@ -518,6 +530,7 @@ def recall(task: str | None = None, db_path: str | None = None) -> None:
 
     Output goes to the AI's context window via SessionStart hook.
     Uses git context (modified files, recent commits) to surface relevant knowledge.
+    Scoped to the current project when possible (old untagged claims pass through).
     """
     memory_db = Path(db_path) if db_path else DEFAULT_MEMORY_DB
     if not memory_db.exists():
@@ -531,6 +544,9 @@ def recall(task: str | None = None, db_path: str | None = None) -> None:
     # Merge session-end data and auto-extracted learnings from the Stop hook
     _merge_session_end(memory_db)
     _merge_auto_learnings(memory_db)
+
+    # Auto-detect project for scoping
+    project = _detect_recall_project()
 
     # Open read-only to avoid fs2 lock conflicts with the MCP server.
     # The Rust engine copies the DB to a temp file internally.
@@ -562,17 +578,23 @@ def recall(task: str | None = None, db_path: str | None = None) -> None:
         try:
             next_claims = db.claims_for_predicate("has_next_steps")
             if next_claims:
-                # Most recent next_steps
-                latest = max(next_claims, key=lambda c: c.timestamp)
-                age = _format_age(latest.timestamp)
-                lines.append(f"### Continue from previous session ({age})")
-                lines.append(f"{latest.object.id}\n")
+                # Filter by project — old untagged claims (no project) pass through
+                if project:
+                    next_claims = [
+                        c for c in next_claims
+                        if not c.provenance.project or c.provenance.project == project
+                    ]
+                if next_claims:
+                    latest = max(next_claims, key=lambda c: c.timestamp)
+                    age = _format_age(latest.timestamp)
+                    lines.append(f"### Continue from previous session ({age})")
+                    lines.append(f"{latest.object.id}\n")
         except Exception:
             pass
 
         # 2. Context-relevant knowledge (based on git status)
         # Includes warnings, patterns, decisions, tips, bugs, fixes — prioritized
-        relevant_items = _find_relevant_knowledge(db, context_files, context_terms)
+        relevant_items = _find_relevant_knowledge(db, context_files, context_terms, project)
 
         # Split by priority threshold into actionable vs historical
         high_pri = [r for r in relevant_items if r[4] <= KNOWLEDGE_HIGH_PRIORITY_THRESHOLD]
@@ -617,6 +639,11 @@ def recall(task: str | None = None, db_path: str | None = None) -> None:
         # 4. Recent session outcomes (brief)
         try:
             outcome_claims = db.claims_for_predicate("had_outcome")
+            if project:
+                outcome_claims = [
+                    c for c in outcome_claims
+                    if not c.provenance.project or c.provenance.project == project
+                ]
         except Exception:
             outcome_claims = []
 
@@ -633,6 +660,23 @@ def recall(task: str | None = None, db_path: str | None = None) -> None:
                 lines.append(f"- [{icon}] {c.object.id} ({age}){desc}")
             lines.append("")
 
+        # 5. Smart recommendations based on gaps and learnings
+        recs = _smart_recommendations(db, project)
+        if recs:
+            lines.append("### Recommended next")
+            lines.extend(recs)
+            lines.append("")
+
+        # Token discipline tips (always shown)
+        lines.append("### Token discipline")
+        token_lines = _session_efficiency_summary()
+        if token_lines:
+            lines.extend(token_lines)
+        else:
+            lines.append("- Before reading PDFs: `pandoc file.pdf -o file.md` (saves 5-20x tokens)")
+            lines.append("- Every ~15 turns: /clear or /compact to avoid context bloat")
+        lines.append("")
+
         lines.append("*Use `attest_learned` to record findings. "
                      "Use `attest_session_end` when done.*")
 
@@ -646,6 +690,170 @@ def recall(task: str | None = None, db_path: str | None = None) -> None:
         print("\n".join(lines))
     finally:
         db.close()
+
+
+def _smart_recommendations(db, project: str | None = None) -> list[str]:
+    """Mine the knowledge graph for actionable recommendations."""
+    def _proj_ok(c) -> bool:
+        if not project:
+            return True
+        cp = c.provenance.project if c.provenance else None
+        return not cp or cp == project
+
+    recs: list[str] = []
+    try:
+        # 1. Unresolved bugs: had_bug without a corresponding has_fix
+        bugs = []
+        fixes_for: set[str] = set()
+        try:
+            for c in db.claims_for_predicate("has_fix"):
+                if _proj_ok(c):
+                    fixes_for.add(c.subject.id)
+            for c in db.claims_for_predicate("had_bug"):
+                if _proj_ok(c) and c.subject.id not in fixes_for:
+                    bugs.append((c.subject.id, c.object.id, c.timestamp))
+        except Exception:
+            pass
+
+        if bugs:
+            bugs.sort(key=lambda b: b[2], reverse=True)
+            for subj, desc, _ts in bugs[:3]:
+                short = desc[:80] + "..." if len(desc) > 80 else desc
+                recs.append(f"- **Fix needed**: `{subj}` — {short}")
+
+        # 2. Incomplete sessions (partial/failure outcomes with next_steps)
+        try:
+            outcomes = db.claims_for_predicate("had_outcome")
+            incomplete = [
+                c for c in outcomes
+                if ("partial" in c.object.id or "failure" in c.object.id)
+                and _proj_ok(c)
+            ]
+            if incomplete:
+                latest = max(incomplete, key=lambda c: c.timestamp)
+                summary = ""
+                if latest.payload and hasattr(latest.payload, "data") and latest.payload.data:
+                    summary = latest.payload.data.get("summary", "")
+                if summary:
+                    age = _format_age(latest.timestamp)
+                    short = summary[:80] + "..." if len(summary) > 80 else summary
+                    recs.append(f"- **Unfinished** ({age}): {short}")
+        except Exception:
+            pass
+
+        # 3. Unresolved warnings (high-priority, no corresponding fix/decision)
+        try:
+            resolved_subjects = set()
+            for pred in ("has_fix", "has_decision", "resolved"):
+                try:
+                    for c in db.claims_for_predicate(pred):
+                        resolved_subjects.add(c.subject.id)
+                except Exception:
+                    pass
+
+            for c in db.claims_for_predicate("has_warning"):
+                if c.subject.id not in resolved_subjects and _proj_ok(c) and len(recs) < 5:
+                    short = c.object.id[:80] + "..." if len(c.object.id) > 80 else c.object.id
+                    recs.append(f"- **Open warning**: `{c.subject.id}` — {short}")
+        except Exception:
+            pass
+
+        # 4. Recent negative results (dead ends to avoid)
+        try:
+            negs = db.claims_for_predicate("has_negative_result")
+            if negs:
+                recent_negs = sorted(negs, key=lambda c: c.timestamp, reverse=True)[:2]
+                for c in recent_negs:
+                    short = c.object.id[:80] + "..." if len(c.object.id) > 80 else c.object.id
+                    recs.append(f"- **Dead end**: `{c.subject.id}` — {short}")
+        except Exception:
+            pass
+
+    except Exception:
+        pass
+
+    return recs[:6]
+
+
+def _session_efficiency_summary() -> list[str]:
+    """Compute session efficiency stats from hook_metrics.jsonl for recall output."""
+    try:
+        if not HOOK_METRICS_LOG.exists():
+            return []
+
+        raw_lines = HOOK_METRICS_LOG.read_text().strip().split("\n")
+        if len(raw_lines) < 5:
+            return []
+
+        timestamps: list[float] = []
+        pdf_reads = 0
+        for line in raw_lines[-200:]:
+            try:
+                m = json.loads(line)
+                ts = _parse_metric_timestamp(m.get("timestamp", 0))
+                if ts > 0:
+                    timestamps.append(ts)
+                if m.get("hook") == "pre_read_check" and m.get("fired"):
+                    pdf_reads += 1
+            except (json.JSONDecodeError, KeyError):
+                continue
+
+        if not timestamps:
+            return []
+
+        # Count sessions (gaps > 30 min)
+        sessions = 1
+        session_lengths: list[float] = []
+        session_start = timestamps[0]
+        for i in range(1, len(timestamps)):
+            if timestamps[i] - timestamps[i - 1] > 1800:
+                session_lengths.append(timestamps[i - 1] - session_start)
+                session_start = timestamps[i]
+                sessions += 1
+        session_lengths.append(timestamps[-1] - session_start)
+
+        avg_min = (sum(session_lengths) / len(session_lengths)) / 60
+        total_events = len(timestamps)
+
+        tips = []
+        tips.append(
+            f"- {sessions} sessions tracked  ·  avg {avg_min:.0f} min  ·  "
+            f"{total_events} tool calls"
+        )
+        if pdf_reads > 0:
+            tips.append(
+                f"- {pdf_reads} raw PDF/image reads last period — "
+                f"run `pandoc file.pdf -o file.md` before reading"
+            )
+        if avg_min > 30:
+            tips.append(
+                "- Sessions averaging >30 min — use /clear every ~15 turns"
+            )
+        return tips
+    except Exception:
+        return []
+
+
+def _detect_recall_project() -> str | None:
+    """Detect project from git remote for recall scoping."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if result.returncode == 0:
+            url = result.stdout.strip().rstrip("/")
+            if url.endswith(".git"):
+                url = url[:-4]
+            if url.startswith("git@"):
+                url = url[4:].replace(":", "/", 1)
+            elif url.startswith(("https://", "http://")):
+                url = url.split("://", 1)[1]
+            return url
+    except Exception:
+        pass
+    return os.path.basename(os.getcwd())
 
 
 def _git_context() -> tuple[list[str], set[str]]:
@@ -694,16 +902,24 @@ def _git_context() -> tuple[list[str], set[str]]:
     return files, terms
 
 
-def _find_relevant_knowledge(db, files: list[str], terms: set[str]) -> list[tuple]:
+def _find_relevant_knowledge(db, files: list[str], terms: set[str], project: str | None = None) -> list[tuple]:
     """Find knowledge claims relevant to the current git context.
 
     Returns (predicate, subject, object, confidence, priority) tuples,
     sorted by priority (warnings/patterns first, then bugs, then fixes).
+    Filters by project when set — old untagged claims (no project) pass through.
     """
     if not files and not terms:
         return []
 
     from attestdb.core.vocabulary import KNOWLEDGE_PREDICATES, KNOWLEDGE_PRIORITY
+
+    def _project_matches(claim) -> bool:
+        """True if claim belongs to this project or is untagged (graceful degradation)."""
+        if not project:
+            return True
+        claim_project = claim.provenance.project if claim.provenance else None
+        return not claim_project or claim_project == project
 
     # Filter to predicates relevant for recall (skip session-level ones)
     recall_predicates = {
@@ -720,7 +936,7 @@ def _find_relevant_knowledge(db, files: list[str], terms: set[str]) -> list[tupl
         entities = db.search_entities(f, top_k=5)
         for entity in entities:
             for claim in db.claims_for(entity.id):
-                if claim.claim_id not in seen and claim.predicate.id in all_predicates:
+                if claim.claim_id not in seen and claim.predicate.id in all_predicates and _project_matches(claim):
                     seen.add(claim.claim_id)
                     relevant.append((
                         claim.predicate.id, claim.subject.id, claim.object.id,
@@ -736,6 +952,8 @@ def _find_relevant_knowledge(db, files: list[str], terms: set[str]) -> list[tupl
             continue
         for c in claims:
             if c.claim_id in seen:
+                continue
+            if not _project_matches(c):
                 continue
             subj_lower = c.subject.id.lower()
             obj_lower = c.object.id.lower()
@@ -766,6 +984,14 @@ def _format_age(ts: int) -> str:
     return f"{age_days}d ago"
 
 
+def _brain_banner(title: str, body: str) -> str:
+    """Wrap hook output in a branded Attest Brain banner."""
+    header = f"🧠 Attest Brain  ›  {title}"
+    bar = "─" * len(header)
+    lines = [f"  {l}" for l in body.strip().split("\n")]
+    return f"{header}\n{bar}\n" + "\n".join(lines)
+
+
 def _log_hook_metric(hook: str, file: str, fired: bool, n_items: int, latency_ms: float) -> None:
     """Append a single metric line to the hook metrics JSONL log."""
     try:
@@ -787,8 +1013,132 @@ def _log_hook_metric(hook: str, file: str, fired: bool, n_items: int, latency_ms
 
 
 # ---------------------------------------------------------------------------
+# PreToolUse hook — warn about expensive document reads
+# ---------------------------------------------------------------------------
+
+_EXPENSIVE_EXTENSIONS = {
+    ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp", ".svg",
+}
+
+
+def pre_read_check() -> None:
+    """PreToolUse hook for Read: warn about expensive PDF/image formats.
+
+    Fast — only checks the file extension, no DB query needed.
+    """
+    try:
+        hook_input = json.loads(sys.stdin.read())
+    except (json.JSONDecodeError, ValueError):
+        return
+
+    file_path = hook_input.get("tool_input", {}).get("file_path", "")
+    if not file_path:
+        return
+
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext not in _EXPENSIVE_EXTENSIONS:
+        return  # Text/code files — no output, zero cost
+
+    _t0 = time.monotonic()
+    stem = file_path.rsplit(".", 1)[0]
+
+    basename = os.path.basename(file_path)
+    if ext == ".pdf":
+        body = (
+            f"{basename} will cost 5-20x more tokens as raw PDF.\n"
+            f"\n"
+            f"Run one of these first, then read the .md instead:\n"
+            f"  $ pandoc \"{file_path}\" -o \"{stem}.md\"\n"
+            f"  $ markitdown \"{file_path}\" > \"{stem}.md\"\n"
+            f"\n"
+            f"A 4,500-word PDF: ~50K tokens raw vs ~5K as markdown."
+        )
+        warning = _brain_banner("Token Warning", body)
+    else:
+        body = (
+            f"{basename} is expensive in context as a raw image.\n"
+            f"\n"
+            f"Options:\n"
+            f"  Ask me to describe what you need from it\n"
+            f"  Extract text with OCR first: tesseract \"{file_path}\" stdout"
+        )
+        warning = _brain_banner("Token Warning", body)
+
+    result = {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": warning,
+        }
+    }
+    print(json.dumps(result))
+    _log_hook_metric(
+        hook="pre_read_check",
+        file=file_path,
+        fired=True,
+        n_items=1,
+        latency_ms=(time.monotonic() - _t0) * 1000,
+    )
+
+
+# ---------------------------------------------------------------------------
 # PreToolUse hook — surface warnings before editing a file
 # ---------------------------------------------------------------------------
+
+def _check_session_sprawl() -> str | None:
+    """Check hook_metrics.jsonl for session sprawl. Returns warning or None."""
+    try:
+        if not HOOK_METRICS_LOG.exists():
+            return None
+
+        lines = HOOK_METRICS_LOG.read_text().strip().split("\n")[-100:]
+        now = time.time()
+
+        timestamps: list[float] = []
+        for line in lines:
+            try:
+                m = json.loads(line)
+                ts = _parse_metric_timestamp(m.get("timestamp", 0))
+                if ts > 0:
+                    timestamps.append(ts)
+            except (json.JSONDecodeError, KeyError):
+                continue
+
+        if len(timestamps) < 5:
+            return None
+
+        # Find session boundary: last gap > 30 min
+        session_start = timestamps[0]
+        for i in range(len(timestamps) - 1, 0, -1):
+            if timestamps[i] - timestamps[i - 1] > 1800:
+                session_start = timestamps[i]
+                break
+
+        session_events = sum(1 for ts in timestamps if ts >= session_start)
+        elapsed_min = (now - session_start) / 60
+
+        if session_events >= 80:
+            severity = "critical"
+        elif session_events >= 50:
+            severity = "high"
+        elif session_events >= 30:
+            severity = "moderate"
+        else:
+            return None
+
+        return (
+            f"~{session_events} tool calls  ·  {elapsed_min:.0f} min  ·  {severity}\n"
+            f"\n"
+            f"Every turn resends the full conversation history.\n"
+            f"Turn 5 costs ~2K tokens. Turn 30 costs ~40K+.\n"
+            f"\n"
+            f"Actions:\n"
+            f"  /clear               start fresh (fastest)\n"
+            f"  /compact             compress context in-place\n"
+            f"  prompt_kit_rescue    extract key decisions, then /clear"
+        )
+    except Exception:
+        return None
+
 
 def pre_edit_check() -> None:
     """PreToolUse hook: check knowledge graph for warnings about the file being edited.
@@ -854,15 +1204,20 @@ def pre_edit_check() -> None:
                         )
         _latency_ms = (time.monotonic() - _t0) * 1000
 
-        if warnings:
-            context = (
-                f"⚠ Attest knowledge for {basename}:\n"
-                + "\n".join(f"  - {w}" for w in warnings[:5])
-            )
+        # Check for session sprawl (cheap — reads metrics file, no DB)
+        sprawl_warning = _check_session_sprawl()
+
+        if warnings or sprawl_warning:
+            parts = []
+            if sprawl_warning:
+                parts.append(_brain_banner("Session Sprawl", sprawl_warning))
+            if warnings:
+                body = "\n".join(f"- {w}" for w in warnings[:5])
+                parts.append(_brain_banner(f"Known Issues: {basename}", body))
             result = {
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
-                    "additionalContext": context,
+                    "additionalContext": "\n".join(parts),
                 }
             }
             print(json.dumps(result))
@@ -871,8 +1226,8 @@ def pre_edit_check() -> None:
         _log_hook_metric(
             hook="pre_edit_check",
             file=file_path,
-            fired=len(warnings) > 0,
-            n_items=len(warnings),
+            fired=len(warnings) > 0 or sprawl_warning is not None,
+            n_items=len(warnings) + (1 if sprawl_warning else 0),
             latency_ms=_latency_ms,
         )
     finally:
@@ -1175,6 +1530,50 @@ def _auto_ingest_learnings(learnings: list[dict]) -> int:
         return 0
 
 
+def _count_session_events() -> dict:
+    """Count hook events in the current session for activity estimation."""
+    try:
+        if not HOOK_METRICS_LOG.exists():
+            return {}
+
+        lines = HOOK_METRICS_LOG.read_text().strip().split("\n")[-100:]
+        now = time.time()
+
+        timestamps: list[float] = []
+        by_hook: dict[str, int] = {}
+        for line in lines:
+            try:
+                m = json.loads(line)
+                ts = _parse_metric_timestamp(m.get("timestamp", 0))
+                if ts > 0:
+                    timestamps.append(ts)
+                    hook = m.get("hook", "unknown")
+                    by_hook[hook] = by_hook.get(hook, 0) + 1
+            except (json.JSONDecodeError, KeyError):
+                continue
+
+        if not timestamps:
+            return {}
+
+        # Find session boundary (last gap > 30 min)
+        session_start = timestamps[0]
+        for i in range(len(timestamps) - 1, 0, -1):
+            if timestamps[i] - timestamps[i - 1] > 1800:
+                session_start = timestamps[i]
+                break
+
+        session_events = sum(1 for ts in timestamps if ts >= session_start)
+        elapsed_min = (now - session_start) / 60
+
+        return {
+            "total": session_events,
+            "elapsed_min": round(elapsed_min, 1),
+            **{k: v for k, v in by_hook.items()},
+        }
+    except Exception:
+        return {}
+
+
 def _infer_session_outcome() -> str:
     """Infer session outcome from hook metrics.
 
@@ -1276,6 +1675,30 @@ def stop_session_summary() -> None:
         outcome = _infer_session_outcome()
         summary = _build_session_summary(learnings, changed_files, outcome)
 
+        # Count session activity from hook metrics
+        activity = _count_session_events()
+
+        # Auto-detect project for provenance tagging
+        project = None
+        try:
+            result = subprocess.run(
+                ["git", "remote", "get-url", "origin"],
+                capture_output=True, text=True, timeout=3, cwd=cwd,
+            )
+            if result.returncode == 0:
+                url = result.stdout.strip().rstrip("/")
+                if url.endswith(".git"):
+                    url = url[:-4]
+                if url.startswith("git@"):
+                    url = url[4:].replace(":", "/", 1)
+                elif url.startswith(("https://", "http://")):
+                    url = url.split("://", 1)[1]
+                project = url
+        except Exception:
+            pass
+        if not project:
+            project = os.path.basename(cwd)
+
         session_end_path = DEFAULT_MEMORY_DIR / "session_end.json"
         try:
             session_data = {
@@ -1285,6 +1708,8 @@ def stop_session_summary() -> None:
                 "files_changed": changed_files[:20],
                 "learnings_count": n_auto,
                 "cwd": cwd,
+                "activity_estimate": activity,
+                "project": project,
             }
             with open(session_end_path, "w") as f:
                 json.dump(session_data, f)
@@ -1292,6 +1717,9 @@ def stop_session_summary() -> None:
             pass
 
         _latency_ms = (time.monotonic() - _t0) * 1000
+
+        # Print visible session summary
+        _print_session_summary(activity, outcome, changed_files, n_auto)
 
         _log_hook_metric(
             hook="stop",
@@ -1302,6 +1730,40 @@ def stop_session_summary() -> None:
         )
     except Exception:
         pass  # Never fail — this is a lightweight signal
+
+
+def _print_session_summary(
+    activity: dict, outcome: str, changed_files: list[str], n_auto: int,
+) -> None:
+    """Print a visible session activity summary via Stop hook output."""
+    try:
+        total = activity.get("total", 0)
+        elapsed = activity.get("elapsed_min", 0)
+        edits = activity.get("pre_edit_check", 0)
+        pdf_reads = activity.get("pre_read_check", 0)
+
+        if total < 3:
+            return  # Too short to summarize
+
+        parts = [f"{outcome}"]
+        parts.append(f"{total} tool calls in {elapsed:.0f} min")
+        if changed_files:
+            parts.append(f"{len(changed_files)} files changed")
+        if edits:
+            parts.append(f"{edits} edits")
+        if pdf_reads:
+            parts.append(f"{pdf_reads} PDF/image reads")
+        if n_auto:
+            parts.append(f"{n_auto} patterns auto-extracted")
+
+        if total >= 50:
+            parts.append("consider shorter sessions")
+
+        reason = f"🧠 Attest Brain  ›  {' · '.join(parts)}"
+
+        print(json.dumps({"stopReason": reason}))
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1738,6 +2200,9 @@ def main():
     # pre-edit-check (used by PreToolUse hooks)
     sub.add_parser("pre-edit-check", help="Check knowledge graph before file edits (PreToolUse hook)")
 
+    # pre-read-check (used by PreToolUse hooks for Read)
+    sub.add_parser("pre-read-check", help="Warn about expensive PDF/image reads (PreToolUse hook)")
+
     # post-test-check (used by PostToolUse hooks)
     sub.add_parser("post-test-check", help="Surface prior fixes on test failure (PostToolUse hook)")
 
@@ -1763,7 +2228,7 @@ def main():
     # This preserves backward compat for: attest-mcp, attest-mcp --transport stdio, etc.
     raw_args = sys.argv[1:]
     mcp_flags = {"--transport", "--host", "--port", "--db", "stdio", "sse", "streamable-http"}
-    subcommands = {"install", "recall", "uninstall", "pre-edit-check", "post-test-check", "stop", "metrics", "benchmark"}
+    subcommands = {"install", "recall", "uninstall", "pre-edit-check", "pre-read-check", "post-test-check", "stop", "metrics", "benchmark"}
     if not raw_args or (raw_args[0] not in subcommands and raw_args[0] != "-h" and raw_args[0] != "--help"):
         from attestdb.mcp_server import main as mcp_main
         mcp_main()
@@ -1788,6 +2253,9 @@ def main():
 
     elif args.command == "pre-edit-check":
         pre_edit_check()
+
+    elif args.command == "pre-read-check":
+        pre_read_check()
 
     elif args.command == "post-test-check":
         post_test_check()

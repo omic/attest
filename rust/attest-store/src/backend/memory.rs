@@ -690,6 +690,20 @@ impl MemoryBackend {
             .collect()
     }
 
+    pub fn claims_by_project(&self, project: &str) -> Vec<Claim> {
+        self.claims
+            .all_claims()
+            .iter()
+            .filter(|c| {
+                c.provenance.project.as_deref() == Some(project)
+                    && self.should_include_claim(&c.claim_id)
+                    && self.should_include_namespace(&c.namespace)
+            })
+            .cloned()
+            .map(|mut c| { Self::apply_status_overlay(&self.status_overrides, &mut c); c })
+            .collect()
+    }
+
     pub fn claims_for(
         &mut self,
         entity_id: &str,
