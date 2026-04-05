@@ -674,6 +674,15 @@ class BulkLoader:
             len(withheld),
         )
 
+        # Predicate → predicate_type mapping for Hetionet
+        _HETIO_PRED_TYPE = {
+            "upregulates": "causes", "downregulates": "causes",
+            "treats": "causes", "palliates": "causes",
+            "regulates": "causes",
+            "binds": "directional", "localizes": "directional",
+            "expresses": "directional",
+        }
+
         # Build entities dict and claim_rows for fast Rust batch insert
         entities: dict[str, tuple[str, str, str]] = {}
         claim_rows: list[tuple] = []
@@ -692,10 +701,11 @@ class BulkLoader:
             claim_id = compute_claim_id(subj_canonical, pred, obj_canonical, source_id, "database_import", timestamp)
             content_id = compute_content_id(subj_canonical, pred, obj_canonical)
             confidence = tier1_confidence("database_import")
+            pred_type = _HETIO_PRED_TYPE.get(pred, "relates_to")
 
             claim_rows.append((
                 subj_canonical, obj_canonical, claim_id, content_id,
-                pred, "relates_to", confidence,
+                pred, pred_type, confidence,
                 "database_import", source_id, "", "[]", "", "", "",
                 timestamp, "active",
             ))
@@ -3820,7 +3830,7 @@ class BulkLoader:
             )
             return None
 
-    def load_semmeddb(self, path: str) -> BatchResult:
+    def load_semmeddb(self, path: str, max_rows: int = 0) -> BatchResult:
         """Load SemMedDB predications from CSV.
 
         PREDICATION CSV columns (pipe-delimited or comma-delimited):
@@ -3830,6 +3840,7 @@ class BulkLoader:
 
         130M+ predications, UMLS CUIs, 30 predicate types.
         Filters: skip NEG_ prefixed predicates, skip non-biomedical semantic types.
+        When max_rows > 0, stops after ingesting that many rows.
         """
         t0 = time.time()
         timestamp = int(t0)
@@ -3912,6 +3923,14 @@ class BulkLoader:
                 if obj_canonical not in entities:
                     entities[obj_canonical] = (obj_type, object_name or obj_eid, "{}")
 
+                # Map predicate to predicate_type
+                _SEMMED_CAUSAL = {
+                    "causes", "treats", "prevents", "predisposes",
+                    "activates", "inhibits", "upregulates",
+                    "downregulates", "regulates",
+                }
+                pred_type = "causes" if predicate in _SEMMED_CAUSAL else "relates_to"
+
                 source_id = f"semmeddb:{pmid}" if pmid else "semmeddb"
                 content_id = compute_content_id(subj_canonical, predicate, obj_canonical)
                 claim_id = compute_claim_id(
@@ -3921,12 +3940,15 @@ class BulkLoader:
 
                 claim_rows.append((
                     subj_canonical, obj_canonical, claim_id, content_id,
-                    predicate, "relation", 0.65,
+                    predicate, pred_type, 0.65,
                     "literature_extraction", source_id,
                     "", "[]", "", "", "", timestamp, "active",
                 ))
 
                 processed += 1
+
+                if max_rows > 0 and processed >= max_rows:
+                    break
 
                 # Flush every 5M rows to keep memory bounded
                 if processed % 5_000_000 == 0:
@@ -6007,6 +6029,34 @@ class BulkLoader:
 
     def load_federal_register_rules(self, *args, **kwargs):
         from attestdb.infrastructure.bulk_loaders_finreg import load_federal_register_rules as _fn
+        return _fn(self._pipeline, *args, **kwargs)
+
+    def load_cisa_kev(self, *args, **kwargs):
+        from attestdb.infrastructure.bulk_loaders_cybersec import load_cisa_kev as _fn
+        return _fn(self._pipeline, *args, **kwargs)
+
+    def load_mitre_attack(self, *args, **kwargs):
+        from attestdb.infrastructure.bulk_loaders_cybersec import load_mitre_attack as _fn
+        return _fn(self._pipeline, *args, **kwargs)
+
+    def load_company_tickers(self, *args, **kwargs):
+        from attestdb.infrastructure.bulk_loaders_corpgov import load_company_tickers as _fn
+        return _fn(self._pipeline, *args, **kwargs)
+
+    def load_insider_transactions(self, *args, **kwargs):
+        from attestdb.infrastructure.bulk_loaders_corpgov import load_insider_transactions as _fn
+        return _fn(self._pipeline, *args, **kwargs)
+
+    def load_openalex_works(self, *args, **kwargs):
+        from attestdb.infrastructure.bulk_loaders_scilit import load_openalex_works as _fn
+        return _fn(self._pipeline, *args, **kwargs)
+
+    def load_pypi_packages(self, *args, **kwargs):
+        from attestdb.infrastructure.bulk_loaders_supplychain import load_pypi_packages as _fn
+        return _fn(self._pipeline, *args, **kwargs)
+
+    def load_osv_vulns(self, *args, **kwargs):
+        from attestdb.infrastructure.bulk_loaders_supplychain import load_osv_vulns as _fn
         return _fn(self._pipeline, *args, **kwargs)
 
     def load_all(

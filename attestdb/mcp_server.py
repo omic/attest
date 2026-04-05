@@ -1027,6 +1027,76 @@ def attest_stale(days: int = 90) -> str:
 
 
 @mcp.tool()
+def system_pulse() -> str:
+    """Heartbeat status: cycle stats, tier distribution, task backlog."""
+    db = _get_db()
+    if not db._heartbeat:
+        return json.dumps({"running": False, "error": "Heartbeat not enabled. Call db.enable_heartbeat()."})
+    from attestdb.intelligence.proactive_mcp_tools import system_pulse as _pulse
+    return _pulse(db._heartbeat)
+
+
+@mcp.tool()
+def entity_health(entity_id: str) -> str:
+    """Freshness, tier distribution, composite status, and gap analysis for an entity."""
+    db = _get_db()
+    if not db._heartbeat:
+        return json.dumps({"error": "Heartbeat not enabled"})
+    from attestdb.intelligence.proactive_mcp_tools import entity_health as _health
+    return _health(db._heartbeat, entity_id)
+
+
+@mcp.tool()
+def stale_entities(top_n: int = 20) -> str:
+    """Entities most in need of data refresh, ranked by importance x staleness."""
+    db = _get_db()
+    if not db._heartbeat:
+        return json.dumps({"error": "Heartbeat not enabled"})
+    from attestdb.intelligence.proactive_mcp_tools import stale_entities as _stale
+    return _stale(db._heartbeat, top_n)
+
+
+@mcp.tool()
+def predicted_queries(hours: int = 24) -> str:
+    """Queries the system predicts will be asked in the next N hours."""
+    db = _get_db()
+    if not db._heartbeat:
+        return json.dumps({"error": "Heartbeat not enabled"})
+    from attestdb.intelligence.proactive_mcp_tools import predicted_queries as _pq
+    return _pq(db._heartbeat, hours)
+
+
+@mcp.tool()
+def composite_status(entity_id: str) -> str:
+    """Which composites exist for an entity, their versions and staleness."""
+    db = _get_db()
+    if not db._heartbeat:
+        return json.dumps({"error": "Heartbeat not enabled"})
+    from attestdb.intelligence.proactive_mcp_tools import composite_status as _cs
+    return _cs(db._heartbeat, entity_id)
+
+
+@mcp.tool()
+def trigger_synthesis(entity_id: str, composite_type: str = "entity_brief") -> str:
+    """Manually trigger composite synthesis for an entity."""
+    db = _get_db()
+    if not db._heartbeat:
+        return json.dumps({"error": "Heartbeat not enabled"})
+    from attestdb.intelligence.proactive_mcp_tools import trigger_synthesis as _ts
+    return _ts(db._heartbeat, entity_id, composite_type)
+
+
+@mcp.tool()
+def knowledge_gaps(top_n: int = 10) -> str:
+    """Biggest coverage gaps in the claim graph."""
+    db = _get_db()
+    if not db._heartbeat:
+        return json.dumps({"error": "Heartbeat not enabled"})
+    from attestdb.intelligence.proactive_mcp_tools import knowledge_gaps as _kg
+    return _kg(db._heartbeat, top_n)
+
+
+@mcp.tool()
 def attest_audit(claim_id: str) -> str:
     """Full provenance audit for a claim: corroborations, chain, dependents."""
     db = _get_db()

@@ -151,8 +151,8 @@ def load_courtlistener_citations(
             source_type = "human_annotation"
 
             # Compute IDs
-            pred_id = "associated_with"
-            pred_type = "relates_to"
+            pred_id = "cites"
+            pred_type = "directional"
             claim_id = compute_claim_id(
                 citing_eid, pred_id, cited_eid,
                 source_id, source_type, timestamp,
@@ -271,7 +271,7 @@ def load_us_code_sections(
                     content_id = compute_content_id(statute_eid, pred_id, amend_eid)
                     claim_rows.append((
                         statute_eid, amend_eid,
-                        claim_id, content_id, pred_id, "relates_to",
+                        claim_id, content_id, pred_id, "directional",
                         confidence,
                         source_type, source_id,
                         "", "[]", "", "", "", timestamp, "active",
@@ -391,7 +391,7 @@ def load_federal_register_legal(
                     content_id = compute_content_id(reg_eid, pred_id, cfr_eid)
                     claim_rows.append((
                         reg_eid, cfr_eid,
-                        claim_id, content_id, pred_id, "relates_to",
+                        claim_id, content_id, pred_id, "directional",
                         confidence,
                         source_type, source_id,
                         "", "[]", "", "", "", timestamp, "active",
@@ -545,7 +545,7 @@ def load_harvard_cap(
                         content_id = compute_content_id(case_eid, pred_id, target_eid)
                         claim_rows.append((
                             case_eid, target_eid,
-                            claim_id, content_id, pred_id, "relates_to",
+                            claim_id, content_id, pred_id, "directional",
                             confidence,
                             source_type, source_id,
                             "", "[]", "", "", "", timestamp, "active",
@@ -573,7 +573,7 @@ def load_harvard_cap(
                         content_id = compute_content_id(case_eid, pred_id, statute_eid)
                         claim_rows.append((
                             case_eid, statute_eid,
-                            claim_id, content_id, pred_id, "relates_to",
+                            claim_id, content_id, pred_id, "directional",
                             confidence,
                             source_type, source_id,
                             "", "[]", "", "", "", timestamp, "active",

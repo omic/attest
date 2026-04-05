@@ -336,12 +336,14 @@ CAUSAL_PREDICATES: set[str] = {
     "regulates",  # non-directional but still indicates regulatory relationship
 }
 
-# Predicate type values (PredicateRef.predicate_type) that indicate causal semantics.
-# Claims with these predicate_types are treated as causal edges even if their
-# predicate ID is not in CAUSAL_PREDICATES. This enables domain-agnostic causal
-# prediction — e.g. cybersec "uses" or pharma "has_adverse_event" predicates
-# work when the bulk loader sets predicate_type="causes".
-CAUSAL_PREDICATE_TYPES: set[str] = {"causes"}
+# Predicate type values (PredicateRef.predicate_type) that indicate composable
+# directed semantics.  Claims with these predicate_types are treated as
+# traversable edges by predict() / what_if() even when the predicate ID is not
+# in CAUSAL_PREDICATES.
+#   "causes"      — biomed / pharma causal edges (drug → adverse_event)
+#   "directional" — non-causal directed edges that compose transitively
+#                   (legal: cites / interprets / implements)
+CAUSAL_PREDICATE_TYPES: set[str] = {"causes", "directional"}
 
 # Predicate equivalence — semantically close predicates that should match
 # when comparing predictions against expected outcomes.

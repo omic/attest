@@ -169,10 +169,13 @@ def cmd_discover(args):
         )
         schema_maps.append(sm)
 
-        # Save individual schema map
-        out_path = f"{source_id}_schema.json"
-        sm.save(out_path)
-        print(f"  Saved to {out_path}")
+        # Save individual schema map (skip in dry-run)
+        if not getattr(args, "dry_run", False):
+            out_path = f"{source_id}_schema.json"
+            sm.save(out_path)
+            print(f"  Saved to {out_path}")
+        else:
+            print(f"  [dry-run] Would save schema to {source_id}_schema.json")
 
     if len(schema_maps) < 2:
         print("\nNeed at least 2 sources for cross-source alignment.")
@@ -180,15 +183,40 @@ def cmd_discover(args):
             print(f"\n{sm.to_review_report()}")
         return
 
+    # Set up calibration if not dry-run
+    import tempfile
+    dry_run = getattr(args, "dry_run", False)
+    prediction_log = None
+    threshold_engine = None
+
+    if not dry_run:
+        cal_dir = tempfile.mkdtemp(prefix="attest_cal_")
+        try:
+            from attestdb.calibration.prediction_log import PredictionLog
+            from attestdb.calibration.threshold_engine import ThresholdEngine
+            prediction_log = PredictionLog(os.path.join(cal_dir, "predictions.db"), tenant_id=tenant_id)
+            threshold_engine = ThresholdEngine(os.path.join(cal_dir, "thresholds.db"), tenant_id=tenant_id)
+        except Exception as exc:
+            print(f"  Warning: calibration unavailable ({exc})")
+
     # Cross-source alignment
     print("\n--- Cross-Source Alignment ---")
-    unified = align_schemas(schema_maps, tenant_id=tenant_id)
+    unified = align_schemas(
+        schema_maps,
+        prediction_log=prediction_log,
+        threshold_engine=threshold_engine,
+        tenant_id=tenant_id,
+    )
     print(unified.to_report())
 
     # Generate claim templates
     print("\n--- Claim Templates ---")
     templates = generate_claim_templates(unified, schema_maps, tenant_id=tenant_id)
     print(templates_to_report(templates))
+
+    if dry_run:
+        print("\n[dry-run] No files written.")
+        return
 
     # Output as JSON if requested
     if args.output:
@@ -211,8 +239,16 @@ def cmd_discover(args):
         print(f"\nReview package saved to {args.output}")
 
     if args.auto_approve:
-        approved = sum(1 for t in templates if t.confidence >= 0.90)
-        print(f"\n--auto-approve: {approved}/{len(templates)} templates above 0.90 confidence")
+        auto_thresh = 0.90
+        if threshold_engine is not None:
+            try:
+                tc = threshold_engine.get_thresholds(decision_type="field_alignment")
+                auto_thresh = tc.auto_approve_threshold
+            except Exception:
+                pass
+        approved = sum(1 for g in unified.aligned_fields if g.alignment_confidence >= auto_thresh)
+        total = len(unified.aligned_fields)
+        print(f"\n--auto-approve: {approved}/{total} alignments above {auto_thresh:.2f} confidence")
 
 
 def cmd_schema(args):

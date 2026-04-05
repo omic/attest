@@ -621,6 +621,10 @@ class AttestDB:
         # Autodidact daemon (lazy-init)
         self._autodidact: "AutodidactDaemon | None" = None
 
+        # Proactive intelligence heartbeat (lazy-init)
+        self._heartbeat = None
+        self._proactive_hooks = None
+
         # Federation daemon (lazy-init)
         self._federation = None
 
@@ -1003,6 +1007,8 @@ class AttestDB:
         """Close the database and persist indexes."""
         with _span("attestdb.close"):
             try:
+                if getattr(self, "_heartbeat", None):
+                    self.disable_heartbeat()
                 if self._autodidact:
                     self._autodidact.stop()
                     self._autodidact = None
@@ -1682,6 +1688,90 @@ class AttestDB:
         history = self._autodidact.history
         return list(reversed(history[-limit:]))
 
+    # --- Proactive Intelligence Heartbeat ---
+
+    def enable_heartbeat(
+        self,
+        cycle_interval: float = 30.0,
+        hot_threshold: float = 0.65,
+        decay_half_life_hours: float = 336.0,
+        composite_synthesis_budget: float = 10.0,
+        max_consolidation_batch: int = 64,
+        working_memory_max_claims: int = 512,
+    ) -> dict:
+        """Start the proactive intelligence heartbeat.
+
+        The heartbeat runs a background Perceive->Plan->Act cycle that
+        maintains claim lifecycle (decay, tiers), synthesizes composites,
+        consolidates near-duplicates, detects gaps, and tracks access.
+
+        Args:
+            cycle_interval: Seconds between cycles (default 30).
+            hot_threshold: Decay score threshold for hot tier (default 0.65).
+            decay_half_life_hours: Default half-life for decay (default 336 = 2 weeks).
+            composite_synthesis_budget: Max seconds per cycle on synthesis.
+            max_consolidation_batch: Claims per consolidation batch.
+            working_memory_max_claims: Max claims in hot tier.
+
+        Returns:
+            Status dict with running state.
+        """
+        from attestdb.intelligence.heartbeat import HeartbeatConfig, HeartbeatScheduler
+        from attestdb.intelligence.proactive_hooks import ProactiveHooks
+
+        if self._heartbeat:
+            self._heartbeat.stop()
+        if self._proactive_hooks:
+            self._proactive_hooks.uninstall()
+
+        config = HeartbeatConfig(
+            cycle_interval_seconds=cycle_interval,
+            hot_threshold=hot_threshold,
+            decay_half_life_hours=decay_half_life_hours,
+            composite_synthesis_budget_seconds=composite_synthesis_budget,
+            max_consolidation_batch=max_consolidation_batch,
+            working_memory_max_claims=working_memory_max_claims,
+        )
+
+        self._heartbeat = HeartbeatScheduler(self, config=config)
+        self._heartbeat.start()
+
+        self._proactive_hooks = ProactiveHooks(self, self._heartbeat)
+        self._proactive_hooks.install()
+
+        status = self._heartbeat.get_status()
+        return {"running": status.running, "cycle_interval": cycle_interval}
+
+    def disable_heartbeat(self) -> None:
+        """Stop the proactive intelligence heartbeat."""
+        if self._proactive_hooks:
+            self._proactive_hooks.uninstall()
+            self._proactive_hooks = None
+        if self._heartbeat:
+            self._heartbeat.stop()
+            self._heartbeat = None
+
+    def heartbeat_status(self) -> dict:
+        """Return current heartbeat status."""
+        if not self._heartbeat:
+            return {"running": False, "cycle_count": 0}
+        status = self._heartbeat.get_status()
+        return {
+            "running": status.running,
+            "cycle_count": status.cycle_count,
+            "last_cycle_at": status.last_cycle_at,
+            "last_cycle_duration_ms": round(status.last_cycle_duration_ms, 1),
+            "tier_distribution": status.tier_distribution,
+            "tracked_claims": status.tracked_claims,
+            "hot_claims": status.hot_claims,
+            "stale_composites": status.stale_composites,
+        }
+
+    def heartbeat_run_now(self) -> None:
+        """Trigger an immediate heartbeat cycle."""
+        if self._heartbeat:
+            self._heartbeat.run_now()
+
     # --- Federation ---
 
     def enable_federation(
@@ -2060,6 +2150,12 @@ class AttestDB:
                 frame.narrative = generate_narrative(frame)
             except ImportError:
                 pass  # narrative generation requires attestdb-intelligence
+        # Proactive intelligence: record access and attach freshness warnings
+        if getattr(self, "_proactive_hooks", None):
+            try:
+                self._proactive_hooks.post_query(focal_entity, frame)
+            except Exception:
+                pass  # hooks must never break queries
         return frame
 
     def _get_topic_membership(self, entity_id: str) -> list[str]:
