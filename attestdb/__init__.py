@@ -76,6 +76,12 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "ConsensusEngine": ("attestdb.core.consensus", "ConsensusEngine"),
     "MultiChat": ("attestdb.core.chat", "MultiChat"),
     "BrowserChat": ("attestdb.core.browser_chat", "BrowserChat"),
+    # Connectors (open source — 20 connectors)
+    "Connector": ("attestdb.connectors.base", "Connector"),
+    "ConnectorResult": ("attestdb.connectors.base", "ConnectorResult"),
+    "connect": ("attestdb.connectors", "connect"),
+    # Heuristic extractor (open source — no LLM dependencies)
+    "HeuristicExtractor": ("attestdb.intelligence.heuristic_extractor", "HeuristicExtractor"),
 }
 
 # Backward-compat alias
@@ -87,16 +93,12 @@ _ENTERPRISE_IMPORTS: dict[str, tuple[str, str]] = {
     "CuratorV1": ("attestdb.intelligence.curator", "CuratorV1"),
     "TextExtractor": ("attestdb.intelligence.text_extractor", "TextExtractor"),
     "ChatIngestor": ("attestdb.intelligence.chat_ingestor", "ChatIngestor"),
-    "HeuristicExtractor": ("attestdb.intelligence.heuristic_extractor", "HeuristicExtractor"),
     "SlackExportReader": ("attestdb.intelligence.slack_connector", "SlackExportReader"),
     "NoveltyChecker": ("attestdb.intelligence.novelty", "NoveltyChecker"),
     "ClaimMerger": ("attestdb.intelligence.novelty", "ClaimMerger"),
     "SmartExtractor": ("attestdb.intelligence.smart_extractor", "SmartExtractor"),
     "InsightEngineV1": ("attestdb.intelligence.insight_engine", "InsightEngineV1"),
     "OmicPipeline": ("attestdb.intelligence.omic_pipeline", "OmicPipeline"),
-    # Connectors (closed source)
-    "Connector": ("attestdb.connectors.base", "Connector"),
-    "ConnectorResult": ("attestdb.connectors.base", "ConnectorResult"),
     # Vocabularies (closed source)
     "register_bio_vocabulary": ("attestdb.intelligence.bio_vocabulary", "register_bio_vocabulary"),
     "register_devops_vocabulary": (

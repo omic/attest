@@ -27,6 +27,11 @@ attestdb/
   core/           -- Types, normalization (locked), hashing (locked), confidence, vocabulary
   infrastructure/ -- ingestion, query_engine, embedding_index,
                     bulk_loader, attest_db, snapshot, migration
+  connectors/     -- 20 data connectors (Slack, GitHub, Postgres, etc.)
+  extraction/     -- Claim extraction pipeline
+  discovery/      -- Drift detection, schema versioning, auto-discovery
+  resolution/     -- Entity matching and deduplication
+  intelligence/   -- HeuristicExtractor (rule-based, no LLM)
 rust/
   Cargo.toml      -- Workspace manifest
   attest-core/    -- Locked invariants in Rust (normalization, hashing, types, errors, confidence, vocabulary)
@@ -73,6 +78,12 @@ pip install rust/target/wheels/attest_py-*.whl --force-reinstall
 
 **No filler tests.** Every test must verify real behavior -- parsing real data, claims landing in a real DB, actual error paths. Never mock the thing you're testing. Mock only external boundaries (LLM API calls, HTTP requests to third-party services).
 
+## Connectors (20 Open Source)
+
+20 connectors are included: Slack, Gmail, GitHub, Linear, PagerDuty, Notion, GDocs, Google Sheets, GDrive, Airtable, HubSpot, PostgreSQL, MySQL, MSSQL, SQLite, MongoDB, Elasticsearch, S3, CSV, HTTP.
+
+Enterprise connectors (Salesforce, Jira, Confluence, Teams, ServiceNow, Zendesk, SharePoint, Box, Zoho, DSI) are available in `attestdb-enterprise`.
+
 ## Intelligence Layer (Enterprise)
 
-LLM-powered features (curator, text extraction, chat ingestion, connectors, insight engine, vocabularies) are available separately in `attestdb-enterprise`. Methods on `AttestDB` that require intelligence (e.g. `configure_curator()`, `ingest_chat()`, `ingest_text()`, `connect()`) will raise `ImportError` with installation instructions if the enterprise package is not installed.
+LLM-powered features (curator, text extraction, chat ingestion, insight engine, vocabularies) are available separately in `attestdb-enterprise`. The `HeuristicExtractor` (rule-based extraction, no LLM) is included in the open-source package.

@@ -146,7 +146,7 @@ class IngestionPipeline:
         subj_type = claim_input.subject[1]
         obj_type = claim_input.object[1]
         pred_id = claim_input.predicate[0]
-        pred_type = claim_input.predicate[1]
+        pred_type = claim_input.predicate[1] or "relates_to"
 
         # Normalize predicate to controlled vocabulary
         from attestdb.core.vocabulary import normalize_predicate
@@ -390,7 +390,11 @@ class IngestionPipeline:
             claim.object.id, claim.object.entity_type,
             claim.object.display_name, claim.object.external_ids, claim.timestamp,
         )
-        self._store.insert_claim(claim)
+        if not self._store.insert_claim(claim):
+            raise RuntimeError(
+                f"Claim {claim.claim_id} rejected by storage engine — "
+                f"possible LMDB write failure (check map_size, disk space)"
+            )
 
         # Keep resolver index current with new external_ids
         if self._resolver is not None:

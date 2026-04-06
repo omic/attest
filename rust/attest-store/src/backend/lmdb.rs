@@ -827,9 +827,16 @@ impl LmdbBackend {
 
         // Stats counters and analytics — skip in bulk load mode
         if !self.bulk_load_mode {
-            Self::increment_counter(wtxn, &self.dbs.pred_type_counts, &claim.predicate.predicate_type)?;
-            Self::increment_counter(wtxn, &self.dbs.pred_id_counts, &claim.predicate.id)?;
-            Self::increment_counter(wtxn, &self.dbs.src_type_counts, &claim.provenance.source_type)?;
+            // Skip empty keys — LMDB doesn't allow zero-length keys
+            if !claim.predicate.predicate_type.is_empty() {
+                Self::increment_counter(wtxn, &self.dbs.pred_type_counts, &claim.predicate.predicate_type)?;
+            }
+            if !claim.predicate.id.is_empty() {
+                Self::increment_counter(wtxn, &self.dbs.pred_id_counts, &claim.predicate.id)?;
+            }
+            if !claim.provenance.source_type.is_empty() {
+                Self::increment_counter(wtxn, &self.dbs.src_type_counts, &claim.provenance.source_type)?;
+            }
 
             // Claim summary (lightweight projection for analytics)
             let summary = ClaimSummary::from(claim);

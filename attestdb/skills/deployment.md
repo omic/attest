@@ -1,5 +1,7 @@
 # Deployment and Publishing
 
+For server IPs, credentials, Stripe product IDs, DNS records, and deploy commands, see `docs/OPS_REFERENCE.md`.
+
 ## PyPI Publishing
 
 **Package name:** `attest_py` (underscore). PyPI normalizes hyphens to underscores. The trusted publisher must be registered as `attest_py`, not `attest-py`. Workflow name, owner, repo, and environment must all match exactly.
@@ -39,4 +41,4 @@ Flat-rate tier prices are separate from metered prices — each plan needs both.
 
 ## Security Groups
 
-Two separate SGs — don't mix them up. The static website and the API instance use different security groups. SSH whitelist must target the correct SG for whichever server you're accessing. Check CLAUDE.md for the actual SG IDs.
+Two separate SGs — don't mix them up. The static website and the API instance use different security groups. SSH whitelist must target the correct SG for whichever server you're accessing. Check `docs/OPS_REFERENCE.md` for the actual SG IDs.
