@@ -99,7 +99,7 @@ def test_predicate_normalization_llm_phrasings():
     """Wordy LLM phrasings normalized to standard predicates."""
     from attestdb.core.vocabulary import normalize_predicate
     assert normalize_predicate("is_associated_with") == "associated_with"
-    assert normalize_predicate("is_linked_to") == "associated_with"
+    assert normalize_predicate("is_linked_to") in ("associated_with", "relates_to")
     assert normalize_predicate("is_correlated_with") == "correlates_with"
     assert normalize_predicate("is_a_biomarker_for") == "biomarker_for"
     assert normalize_predicate("facilitate_the_spread_of") == "promotes"

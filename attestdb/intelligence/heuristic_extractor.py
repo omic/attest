@@ -18,7 +18,7 @@ import re
 
 from attestdb.core.normalization import normalize_entity_id
 from attestdb.core.types import ClaimInput
-from attestdb.intelligence.text_extractor import ExtractedClaim, ExtractionResult
+from attestdb.intelligence.extraction_types import ExtractedClaim, ExtractionResult
 
 logger = logging.getLogger(__name__)
 

@@ -73,9 +73,9 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "ProviderResponse": ("attestdb.core.types", "ProviderResponse"),
     "AgentConsensusResult": ("attestdb.core.types", "AgentConsensusResult"),
     # Consensus engine + chat
-    "ConsensusEngine": ("attestdb.core.consensus", "ConsensusEngine"),
-    "MultiChat": ("attestdb.core.chat", "MultiChat"),
-    "BrowserChat": ("attestdb.core.browser_chat", "BrowserChat"),
+    "ConsensusEngine": ("attestdb.intelligence.consensus", "ConsensusEngine"),
+    "MultiChat": ("attestdb.intelligence.chat", "MultiChat"),
+    "BrowserChat": ("attestdb.intelligence.browser_chat", "BrowserChat"),
     # Connectors (open source — 20 connectors)
     "Connector": ("attestdb.connectors.base", "Connector"),
     "ConnectorResult": ("attestdb.connectors.base", "ConnectorResult"),

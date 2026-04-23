@@ -1,4 +1,9 @@
-"""Entity Resolution Engine — cross-source entity matching, unified index, and change detection."""
+"""Entity Resolution Engine — cross-source entity matching, unified index, and change detection.
+
+The LLM-assisted matcher ``AIMatcher`` lives at
+``attestdb.intelligence.ai_matcher`` and is not re-exported here to
+keep this package free of LLM SDK dependencies.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +11,6 @@ from attestdb.resolution.change_detector import ChangeSet, SyncManager, detect_c
 from attestdb.resolution.entity_index import EntityIndex, UnifiedEntity
 from attestdb.resolution.ingestion_hook import IngestionHook
 from attestdb.resolution.matcher import (
-    AIMatcher,
     DomainMatcher,
     EntityMatcher,
     ExactMatcher,
@@ -16,7 +20,6 @@ from attestdb.resolution.matcher import (
 from attestdb.resolution.materialized_views import MaterializedViewManager
 
 __all__ = [
-    "AIMatcher",
     "ChangeSet",
     "DomainMatcher",
     "EntityIndex",

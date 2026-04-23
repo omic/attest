@@ -211,45 +211,19 @@ Use your best judgment for fields that don't fit neatly. Be specific \
 
 
 def _get_llm_client() -> tuple[object | None, str]:
-    """Walk the extraction fallback chain and return the first available client.
+    """Get an LLM client from the intelligence layer, if installed.
 
-    Returns (client, model_name) or (None, "") if no provider is available.
+    Delegates to ``attestdb.intelligence.llm_client.get_llm_client`` so
+    the actual ``openai`` SDK dependency lives on the enterprise side of
+    the directory boundary. OSS installs without ``attestdb.intelligence``
+    fall back to the heuristic classification path.
     """
-    for provider_name in EXTRACTION_FALLBACK_CHAIN:
-        provider = PROVIDERS.get(provider_name)
-        if not provider:
-            continue
-
-        api_key = os.environ.get(provider["env_key"])
-        if not api_key:
-            # Try .env file
-            env_vars = _load_env_file(".env")
-            api_key = env_vars.get(provider["env_key"])
-
-        if not api_key:
-            continue
-
-        try:
-            from openai import OpenAI
-
-            client = OpenAI(
-                api_key=api_key,
-                base_url=provider["base_url"],
-            )
-            model = provider["default_model"]
-            logger.info(
-                "Schema analyzer using provider=%s, model=%s", provider_name, model
-            )
-            return client, model
-        except ImportError:
-            logger.debug("openai package not installed")
-            return None, ""
-        except Exception as exc:
-            logger.warning("Failed to init %s client: %s", provider_name, exc)
-            continue
-
-    logger.info("No LLM provider available; using heuristic classification")
-    return None, ""
+    try:
+        from attestdb.intelligence.llm_client import get_llm_client
+    except ImportError:
+        logger.info("attestdb.intelligence not installed; using heuristic classification")
+        return None, ""
+    return get_llm_client()
 
 
 def _infer_with_llm(

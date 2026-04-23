@@ -19,7 +19,7 @@ import logging
 import time
 from typing import Iterator
 
-from attestdb.connectors.base import TextConnector
+from attestdb.connectors.base import HybridConnector
 
 try:
     import requests
@@ -34,8 +34,13 @@ GMAIL_API = "https://gmail.googleapis.com/gmail/v1"
 _MAX_BODY_BYTES = 25 * 1024 * 1024
 
 
-class GmailConnector(TextConnector):
-    """Sync connector that ingests Gmail threads via text extraction."""
+class GmailConnector(HybridConnector):
+    """Sync connector that ingests Gmail threads as structural + text claims.
+
+    Structural pass: extracts sender/recipient relationships with email
+    addresses as external_ids for cross-connector entity resolution.
+    Text pass: extracts knowledge claims from email body text.
+    """
 
     name = "gmail"
 
@@ -54,13 +59,17 @@ class GmailConnector(TextConnector):
         self.max_results = max_results
         self._session = requests.Session()
         self._session.headers["Authorization"] = f"Bearer {access_token}"
+        self._thread_cache: list[dict] = []
 
     # ------------------------------------------------------------------
-    # TextConnector contract
+    # HybridConnector contract
     # ------------------------------------------------------------------
 
-    def fetch_texts(self) -> Iterator[tuple[str, str]]:
-        """Yield ``(source_id, text)`` for each Gmail thread."""
+    def fetch(self) -> Iterator[dict]:
+        """Yield structural claims from email headers (sender, recipients)."""
+        import email.utils
+
+        self._thread_cache = []
         thread_ids = self._list_threads()
         logger.info(
             "gmail: found %d thread(s) matching query %r",
@@ -70,17 +79,78 @@ class GmailConnector(TextConnector):
         for thread_id in thread_ids:
             try:
                 thread_data = self._get_thread(thread_id)
-                body_text = self._extract_text(thread_data)
-                yield (f"gmail:{thread_id}", body_text)
+                self._thread_cache.append(thread_data)
+
+                for message in thread_data.get("messages", []):
+                    headers = self._extract_headers(message)
+                    sid = f"gmail:{thread_id}"
+
+                    # Parse sender
+                    from_header = headers.get("from", "")
+                    sender_pairs = email.utils.getaddresses([from_header])
+                    if not sender_pairs:
+                        continue
+                    sender_name, sender_email = sender_pairs[0]
+                    if not sender_email:
+                        continue
+                    sender_name = sender_name or sender_email.split("@")[0]
+
+                    pl: dict = {"schema_ref": "gmail/thread", "data": {
+                        "thread_id": thread_id,
+                        "sender_email": sender_email,
+                    }}
+
+                    # sender authored this thread
+                    yield self._make_claim(
+                        sender_name, "person", "authored",
+                        f"gmail:{thread_id}", "email_thread", sid,
+                        subj_ext={"email": sender_email},
+                        payload=pl,
+                    )
+
+                    # Parse recipients (To + Cc)
+                    for hdr_name in ("to", "cc"):
+                        recip_header = headers.get(hdr_name, "")
+                        if not recip_header:
+                            continue
+                        for recip_name, recip_email in email.utils.getaddresses([recip_header]):
+                            if not recip_email:
+                                continue
+                            recip_name = recip_name or recip_email.split("@")[0]
+                            yield self._make_claim(
+                                sender_name, "person", "sent_email_to",
+                                recip_name, "person", sid,
+                                subj_ext={"email": sender_email},
+                                obj_ext={"email": recip_email},
+                                payload=pl,
+                            )
+
             except Exception as exc:
-                logger.warning(
-                    "gmail: error fetching thread %s: %s",
-                    thread_id, exc,
-                )
+                logger.warning("gmail: error fetching thread %s: %s", thread_id, exc)
+
+    def fetch_bodies(self) -> Iterator[tuple[str, str]]:
+        """Yield ``(source_id, text)`` for each cached Gmail thread."""
+        for thread_data in self._thread_cache:
+            thread_id = thread_data.get("id", "")
+            body_text = self._extract_text(thread_data)
+            if body_text and body_text.strip():
+                yield (f"gmail:{thread_id}", body_text)
 
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_headers(message: dict) -> dict[str, str]:
+        """Extract headers from a Gmail message payload as a lowercase dict."""
+        headers: dict[str, str] = {}
+        payload = message.get("payload", {})
+        for h in payload.get("headers", []):
+            name = h.get("name", "").lower()
+            value = h.get("value", "")
+            if name and value:
+                headers[name] = value
+        return headers
 
     def _list_threads(self) -> list[str]:
         """Return up to ``max_results`` thread IDs matching ``self.query``."""

@@ -79,6 +79,10 @@ TOOLS = {
             "project": lambda: Path(".gemini") / "settings.json",
             "user": lambda: Path.home() / ".gemini" / "settings.json",
         },
+        "hooks_path": {
+            "project": lambda: Path(".gemini") / "settings.json",
+            "user": lambda: Path.home() / ".gemini" / "settings.json",
+        },
     },
 }
 
@@ -100,6 +104,16 @@ def _find_attest_mcp() -> str:
     return found or ""
 
 
+def _find_attest_gateway() -> str:
+    """Locate the ``attest-gateway`` entry point next to the running Python."""
+    exe_dir = Path(sys.executable).parent
+    for name in ("attest-gateway", "attest-gateway.exe"):
+        candidate = exe_dir / name
+        if candidate.exists():
+            return str(candidate)
+    return shutil.which("attest-gateway") or ""
+
+
 def _load_cloud_config() -> dict | None:
     """Load cloud config from ~/.attest/cloud.json if it exists."""
     cloud_path = DEFAULT_MEMORY_DIR / "cloud.json"
@@ -111,39 +125,54 @@ def _load_cloud_config() -> dict | None:
         return None
 
 
-def _mcp_server_entry() -> dict:
+def _mcp_server_entry(gateway: bool = False, surface: str = "curated") -> dict:
     """Build the MCP server config entry.
 
-    If ~/.attest/cloud.json exists, returns a remote MCP config pointing
-    to the cloud endpoint.  Otherwise returns a local stdio config.
+    If ``gateway=True``, clients are pointed at the ``attest-gateway`` entry —
+    the inference-bypass layer with the curated tool surface and savings
+    ledger. Otherwise the full ``attest-mcp`` server is used (default).
+
+    Cloud mode: when ``~/.attest/cloud.json`` exists, returns a remote URL
+    config. The gateway's cloud mount lives at ``/gateway``; the core
+    multi-tenant mount stays at ``/mcp``.
     """
     cloud = _load_cloud_config()
     if cloud and cloud.get("endpoint") and cloud.get("api_key"):
-        # Cloud mode — point MCP client at the cloud endpoint
         endpoint = cloud["endpoint"].rstrip("/")
+        path = "/gateway" if gateway else "/mcp"
         return {
-            "url": f"{endpoint}/mcp",
+            "url": f"{endpoint}{path}",
             "headers": {
                 "Authorization": f"Bearer {cloud['api_key']}",
             },
         }
 
-    # Local mode — launch attest-mcp as a subprocess
-    attest_mcp = _find_attest_mcp()
-    if not attest_mcp:
-        # Fall back to module invocation
-        attest_mcp = sys.executable
-        args = ["-m", "attestdb.mcp_server"]
+    if gateway:
+        binary = _find_attest_gateway()
+        module_args = ["-m", "attestdb.gateway.server"]
+        extra_args = ["--surface", surface]
+    else:
+        binary = _find_attest_mcp()
+        module_args = ["-m", "attestdb.mcp_server"]
+        extra_args = []
+
+    if not binary:
+        binary = sys.executable
+        args = module_args
     else:
         args = []
 
     db_path = str(DEFAULT_MEMORY_DB)
 
     entry = {
-        "command": attest_mcp,
-        "args": args + ["--db", db_path],
+        "command": binary,
+        "args": args + ["--db", db_path] + extra_args,
         "env": {
             "ATTEST_AUTO_OBSERVE": "1",
+            # Tool-surface profile: "core" (default, ~8K tokens) keeps the
+            # per-turn MCP tool list small. Set "standard" (~13K) or "full"
+            # (~24K, all 165 tools) to opt back in. Inherits any pre-set value.
+            "ATTEST_MCP_PROFILE": os.environ.get("ATTEST_MCP_PROFILE", "core"),
         },
     }
     return entry
@@ -171,15 +200,30 @@ def _write_json(path: Path, data: dict) -> None:
 # Install
 # ---------------------------------------------------------------------------
 
-def install(tools: list[str] | None = None, scope: str = "project") -> list[str]:
+def install(
+    tools: list[str] | None = None,
+    scope: str = "project",
+    gateway: bool = False,
+    surface: str = "curated",
+) -> list[str]:
     """Install Attest MCP server config for coding tools.
+
+    Args:
+        tools: Explicit tool list, or None to auto-detect.
+        scope: "project" or "user".
+        gateway: When True, configure clients to use the inference-bypass
+            gateway (``attest-gateway``) instead of the full ``attest-mcp``
+            server. Registers under the ``gateway`` server name so it can
+            coexist with the default ``brain`` server.
+        surface: Tool surface for the gateway — "curated" (default) or "full".
 
     Returns list of tools configured.
     """
     # Ensure memory directory exists
     DEFAULT_MEMORY_DIR.mkdir(parents=True, exist_ok=True)
 
-    entry = _mcp_server_entry()
+    entry = _mcp_server_entry(gateway=gateway, surface=surface)
+    server_name = "gateway" if gateway else "brain"
     configured = []
 
     targets = tools or list(TOOLS.keys())
@@ -205,19 +249,43 @@ def install(tools: list[str] | None = None, scope: str = "project") -> list[str]
         config_path = config_path_fn()
         existing = _read_json(config_path)
         servers = existing.setdefault("mcpServers", {})
-        servers["brain"] = entry
+        servers[server_name] = entry
         _write_json(config_path, existing)
         configured.append(tool_key)
-        print(f"  {tool['name']}: {config_path}")
+        print(f"  {tool['name']}: {config_path} ({server_name})")
 
     # Claude Code hooks (SessionStart for prior approach retrieval)
     if "claude" in configured:
         _install_claude_hooks(scope)
+    if "gemini" in configured:
+        _install_gemini_hooks(scope)
+    if "codex" in configured:
+        _install_codex_hooks()
 
     # Generate agent instructions
     _install_agent_instructions()
 
+    # Signal any running MCP server to restart with the new version
+    if configured:
+        _signal_mcp_restart()
+
     return configured
+
+
+def _signal_mcp_restart():
+    """Touch the restart sentinel so any running MCP server picks up the new version.
+
+    The server's version watchdog checks for ~/.attest/.mcp-restart every 10s.
+    When found, the server exits cleanly and Claude Code relaunches it with the
+    updated binary.
+    """
+    sentinel = DEFAULT_MEMORY_DIR / ".mcp-restart"
+    try:
+        DEFAULT_MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+        sentinel.touch()
+        print(f"  Signaled running MCP server to restart ({sentinel})")
+    except OSError:
+        pass  # best-effort
 
 
 def _install_claude_hooks(scope: str) -> None:
@@ -297,6 +365,91 @@ def _install_claude_hooks(scope: str) -> None:
 
     _write_json(hook_path, existing)
     print(f"  Claude Code hooks: {hook_path}")
+
+
+def _install_gemini_hooks(scope: str) -> None:
+    """Wire Gemini CLI lifecycle events to the universal `attest-mcp hook` dispatcher.
+
+    Gemini's hook system is near-isomorphic to Claude Code's — same
+    settings.json shape, same stdin-JSON wire format. We wire SessionStart,
+    BeforeTool, AfterTool, and AfterAgent.
+    """
+    hook_paths = TOOLS["gemini"].get("hooks_path", {})
+    hook_path_fn = hook_paths.get(scope) or hook_paths.get("user")
+    if not hook_path_fn:
+        return
+
+    hook_path = hook_path_fn()
+    existing = _read_json(hook_path)
+    hooks = existing.setdefault("hooks", {})
+
+    attest_mcp = _find_attest_mcp() or f"{sys.executable} -m attestdb.mcp_install"
+    cmd = f"{attest_mcp} hook --agent gemini"
+
+    def _is_attest_hook(h: dict) -> bool:
+        return any(
+            "attest-mcp" in (hk.get("command", "") or "")
+            or "mcp_install" in (hk.get("command", "") or "")
+            for hk in h.get("hooks", [])
+        )
+
+    # Gemini event names + actual tool names (per docs/tools/{file-system,shell}.md).
+    # Tool names are snake_case in Gemini's hook payloads: read_file, write_file,
+    # replace (edit), run_shell_command.
+    event_matchers = {
+        "SessionStart": "",
+        "BeforeTool": "^(read_file|write_file|replace)$",
+        "AfterTool": "^run_shell_command$",
+        "AfterAgent": "",
+    }
+    for event_name, matcher in event_matchers.items():
+        bucket = hooks.get(event_name, [])
+        bucket = [h for h in bucket if not _is_attest_hook(h)]
+        bucket.append({
+            "matcher": matcher,
+            "hooks": [{"type": "command", "command": cmd, "timeout": 10}],
+        })
+        hooks[event_name] = bucket
+
+    _write_json(hook_path, existing)
+    print(f"  Gemini CLI hooks: {hook_path}")
+
+
+def _install_codex_hooks() -> None:
+    """Wire Codex CLI's `notify` event to the universal hook dispatcher.
+
+    Codex only supports a single `notify` hook (turn complete) and passes
+    its payload as the last argv to the script. The dispatcher's
+    auto-detection handles both the argv-JSON quirk and the missing
+    pre-tool / session-start events (which Codex doesn't expose).
+    """
+    config_path = Path.home() / ".codex" / "config.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    attest_mcp = _find_attest_mcp() or f"{sys.executable} -m attestdb.mcp_install"
+    new_line = f'notify = ["{attest_mcp}", "hook", "--agent", "codex"]'
+
+    existing_text = ""
+    if config_path.exists():
+        try:
+            existing_text = config_path.read_text()
+        except OSError:
+            existing_text = ""
+
+    # Strip any prior attest-mcp notify line, then append ours. We rewrite
+    # rather than parse TOML to avoid pulling in tomli_w just for one line.
+    cleaned = []
+    for line in existing_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("notify =") and "attest-mcp" in stripped:
+            continue
+        cleaned.append(line)
+    cleaned.append(new_line)
+    while cleaned and cleaned[0].strip() == "":
+        cleaned.pop(0)
+
+    config_path.write_text("\n".join(cleaned).rstrip() + "\n")
+    print(f"  Codex CLI notify hook: {config_path}")
 
 
 def _install_agent_instructions() -> None:
@@ -525,13 +678,79 @@ def _merge_auto_learnings(db_path: Path) -> int:
     return count
 
 
+# Recall output — content-aware pruning with a safety cap.
+# The budget exists to protect against pathological brains; the real pruning
+# happens via supersession, resolved-filter, and near-duplicate dedupe.
+_RECALL_MAX_CHARS = int(os.environ.get("ATTEST_RECALL_MAX_CHARS", "12000"))
+_RECALL_ITEM_CHARS = int(os.environ.get("ATTEST_RECALL_ITEM_CHARS", "140"))
+_RECALL_STALE_DAYS = int(os.environ.get("ATTEST_RECALL_STALE_DAYS", "60"))
+_RECALL_OUTCOME_STALE_DAYS = int(os.environ.get("ATTEST_RECALL_OUTCOME_STALE_DAYS", "14"))
+_RECALL_DEDUPE_JACCARD = float(os.environ.get("ATTEST_RECALL_DEDUPE_JACCARD", "0.6"))
+
+
+def _trunc(text: str, limit: int = _RECALL_ITEM_CHARS) -> str:
+    text = (text or "").strip().replace("\n", " ")
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _is_fresh(claim, max_age_days: int) -> bool:
+    """True if claim timestamp is within max_age_days (or unknown)."""
+    try:
+        age_days = (time.time() - float(claim.timestamp)) / 86400.0
+        return age_days <= max_age_days
+    except (TypeError, ValueError, AttributeError):
+        return True
+
+
+def _supersede(claims):
+    """Keep only the most recent claim per (subject, predicate)."""
+    latest: dict[tuple[str, str], object] = {}
+    for c in claims:
+        key = (c.subject.id, c.predicate.id)
+        prev = latest.get(key)
+        if prev is None or c.timestamp > prev.timestamp:
+            latest[key] = c
+    return list(latest.values())
+
+
+def _dedupe_by_text(items, text_getter, ts_getter):
+    """Drop near-duplicates by Jaccard word overlap — keep most recent."""
+    kept: list = []
+    kept_word_sets: list[set[str]] = []
+    for item in sorted(items, key=ts_getter, reverse=True):
+        words = set((text_getter(item) or "").lower().split())
+        if not words:
+            kept.append(item)
+            kept_word_sets.append(words)
+            continue
+        dup = False
+        for w in kept_word_sets:
+            union = len(words | w)
+            if union == 0:
+                continue
+            if len(words & w) / union >= _RECALL_DEDUPE_JACCARD:
+                dup = True
+                break
+        if not dup:
+            kept.append(item)
+            kept_word_sets.append(words)
+    return kept
+
+
 def recall(task: str | None = None, db_path: str | None = None) -> None:
     """Query the memory DB and print context-aware knowledge to stdout.
 
     Output goes to the AI's context window via SessionStart hook.
     Uses git context (modified files, recent commits) to surface relevant knowledge.
-    Scoped to the current project when possible (old untagged claims pass through).
+    Strictly project-scoped — claims without a project tag are dropped to avoid
+    cross-project bleed. Stale claims are dropped by age. Total output is capped.
     """
+    # SessionStart fires on fresh start, /compact, and /clear — write a sentinel
+    # so _check_session_sprawl resets its turn/edit counters from this point.
+    _log_hook_metric(
+        hook="session_boundary", file="", fired=True, n_items=0, latency_ms=0.0,
+    )
+
     memory_db = Path(db_path) if db_path else DEFAULT_MEMORY_DB
     if not memory_db.exists():
         return
@@ -574,89 +793,125 @@ def recall(task: str | None = None, db_path: str | None = None) -> None:
         lines.append(f"*{total_claims} claims, "
                      f"{stats.get('entity_count', 0)} entities*\n")
 
-        # 1. Continue from previous session (next_steps)
+        def _scoped(claims, max_age_days: int | None = None):
+            out = []
+            for c in claims:
+                cp = c.provenance.project if c.provenance else None
+                if project and cp != project:
+                    continue
+                if max_age_days is not None and not _is_fresh(c, max_age_days):
+                    continue
+                out.append(c)
+            return out
+
+        # 1. Continue from previous session (next_steps) — must be recent
         try:
-            next_claims = db.claims_for_predicate("has_next_steps")
+            next_claims = _scoped(
+                db.claims_for_predicate("has_next_steps"),
+                max_age_days=_RECALL_OUTCOME_STALE_DAYS,
+            )
             if next_claims:
-                # Filter by project — old untagged claims (no project) pass through
-                if project:
-                    next_claims = [
-                        c for c in next_claims
-                        if not c.provenance.project or c.provenance.project == project
-                    ]
-                if next_claims:
-                    latest = max(next_claims, key=lambda c: c.timestamp)
-                    age = _format_age(latest.timestamp)
-                    lines.append(f"### Continue from previous session ({age})")
-                    lines.append(f"{latest.object.id}\n")
+                latest = max(next_claims, key=lambda c: c.timestamp)
+                age = _format_age(latest.timestamp)
+                lines.append(f"### Continue from previous session ({age})")
+                lines.append(f"{_trunc(latest.object.id, 300)}\n")
         except Exception:
             pass
 
         # 2. Context-relevant knowledge (based on git status)
-        # Includes warnings, patterns, decisions, tips, bugs, fixes — prioritized
+        # Includes warnings, patterns, decisions, tips, bugs, fixes — prioritized.
+        # Drops warnings/bugs that have been resolved by a newer fix/decision on
+        # the same subject, supersedes older claims on the same (subject, predicate),
+        # and dedupes near-duplicate object text.
         relevant_items = _find_relevant_knowledge(db, context_files, context_terms, project)
 
-        # Split by priority threshold into actionable vs historical
-        high_pri = [r for r in relevant_items if r[4] <= KNOWLEDGE_HIGH_PRIORITY_THRESHOLD]
-        low_pri = [r for r in relevant_items if r[4] > KNOWLEDGE_HIGH_PRIORITY_THRESHOLD]
+        # Build resolved-subjects set: subjects with a fix/decision newer than
+        # any open warning/bug for that subject.
+        resolved_subjects: set[str] = set()
+        try:
+            fix_ts: dict[str, int] = {}
+            for pred in ("has_fix", "has_decision"):
+                for c in db.claims_for_predicate(pred):
+                    prev = fix_ts.get(c.subject.id, 0)
+                    if c.timestamp > prev:
+                        fix_ts[c.subject.id] = c.timestamp
+            warn_ts: dict[str, int] = {}
+            for pred in ("has_warning", "had_bug"):
+                for c in db.claims_for_predicate(pred):
+                    prev = warn_ts.get(c.subject.id, 0)
+                    if c.timestamp > prev:
+                        warn_ts[c.subject.id] = c.timestamp
+            for subj, ft in fix_ts.items():
+                if ft >= warn_ts.get(subj, 0):
+                    resolved_subjects.add(subj)
+        except Exception:
+            pass
+
+        # Supersede: keep only the most recent (subject, predicate) tuple.
+        # relevant_items is (pred, subj, obj, conf, priority) — synthesize a fake
+        # ordering key by (subj, pred) and pick the highest-priority/confidence
+        # (input is already sorted by priority then -confidence so first wins).
+        seen_keys: set[tuple[str, str]] = set()
+        pruned: list[tuple] = []
+        for row in relevant_items:
+            pred, subj, obj, conf, pri = row
+            key = (subj, pred)
+            if key in seen_keys:
+                continue
+            # Resolved-filter: drop open warnings/bugs for subjects with a newer fix
+            if pred in ("has_warning", "had_bug") and subj in resolved_subjects:
+                continue
+            seen_keys.add(key)
+            pruned.append(row)
+
+        # Dedupe near-duplicate object text within high/low bands
+        def _text_getter(r):
+            return r[2]
+        def _ts_none(_r):
+            # _find_relevant_knowledge doesn't surface timestamps; use priority
+            # then confidence as a proxy ordering (already sort-stable).
+            return 0
+
+        high_pri = [r for r in pruned if r[4] <= KNOWLEDGE_HIGH_PRIORITY_THRESHOLD]
+        low_pri = [r for r in pruned if r[4] > KNOWLEDGE_HIGH_PRIORITY_THRESHOLD]
+        high_pri = _dedupe_by_text(high_pri, _text_getter, _ts_none)
+        low_pri = _dedupe_by_text(low_pri, _text_getter, _ts_none)
 
         if high_pri:
             lines.append("### Warnings & patterns (relevant to current work)")
             for pred, subj, obj, conf, _pri in high_pri[:8]:
-                lines.append(f"- **[{knowledge_label(pred)}]** `{subj}`: {obj}")
+                lines.append(f"- **[{knowledge_label(pred)}]** `{subj}`: {_trunc(obj)}")
             lines.append("")
 
         if low_pri:
-            lines.append("### Known issues in these files")
+            lines.append("### In these files")
             for pred, subj, obj, conf, _pri in low_pri[:5]:
-                lines.append(f"- [{knowledge_label(pred)}] `{subj}`: {obj}")
+                lines.append(f"- [{knowledge_label(pred)}] `{subj}`: {_trunc(obj)}")
             lines.append("")
 
-        # 3. Non-context learnings (warnings/patterns not matched by git context)
-        # Only show if they weren't already surfaced above
-        context_claim_ids = {(r[1], r[2]) for r in relevant_items}
-        learning_predicates = ["has_warning", "has_pattern", "has_decision"]
-        extra_learnings: list[tuple] = []
-        for pred in learning_predicates:
-            try:
-                claims = db.claims_for_predicate(pred)
-            except Exception:
-                continue
-            for c in claims:
-                if (c.subject.id, c.object.id) not in context_claim_ids:
-                    extra_learnings.append((
-                        knowledge_label(pred), c.subject.id, c.object.id,
-                        c.timestamp,
-                    ))
-
-        if extra_learnings:
-            extra_learnings.sort(key=lambda x: x[3], reverse=True)
-            lines.append("### Other learnings")
-            for kind, subj, obj, _ts in extra_learnings[:5]:
-                lines.append(f"- [{kind}] `{subj}`: {obj}")
-            lines.append("")
-
-        # 4. Recent session outcomes (brief)
+        # 4. Recent session outcomes — skip bookkeeping noise (auto-stop:* etc.)
         try:
-            outcome_claims = db.claims_for_predicate("had_outcome")
-            if project:
-                outcome_claims = [
-                    c for c in outcome_claims
-                    if not c.provenance.project or c.provenance.project == project
-                ]
+            outcome_claims = _scoped(
+                db.claims_for_predicate("had_outcome"),
+                max_age_days=_RECALL_OUTCOME_STALE_DAYS,
+            )
+            outcome_claims = [
+                c for c in outcome_claims
+                if not c.subject.id.startswith(("auto-stop:", "session_end"))
+            ]
         except Exception:
             outcome_claims = []
 
         if outcome_claims:
-            recent = sorted(outcome_claims, key=lambda c: c.timestamp, reverse=True)[:5]
-            lines.append(f"### Recent sessions ({len(outcome_claims)} total)")
+            recent = sorted(outcome_claims, key=lambda c: c.timestamp, reverse=True)[:3]
+            lines.append(f"### Recent sessions ({len(outcome_claims)} in last {_RECALL_OUTCOME_STALE_DAYS}d)")
             for c in recent:
                 summary = ""
                 if c.payload and hasattr(c.payload, "data") and c.payload.data:
                     summary = c.payload.data.get("summary", "")
                 age = _format_age(c.timestamp)
                 icon = "+" if "success" in c.object.id else "-" if "failure" in c.object.id else "~"
-                desc = f" — {summary}" if summary else ""
+                desc = f" — {_trunc(summary, 80)}" if summary else ""
                 lines.append(f"- [{icon}] {c.object.id} ({age}){desc}")
             lines.append("")
 
@@ -687,7 +942,15 @@ def recall(task: str | None = None, db_path: str | None = None) -> None:
         except Exception:
             pass  # skill regeneration is optional
 
-        print("\n".join(lines))
+        output = "\n".join(lines)
+        # Global token budget — trim trailing sections if over.
+        if len(output) > _RECALL_MAX_CHARS:
+            trimmed = output[: _RECALL_MAX_CHARS]
+            cut = trimmed.rfind("\n### ")
+            if cut > 0:
+                trimmed = trimmed[:cut]
+            output = trimmed.rstrip() + "\n\n*(truncated to fit token budget)*"
+        print(output)
     finally:
         db.close()
 
@@ -905,9 +1168,12 @@ def _git_context() -> tuple[list[str], set[str]]:
 def _find_relevant_knowledge(db, files: list[str], terms: set[str], project: str | None = None) -> list[tuple]:
     """Find knowledge claims relevant to the current git context.
 
-    Returns (predicate, subject, object, confidence, priority) tuples,
+    Returns (predicate, subject, object, confidence, priority, timestamp) tuples,
     sorted by priority (warnings/patterns first, then bugs, then fixes).
-    Filters by project when set — old untagged claims (no project) pass through.
+    Strict project scoping — claims from other projects are excluded.
+    Applies supersession (one claim per subject+predicate, most recent) and
+    a resolved-filter (warnings/bugs are dropped when a newer fix/decision
+    for the same subject exists).
     """
     if not files and not terms:
         return []
@@ -915,7 +1181,8 @@ def _find_relevant_knowledge(db, files: list[str], terms: set[str], project: str
     from attestdb.core.vocabulary import KNOWLEDGE_PREDICATES, KNOWLEDGE_PRIORITY
 
     def _project_matches(claim) -> bool:
-        """True if claim belongs to this project or is untagged (graceful degradation)."""
+        """Scope to project, but allow untagged legacy claims (they're already
+        filtered to git-context matches below, so leak is self-limited)."""
         if not project:
             return True
         claim_project = claim.provenance.project if claim.provenance else None
@@ -1085,56 +1352,81 @@ def pre_read_check() -> None:
 # ---------------------------------------------------------------------------
 
 def _check_session_sprawl() -> str | None:
-    """Check hook_metrics.jsonl for session sprawl. Returns warning or None."""
+    """Check hook_metrics.jsonl for session sprawl. Returns warning or None.
+
+    This is a rough proxy — the hook log only sees `stop` (1 per assistant turn)
+    and `pre_edit_check` (1 per Edit). Read/Bash/Grep/Glob are invisible. So we
+    estimate turn count from `stop` events and edit count from `pre_edit_check`,
+    and only warn when a session has genuinely been running long enough that
+    transcript cost is likely to hurt.
+    """
     try:
         if not HOOK_METRICS_LOG.exists():
             return None
 
-        lines = HOOK_METRICS_LOG.read_text().strip().split("\n")[-100:]
+        # Last 300 entries is enough to cover any plausible single session.
+        lines = HOOK_METRICS_LOG.read_text().strip().split("\n")[-300:]
         now = time.time()
 
-        timestamps: list[float] = []
+        events: list[tuple[float, str]] = []
         for line in lines:
             try:
                 m = json.loads(line)
                 ts = _parse_metric_timestamp(m.get("timestamp", 0))
-                if ts > 0:
-                    timestamps.append(ts)
+                hook = m.get("hook", "")
+                if ts > 0 and hook:
+                    events.append((ts, hook))
             except (json.JSONDecodeError, KeyError):
                 continue
 
-        if len(timestamps) < 5:
+        if len(events) < 10:
             return None
 
-        # Find session boundary: last gap > 30 min
-        session_start = timestamps[0]
-        for i in range(len(timestamps) - 1, 0, -1):
-            if timestamps[i] - timestamps[i - 1] > 1800:
-                session_start = timestamps[i]
+        # Session boundary (in priority order):
+        #   1. Most recent `session_boundary` sentinel (written on SessionStart,
+        #      which fires on fresh start, /compact, and /clear).
+        #   2. Fallback: last gap > 30 min between any events.
+        session_start = events[0][0]
+        boundary_found = False
+        for i in range(len(events) - 1, -1, -1):
+            if events[i][1] == "session_boundary":
+                session_start = events[i][0]
+                boundary_found = True
                 break
+        if not boundary_found:
+            for i in range(len(events) - 1, 0, -1):
+                if events[i][0] - events[i - 1][0] > 1800:
+                    session_start = events[i][0]
+                    break
 
-        session_events = sum(1 for ts in timestamps if ts >= session_start)
+        session = [e for e in events if e[0] >= session_start]
+        turns = sum(1 for _, h in session if h == "stop")
+        edits = sum(1 for _, h in session if h == "pre_edit_check")
         elapsed_min = (now - session_start) / 60
 
-        if session_events >= 80:
+        # Thresholds on turns (true per-turn transcript cost). Edits are shown
+        # for context but don't gate severity.
+        if turns >= 80:
             severity = "critical"
-        elif session_events >= 50:
+        elif turns >= 50:
             severity = "high"
-        elif session_events >= 30:
+        elif turns >= 30:
             severity = "moderate"
         else:
             return None
 
         return (
-            f"~{session_events} tool calls  ·  {elapsed_min:.0f} min  ·  {severity}\n"
+            f"~{turns} turns  ·  ~{edits} edits  ·  {elapsed_min:.0f} min  ·  {severity}\n"
             f"\n"
-            f"Every turn resends the full conversation history.\n"
-            f"Turn 5 costs ~2K tokens. Turn 30 costs ~40K+.\n"
+            f"Every turn resends the full conversation. Cost scales with turn count,\n"
+            f"not wall-clock time — long sessions with many turns get expensive.\n"
             f"\n"
             f"Actions:\n"
             f"  /clear               start fresh (fastest)\n"
             f"  /compact             compress context in-place\n"
-            f"  prompt_kit_rescue    extract key decisions, then /clear"
+            f"  prompt_kit_rescue    extract key decisions, then /clear\n"
+            f"\n"
+            f"Note: this is a proxy — only Edit + turn-end are logged."
         )
     except Exception:
         return None
@@ -1186,6 +1478,9 @@ def pre_edit_check() -> None:
         seen: set[str] = set()
 
         _t0 = time.monotonic()
+        # Bookkeeping predicates/subjects to never surface as warnings
+        _skip_preds = {"had_outcome", "has_next_steps", "produced_by"}
+        _skip_prefixes = ("auto-stop:", "session_end")
         for term in search_terms:
             entities = db.search_entities(term, top_k=3)
             for entity in entities:
@@ -1196,12 +1491,17 @@ def pre_edit_check() -> None:
                 for claim in db.claims_for(entity.id):
                     if claim.claim_id in seen:
                         continue
-                    if claim.predicate.id in KNOWLEDGE_PREDICATES:
-                        seen.add(claim.claim_id)
-                        label = knowledge_label(claim.predicate.id)
-                        warnings.append(
-                            f"[{label}] {claim.subject.id}: {claim.object.id}"
-                        )
+                    if claim.predicate.id not in KNOWLEDGE_PREDICATES:
+                        continue
+                    if claim.predicate.id in _skip_preds:
+                        continue
+                    if claim.subject.id.startswith(_skip_prefixes):
+                        continue
+                    seen.add(claim.claim_id)
+                    label = knowledge_label(claim.predicate.id)
+                    warnings.append(
+                        f"[{label}] {claim.subject.id}: {claim.object.id}"
+                    )
         _latency_ms = (time.monotonic() - _t0) * 1000
 
         # Check for session sprawl (cheap — reads metrics file, no DB)
@@ -2166,6 +2466,99 @@ def uninstall(tools: list[str] | None = None) -> list[str]:
 # CLI entry point
 # ---------------------------------------------------------------------------
 
+def hook_dispatch(agent: str = "auto") -> None:
+    """Universal hook entry point — normalizes input across Claude / Gemini / Codex.
+
+    Reads raw input (stdin for Claude/Gemini, argv for Codex), translates to a
+    NormalizedEvent, and dispatches to the appropriate existing handler. Output
+    is re-emitted in the agent's native format.
+
+    When ``agent="auto"`` (default), the caller is sniffed from the input shape:
+    argv-JSON → Codex; stdin event name vocabulary → Claude vs Gemini. This
+    makes a single unified hook command wire up identically in any CLI.
+    """
+    import io
+
+    from attestdb import agent_hooks
+
+    if agent == "auto":
+        argv = sys.argv[1:]
+        # Try stdin first (Claude/Gemini); if empty, fall through to argv (Codex).
+        raw = agent_hooks.read_input("claude")  # reuses stdin reader
+        if not raw:
+            raw = agent_hooks.read_input("codex", argv=argv)
+        if not raw:
+            return
+        detected = agent_hooks.detect_agent(raw, argv=argv)
+        if not detected:
+            return
+        agent = detected
+    else:
+        raw = agent_hooks.read_input(agent)
+        if not raw:
+            return
+
+    event = agent_hooks.parse(agent, raw)
+    if event is None:
+        return
+
+    # Synthesize a Claude-shaped payload for the existing handlers, which all
+    # read stdin. We do this even for Gemini since the wire formats are
+    # isomorphic — the handler doesn't care about the discriminator.
+    synth = {
+        "session_id": event.session_id,
+        "cwd": event.cwd,
+        "tool_input": event.tool_input or {},
+        "tool_response": event.tool_response or {},
+        "tool_name": event.tool_name or "",
+    }
+
+    saved_stdin = sys.stdin
+    saved_stdout = sys.stdout
+    captured = io.StringIO()
+    sys.stdin = io.StringIO(json.dumps(synth))
+    sys.stdout = captured
+    try:
+        if event.event == "session.start":
+            recall()
+        elif event.event == "tool.pre":
+            file_path = event.file_path
+            if not file_path:
+                return
+            tool = (event.tool_name or "").lower()
+            if tool in ("read", "notebookread"):
+                pre_read_check()
+            else:
+                pre_edit_check()
+        elif event.event == "tool.post":
+            post_test_check()
+        elif event.event == "agent.stop":
+            stop_session_summary()
+        else:
+            return
+    finally:
+        sys.stdin = saved_stdin
+        sys.stdout = saved_stdout
+
+    # Re-emit captured handler output in the agent's native format. Claude's
+    # handlers already print `hookSpecificOutput` JSON, which is also valid
+    # for Gemini. For Codex we strip JSON and emit plain text.
+    out = captured.getvalue().strip()
+    if not out:
+        return
+    if agent == "codex":
+        # Codex notify ignores stdout, but keep human-readable in case the
+        # user pipes it elsewhere.
+        try:
+            parsed = json.loads(out)
+            msg = parsed.get("hookSpecificOutput", {}).get("additionalContext", out)
+            print(msg)
+        except json.JSONDecodeError:
+            print(out)
+    else:
+        print(out)
+
+
 def main():
     """CLI for attest-mcp install/recall/uninstall."""
     import argparse
@@ -2191,6 +2584,16 @@ def main():
         "--db", default=str(DEFAULT_MEMORY_DB),
         help=f"Memory database path (default: {DEFAULT_MEMORY_DB})",
     )
+    p_install.add_argument(
+        "--gateway", action="store_true",
+        help="Configure the inference-bypass gateway (attest-gateway) instead "
+             "of the full MCP server. Exposes a curated ~9-tool surface and "
+             "records a savings ledger for every call.",
+    )
+    p_install.add_argument(
+        "--surface", choices=["curated", "full"], default="curated",
+        help="Gateway tool surface (only used with --gateway; default: curated)",
+    )
 
     # recall (used by SessionStart hooks)
     p_recall = sub.add_parser("recall", help="Output prior approaches (for SessionStart hooks)")
@@ -2208,6 +2611,16 @@ def main():
 
     # stop (used by Stop hooks)
     sub.add_parser("stop", help="Stop hook handler (lightweight session signal)")
+
+    # hook — universal cross-CLI dispatcher (Claude / Gemini / Codex)
+    p_hook = sub.add_parser(
+        "hook",
+        help="Universal hook entry point — works for Claude Code, Gemini CLI, and Codex CLI",
+    )
+    p_hook.add_argument(
+        "--agent", default="auto", choices=["auto", "claude", "gemini", "codex"],
+        help="Which agent CLI is invoking this hook (default: auto-detect from input shape)",
+    )
 
     # metrics
     sub.add_parser("metrics", help="Show hook instrumentation metrics summary")
@@ -2228,7 +2641,7 @@ def main():
     # This preserves backward compat for: attest-mcp, attest-mcp --transport stdio, etc.
     raw_args = sys.argv[1:]
     mcp_flags = {"--transport", "--host", "--port", "--db", "stdio", "sse", "streamable-http"}
-    subcommands = {"install", "recall", "uninstall", "pre-edit-check", "pre-read-check", "post-test-check", "stop", "metrics", "benchmark"}
+    subcommands = {"install", "recall", "uninstall", "pre-edit-check", "pre-read-check", "post-test-check", "stop", "hook", "metrics", "benchmark"}
     if not raw_args or (raw_args[0] not in subcommands and raw_args[0] != "-h" and raw_args[0] != "--help"):
         from attestdb.mcp_server import main as mcp_main
         mcp_main()
@@ -2237,12 +2650,18 @@ def main():
     args, unknown = parser.parse_known_args()
 
     if args.command == "install":
-        print("Installing Attest MCP server...")
-        configured = install(tools=args.tools, scope=args.scope)
+        mode = "gateway (inference-bypass)" if args.gateway else "MCP server"
+        print(f"Installing Attest {mode}...")
+        configured = install(
+            tools=args.tools,
+            scope=args.scope,
+            gateway=args.gateway,
+            surface=args.surface,
+        )
         if configured:
             print(f"\nConfigured for: {', '.join(TOOLS[t]['name'] for t in configured)}")
             print(f"Memory DB: {DEFAULT_MEMORY_DB}")
-            print("\nThe MCP server will start automatically when you open your coding tool.")
+            print(f"\nThe {mode} will start automatically when you open your coding tool.")
         else:
             print("\nNo coding tools detected. Install with --tool to configure manually:")
             print("  attest-mcp install --tool claude")
@@ -2262,6 +2681,9 @@ def main():
 
     elif args.command == "stop":
         stop_session_summary()
+
+    elif args.command == "hook":
+        hook_dispatch(agent=args.agent)
 
     elif args.command == "metrics":
         metrics()

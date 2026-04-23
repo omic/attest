@@ -2,7 +2,7 @@
 
 BUILT_IN_ENTITY_TYPES: set[str] = {
     "entity", "event", "metric", "document", "agent", "system",
-    "thread",
+    "thread", "person", "location",
 }
 
 BUILT_IN_PREDICATE_TYPES: set[str] = {
@@ -211,29 +211,23 @@ VERIFICATION_PROFILES: dict[str, dict] = {
 CONTRADICTION_PREDICATES: set[str] = {"contradicts", "contradiction_resolved"}
 SYMMETRIC_PREDICATES: set[str] = {"interacts", "binds", "resembles", "homolog_of", "same_as"}
 
-# Opposing predicate pairs — used for contradiction detection
-OPPOSITE_PREDICATES: dict[str, str] = {
-    "activates": "inhibits",
-    "inhibits": "activates",
-    "upregulates": "downregulates",
-    "downregulates": "upregulates",
-    "promotes": "suppresses",
-    "suppresses": "promotes",
-    "increases": "decreases",
-    "decreases": "increases",
-    "causes": "prevents",
-    "prevents": "causes",
-    "enables": "blocks",
-    "blocks": "enables",
-    "enhances": "reduces",
-    "reduces": "enhances",
-    "stabilizes": "destabilizes",
-    "destabilizes": "stabilizes",
-    "phosphorylates": "dephosphorylates",
-    "dephosphorylates": "phosphorylates",
-    "methylates": "demethylates",
-    "demethylates": "methylates",
-}
+# Opposing predicate pairs — built from PredicateStore seed data.
+# Kept as a module-level dict for backward compatibility with 17+ import sites.
+def _build_opposite_predicates() -> dict[str, str]:
+    """Build opposite predicates dict from PredicateStore."""
+    try:
+        from attestdb.core.predicate_store import get_default_store
+        store = get_default_store()
+        result = {}
+        for info in store.all():
+            if info.opposite:
+                result[info.id] = info.opposite
+        return result
+    except Exception:
+        return {}
+
+
+OPPOSITE_PREDICATES: dict[str, str] = _build_opposite_predicates()
 
 # Predicate composition rules — (pred_A_to_C, pred_C_to_B) → predicted_A_to_B
 # Causal logic: inhibits + promotes → inhibits,
@@ -371,14 +365,17 @@ PREDICATE_EQUIVALENCE: dict[str, str] = {
 def predicates_agree(pred_a: str, pred_b: str) -> bool:
     """Check if two predicates are semantically equivalent (same direction).
 
-    Returns True if both are positive regulation or both are negative.
-    Returns False if they oppose or either is unknown.
+    Delegates to PredicateStore for live equivalence data.
     """
-    class_a = PREDICATE_EQUIVALENCE.get(pred_a)
-    class_b = PREDICATE_EQUIVALENCE.get(pred_b)
-    if class_a and class_b:
-        return class_a == class_b
-    return pred_a == pred_b
+    try:
+        from attestdb.core.predicate_store import get_default_store
+        return get_default_store().predicates_agree(pred_a, pred_b)
+    except Exception:
+        class_a = PREDICATE_EQUIVALENCE.get(pred_a)
+        class_b = PREDICATE_EQUIVALENCE.get(pred_b)
+        if class_a and class_b:
+            return class_a == class_b
+        return pred_a == pred_b
 
 
 def directional_confidence(
@@ -445,18 +442,22 @@ def directional_confidence(
 def compose_predicates(pred_ac: str, pred_cb: str) -> str:
     """Compose two predicates along A→C→B into predicted A→B predicate.
 
-    Lookup in composition table, fall back to same-predicate transitivity,
-    then "associated_with".
+    Delegates to PredicateStore.compose() for live, self-improving
+    composition rules. Falls back to legacy table if store unavailable.
     """
-    if pred_ac in _WEAK_PREDICATES or pred_cb in _WEAK_PREDICATES:
+    try:
+        from attestdb.core.predicate_store import get_default_store
+        return get_default_store().compose(pred_ac, pred_cb)
+    except Exception:
+        # Fallback to legacy table
+        if pred_ac in _WEAK_PREDICATES or pred_cb in _WEAK_PREDICATES:
+            return "associated_with"
+        result = PREDICATE_COMPOSITION.get((pred_ac, pred_cb))
+        if result:
+            return result
+        if pred_ac == pred_cb:
+            return pred_ac
         return "associated_with"
-    result = PREDICATE_COMPOSITION.get((pred_ac, pred_cb))
-    if result:
-        return result
-    # Same-predicate transitivity
-    if pred_ac == pred_cb:
-        return pred_ac
-    return "associated_with"
 
 
 def predict_predicate_from_paths(
@@ -564,49 +565,40 @@ PREDICATE_ALIAS_MAP: dict[str, str] = {
 def normalize_predicate(pred: str) -> str:
     """Normalize an LLM-generated predicate to the controlled vocabulary.
 
-    4-stage normalization:
-    1. Direct match to standard set
-    2. Alias map lookup
-    3. Strip common prefixes/suffixes and retry
-    4. Fallback to 'associated_with' for unknown long predicates
-
-    Usage:
-        normalize_predicate("is_associated_with")  → "associated_with"
-        normalize_predicate("activate")             → "activates"
-        normalize_predicate("inhibit")              → "inhibits"
-        normalize_predicate("may_potentially_cause") → "causes"
+    Delegates to PredicateStore.normalize() for live, self-improving
+    alias resolution. Falls back to legacy normalization if store unavailable.
     """
-    cleaned = pred.lower().strip().rstrip(".").replace(" ", "_")
-
-    # Stage 1: direct match
-    if cleaned in STANDARD_PREDICATES:
+    try:
+        from attestdb.core.predicate_store import get_default_store
+        result = get_default_store().normalize(pred)
+        # PredicateStore.normalize returns the cleaned string if no match.
+        # Apply the legacy fallback for long unknown predicates.
+        if result == pred.lower().strip().rstrip(".").replace(" ", "_") and len(result) > 30:
+            return "associated_with"
+        return result
+    except Exception:
+        # Legacy fallback
+        cleaned = pred.lower().strip().rstrip(".").replace(" ", "_")
+        if cleaned in STANDARD_PREDICATES:
+            return cleaned
+        mapped = PREDICATE_ALIAS_MAP.get(cleaned)
+        if mapped:
+            return mapped
+        stripped = cleaned
+        for prefix in ("is_", "can_", "may_", "potentially_", "directly_"):
+            if stripped.startswith(prefix):
+                stripped = stripped[len(prefix):]
+        for suffix in ("_in", "_of", "_by", "_to", "_for", "_with"):
+            if stripped.endswith(suffix):
+                stripped = stripped[: -len(suffix)]
+        if stripped in STANDARD_PREDICATES:
+            return stripped
+        mapped = PREDICATE_ALIAS_MAP.get(stripped)
+        if mapped:
+            return mapped
+        if len(cleaned) > 30:
+            return "associated_with"
         return cleaned
-
-    # Stage 2: alias map
-    mapped = PREDICATE_ALIAS_MAP.get(cleaned)
-    if mapped:
-        return mapped
-
-    # Stage 3: strip common prefixes/suffixes and retry
-    stripped = cleaned
-    for prefix in ("is_", "can_", "may_", "potentially_", "directly_"):
-        if stripped.startswith(prefix):
-            stripped = stripped[len(prefix):]
-    for suffix in ("_in", "_of", "_by", "_to", "_for", "_with"):
-        if stripped.endswith(suffix):
-            stripped = stripped[: -len(suffix)]
-
-    if stripped in STANDARD_PREDICATES:
-        return stripped
-    mapped = PREDICATE_ALIAS_MAP.get(stripped)
-    if mapped:
-        return mapped
-
-    # Stage 4: fallback for unknown long predicates
-    if len(cleaned) > 30:
-        return "associated_with"
-
-    return cleaned
 
 
 # ---------------------------------------------------------------------------

@@ -80,8 +80,10 @@ def load_sec_enforcement(
     Returns:
         BatchResult with ingestion counts.
     """
+    from datetime import datetime, timezone
+
     t0 = time.time()
-    timestamp = int(t0 * 1_000_000_000)
+    fallback_timestamp = int(t0 * 1_000_000_000)
 
     entities: dict[str, tuple[str, str, str]] = {}
     claim_rows: list[tuple] = []
@@ -102,6 +104,16 @@ def load_sec_enforcement(
 
             respondent = (rec.get("respondent") or "").strip()
             action_type = (rec.get("action_type") or "enforcement").strip()
+
+            # Use enforcement date for temporal analysis
+            date_str = (rec.get("date") or "").strip()
+            timestamp = fallback_timestamp
+            if date_str:
+                try:
+                    dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                    timestamp = int(dt.timestamp() * 1_000_000_000)
+                except ValueError:
+                    pass
             violations = rec.get("violations") or []
             penalty = rec.get("penalty_amount", 0)
             release = (rec.get("release_number") or "").strip()
@@ -218,8 +230,10 @@ def load_federal_register_rules(
     Returns:
         BatchResult with ingestion counts.
     """
+    from datetime import datetime, timezone
+
     t0 = time.time()
-    timestamp = int(t0 * 1_000_000_000)
+    fallback_timestamp = int(t0 * 1_000_000_000)
 
     entities: dict[str, tuple[str, str, str]] = {}
     claim_rows: list[tuple] = []
@@ -246,6 +260,16 @@ def load_federal_register_rules(
 
             if not title or not doc_number:
                 continue
+
+            # Use publication date for temporal analysis
+            date_str = (rec.get("publication_date") or "").strip()
+            timestamp = fallback_timestamp
+            if date_str:
+                try:
+                    dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                    timestamp = int(dt.timestamp() * 1_000_000_000)
+                except ValueError:
+                    pass
 
             # Entity: the rule itself
             rule_eid = normalize_entity_id(f"rule_{doc_number}")

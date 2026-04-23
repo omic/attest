@@ -93,21 +93,37 @@ def create_http_app(db_path: str = "attest.db", api_key: str | None = None) -> S
     # Ensure data is flushed on process exit (Rust store only persists on close())
     atexit.register(db.close)
 
+    # Disable DNS rebinding protection — we handle auth via Bearer token.
+    # This allows remote MCP clients (Managed Agents, ngrok tunnels) to connect.
+    from mcp.server.transport_security import TransportSecuritySettings
+    mcp.settings.transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=False,
+    )
+
+    # Get FastMCP's streamable-http Starlette app.
+    # We must run the session manager's lifespan in our outer app
+    # so the task group is initialized before requests arrive.
+    mcp_app = mcp.streamable_http_app()
+    session_manager = mcp.session_manager
+
     @asynccontextmanager
     async def _lifespan(app):
-        yield
+        async with session_manager.run():
+            yield
         db.close()
 
-    # Get FastMCP's streamable-http Starlette app
-    mcp_app = mcp.streamable_http_app()
-
     def _health(request: Request) -> JSONResponse:
-        stats = db.stats()
-        return JSONResponse({
-            "status": "ok",
-            "entity_count": stats.get("entity_count", 0),
-            "claim_count": stats.get("claim_count", 0),
-        })
+        # Only expose database statistics to authenticated requests
+        if api_key:
+            auth = request.headers.get("authorization", "")
+            if auth.startswith("Bearer ") and secrets.compare_digest(auth[7:], api_key):
+                stats = db.stats()
+                return JSONResponse({
+                    "status": "ok",
+                    "entity_count": stats.get("entity_count", 0),
+                    "claim_count": stats.get("claim_count", 0),
+                })
+        return JSONResponse({"status": "ok"})
 
     async def _ingest_text(request: Request) -> JSONResponse:
         """REST endpoint for Chrome extension and other lightweight clients."""
@@ -253,7 +269,7 @@ def create_http_app(db_path: str = "attest.db", api_key: str | None = None) -> S
         Route("/api/ingest_text", _ingest_text, methods=["POST"]),
         Route("/api/ingest_batch", _ingest_batch, methods=["POST"]),
         Route("/api/synthesize", _synthesize, methods=["POST"]),
-        Mount("/mcp", app=mcp_app),
+        Mount("/", app=mcp_app),
     ]
 
     middleware = [

@@ -10,6 +10,7 @@ Commands:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -464,7 +465,7 @@ def cmd_chat(args):
     mode = getattr(args, "mode", "browser")
 
     if mode == "api":
-        from attestdb.core.chat import MultiChat
+        from attestdb.intelligence.chat import MultiChat
         chat = MultiChat(
             db=db,
             providers=providers,
@@ -477,7 +478,7 @@ def cmd_chat(args):
             db.close()
     else:
         # Browser mode (default)
-        from attestdb.core.browser_chat import run_browser_chat
+        from attestdb.intelligence.browser_chat import run_browser_chat
         # Parse --models flag: "chatgpt=o3,claude=opus" → dict
         models = None
         if getattr(args, "models", None):
@@ -496,6 +497,52 @@ def cmd_chat(args):
             )
         finally:
             db.close()
+
+
+def cmd_audit_quality(args):
+    """Audit extraction quality of claims; optionally tag flagged ones."""
+    from attestdb.core.extraction_quality import audit_db, print_audit_report
+    from attestdb.infrastructure.attest_db import AttestDB
+
+    db = AttestDB(args.db)
+    try:
+        result = audit_db(db, apply=args.apply)
+        print_audit_report(result, apply=args.apply)
+    finally:
+        db.close()
+
+
+def cmd_build_equivalence(args):
+    """Find claim-equivalence groups; optionally write same_claim_as meta-claims."""
+    from attestdb.infrastructure.attest_db import AttestDB
+    from attestdb.infrastructure.claim_equivalence import (
+        find_equivalent_claim_groups, write_same_claim_as_meta,
+    )
+
+    db = AttestDB(args.db)
+    try:
+        groups = find_equivalent_claim_groups(
+            db,
+            numeric_tolerance=args.tolerance,
+            time_window_days=args.window_days,
+        )
+        print(f"Found {len(groups)} equivalence group(s).")
+        for i, g in enumerate(groups[:10]):
+            num = f"${g.numeric_value:,.0f}" if g.numeric_value is not None else "-"
+            obj = g.object or "-"
+            print(
+                f"  [{i+1}] group={g.predicate_synonym_group} subject={g.subject} "
+                f"object={obj} numeric={num} members={len(g.claim_ids)} "
+                f"preds={','.join(g.member_predicates)}"
+            )
+
+        if args.apply:
+            n = write_same_claim_as_meta(db, groups)
+            print(f"Wrote {n} same_claim_as meta-claim(s).")
+        else:
+            print("(dry run — pass --apply to persist same_claim_as meta-claims)")
+    finally:
+        db.close()
 
 
 def cmd_query(args):
@@ -643,6 +690,56 @@ def main():
     p_query.add_argument(
         "--vocab", nargs="+", choices=["bio", "devops", "ml"],
         help="Vocabularies to register (default: bio)",
+    )
+
+    # --- audit-quality ---
+    p_audit = sub.add_parser(
+        "audit-quality",
+        help="Audit extraction-quality of claims in a database",
+    )
+    p_audit.add_argument("--db", required=True, help="Path to .attest database")
+    p_audit.add_argument(
+        "--apply", action="store_true",
+        help="Write extraction_quality tags into flagged claim payloads",
+    )
+
+    # --- build-equivalence ---
+    p_equiv = sub.add_parser(
+        "build-equivalence",
+        help="Find claim-equivalence groups (predicate synonyms)",
+    )
+    p_equiv.add_argument("--db", required=True, help="Path to .attest database")
+    p_equiv.add_argument(
+        "--apply", action="store_true",
+        help="Write same_claim_as meta-claims (non-destructive)",
+    )
+    p_equiv.add_argument(
+        "--tolerance", type=float, default=0.01,
+        help="Relative numeric tolerance (default 0.01)",
+    )
+    p_equiv.add_argument(
+        "--window-days", type=int, default=1,
+        help="Time window in days for temporal overlap (default 1)",
+    )
+
+    # --- export ---
+    p_export = sub.add_parser(
+        "export",
+        help="Export a portable claim bundle (JSONL) for a scope and time range",
+    )
+    p_export.add_argument("--db", required=True, help="Path to .attest database")
+    p_export.add_argument(
+        "--scope", default="all",
+        help="all | workstream:NAME | user:EMAIL | topic:ENTITY_ID",
+    )
+    p_export.add_argument(
+        "--since", default=None,
+        help="ISO date (YYYY-MM-DD) or epoch seconds; only export claims at or after",
+    )
+    p_export.add_argument(
+        "--out", required=True,
+        help="Output directory; manifest.json/claims.jsonl/entities.jsonl/"
+             "provenance.jsonl/README.md will be written here",
     )
 
     # --- discover ---
@@ -888,6 +985,16 @@ def main():
         cmd_discover(args)
     elif args.command == "schema":
         cmd_schema(args)
+    elif args.command == "audit-quality":
+        cmd_audit_quality(args)
+    elif args.command == "build-equivalence":
+        cmd_build_equivalence(args)
+    elif args.command == "export":
+        from attestdb.cli.export import run_export
+        manifest = run_export(
+            db_path=args.db, scope=args.scope, output_dir=args.out, since=args.since,
+        )
+        print(json.dumps(manifest, indent=2))
     elif args.command == "install":
         from attestdb.mcp_install import install
         install(tools=args.tools, scope=args.scope)

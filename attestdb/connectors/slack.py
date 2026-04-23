@@ -687,6 +687,13 @@ class SlackConnector(Connector):
                         email = user_info.get("email", "")
                         if email:
                             subj_ext["email"] = email
+                        # Convert Slack ts (seconds float) to nanoseconds
+                        ts_ns = int(float(msg_ts) * 1_000_000_000) if msg_ts else None
+                        pl: dict = {"schema_ref": "slack/message", "data": {
+                            "user_id": uid,
+                            "channel": ch["name"],
+                            "ts": msg_ts,
+                        }}
                         structural_claims.append(
                             self._make_claim(
                                 user_name, "person",
@@ -695,6 +702,8 @@ class SlackConnector(Connector):
                                 f"slack:{ch['name']}:{msg_ts}",
                                 subj_ext=subj_ext,
                                 obj_ext={"slack_id": ch["id"]},
+                                timestamp=ts_ns,
+                                payload=pl,
                             )
                         )
 
@@ -719,6 +728,8 @@ class SlackConnector(Connector):
                                     f"slack:{ch['name']}:{msg_ts}",
                                     subj_ext=subj_ext,
                                     obj_ext=m_ext,
+                                    timestamp=ts_ns,
+                                    payload=pl,
                                 )
                             )
 
@@ -755,6 +766,7 @@ class SlackConnector(Connector):
                     ext_result = db.ingest_text(
                         text,
                         source_id=f"slack:{ch['name']}",
+                        source_type="slack",
                     )
                     ch_claims += ext_result.n_valid
                     result.claims_ingested += ext_result.n_valid
@@ -784,7 +796,7 @@ class SlackConnector(Connector):
                     source_id = f"slack:{ch['name']}:file:{fname}"
                     logger.info("Analyzing file %s for claims", fname)
                     try:
-                        ext_result = db.ingest_text(parsed, source_id=source_id)
+                        ext_result = db.ingest_text(parsed, source_id=source_id, source_type="slack")
                         file_claims += ext_result.n_valid
                         result.claims_ingested += ext_result.n_valid
                         result.claims_skipped += ext_result.n_rejected

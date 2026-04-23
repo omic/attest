@@ -32,6 +32,13 @@ class EventType:
     INSIGHT_ALERTS = "insight_alerts"
     AUTODIDACT_CYCLE_COMPLETED = "autodidact_cycle_completed"
     AUTODIDACT_BUDGET_EXHAUSTED = "autodidact_budget_exhausted"
+    CONFIDENCE_SHIFTED = "confidence_shifted"
+    CONTRADICTION_DETECTED = "contradiction_detected"
+    EXTERNAL_EVENT_RECEIVED = "external_event_received"
+    WORKFLOW_EVOLVED = "workflow_evolved"
+    AGENT_EXECUTED = "agent_executed"
+    AGENT_DEGRADED = "agent_degraded"
+    AGENT_REASSEMBLED = "agent_reassembled"
 
 
 _KNOWN_EVENTS: frozenset[str] = frozenset(

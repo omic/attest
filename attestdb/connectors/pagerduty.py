@@ -111,13 +111,19 @@ class PagerDutyConnector(StructuredConnector):
             f"PD-{inc_id}" if isinstance(inc_id, int) else str(inc_id)
         )
         source_id = f"pagerduty:{display_id}"
+        pl: dict = {"schema_ref": "pagerduty/incident", "data": {
+            "incident_id": incident.get("id", ""),
+            "incident_number": inc_id,
+            "urgency": incident.get("urgency", ""),
+            "status": incident.get("status", ""),
+        }}
 
         # Status
         status = incident.get("status", "")
         if status:
             yield self._make_claim(
                 display_id, "incident", "has_status",
-                status, "status", source_id,
+                status, "status", source_id, payload=pl,
             )
 
         # Urgency
@@ -125,7 +131,7 @@ class PagerDutyConnector(StructuredConnector):
         if urgency:
             yield self._make_claim(
                 display_id, "incident", "has_urgency",
-                urgency, "urgency", source_id,
+                urgency, "urgency", source_id, payload=pl,
             )
 
         # Service
@@ -133,7 +139,7 @@ class PagerDutyConnector(StructuredConnector):
         if service:
             yield self._make_claim(
                 display_id, "incident", "affects_service",
-                service, "service", source_id,
+                service, "service", source_id, payload=pl,
             )
 
         # Assignments (with external_ids)
@@ -143,7 +149,7 @@ class PagerDutyConnector(StructuredConnector):
             if assignee:
                 yield self._make_claim(
                     display_id, "incident", "assigned_to",
-                    assignee, "person", source_id,
+                    assignee, "person", source_id, payload=pl,
                     obj_ext={"person_name": assignee},
                 )
 
@@ -155,5 +161,5 @@ class PagerDutyConnector(StructuredConnector):
         if policy:
             yield self._make_claim(
                 display_id, "incident", "escalation_policy",
-                policy, "policy", source_id,
+                policy, "policy", source_id, payload=pl,
             )

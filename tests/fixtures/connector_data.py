@@ -150,6 +150,20 @@ def generate_github_responses(
         page_items = items[start:start + per_page]
         return FakeResponse(page_items)
 
+    # User profile cache for /users/{login} requests
+    _user_profiles: dict[str, dict] = {}
+    for i in range(len(_FIRST_NAMES)):
+        uname, uemail, ulogin = _person(i)
+        _user_profiles[ulogin] = {
+            "login": ulogin, "name": uname, "email": uemail,
+        }
+
+    def _users_handler(method, url, **kwargs):
+        # Extract login from /users/{login}
+        login = url.rstrip("/").rsplit("/", 1)[-1]
+        profile = _user_profiles.get(login, {"login": login})
+        return FakeResponse(profile)
+
     n_with_assignees = sum(1 for i in range(n_issues + n_prs) if i % 3 != 0)
     n_with_bodies = sum(1 for i in range(n_issues + n_prs) if i % 4 != 0)
 
@@ -157,6 +171,7 @@ def generate_github_responses(
         "routes": {
             f"/repos/{repo}/issues": _issues_handler,
             "/search/issues": FakeResponse({"items": []}),
+            "/users/": _users_handler,
         },
         "expected": {
             "total_items": n_issues + n_prs,
@@ -169,6 +184,115 @@ def generate_github_responses(
             "structural_claims": (
                 (n_issues + n_prs) * 4  # authored_by + state + 2 labels
                 + n_with_assignees      # assigned_to
+            ),
+        },
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# GitLab
+# ══════════════════════════════════════════════════════════════════════
+
+def generate_gitlab_responses(
+    n_issues: int = 20,
+    n_mrs: int = 5,
+    project: str = "testorg/testrepo",
+) -> dict:
+    """Generate GitLab issues + merge requests API responses.
+
+    Returns ``{"routes": {...}, "expected": {...}}`` where expected
+    contains deterministic counts for assertions.
+    """
+    issues = []
+    for i in range(n_issues):
+        name, email, login = _person(i)
+        assignee_name, _, assignee_login = _person((i + 3) % 10)
+        issue: dict = {
+            "iid": i + 1,
+            "title": f"Issue #{i + 1}: Fix bug in module-{i % 5}",
+            "state": _STATUSES[i % len(_STATUSES)],
+            "author": {"username": login, "name": name},
+            "labels": [
+                _LABELS[i % len(_LABELS)],
+                _LABELS[(i + 1) % len(_LABELS)],
+            ],
+            "assignees": (
+                [{"username": assignee_login, "name": assignee_name}]
+                if i % 3 != 0 else []
+            ),
+            "milestone": (
+                {"title": f"v{(i % 3) + 1}.0"}
+                if i % 4 == 0 else None
+            ),
+            "description": (
+                f"Description for issue {i + 1}."
+                if i % 4 != 0 else ""
+            ),
+        }
+        issues.append(issue)
+
+    mrs = []
+    for i in range(n_mrs):
+        name, email, login = _person(i + n_issues)
+        mrs.append({
+            "iid": n_issues + i + 1,
+            "title": f"MR !{n_issues + i + 1}: Add feature-{i % 3}",
+            "state": "merged" if i % 2 == 0 else "opened",
+            "author": {"username": login, "name": name},
+            "labels": [_LABELS[(i + 2) % len(_LABELS)]],
+            "assignees": [],
+            "milestone": None,
+            "description": f"Merge request description {i + 1}.",
+        })
+
+    # User profile cache for /users?username= requests
+    _user_profiles: dict[str, list[dict]] = {}
+    for i in range(len(_FIRST_NAMES)):
+        uname, uemail, ulogin = _person(i)
+        _user_profiles[ulogin] = [{
+            "username": ulogin, "name": uname, "public_email": uemail,
+        }]
+
+    def _issues_handler(method, url, **kwargs):
+        params = kwargs.get("params", {})
+        page = int(params.get("page", 1))
+        per_page = int(params.get("per_page", 100))
+        start = (page - 1) * per_page
+        return FakeResponse(issues[start:start + per_page])
+
+    def _mrs_handler(method, url, **kwargs):
+        params = kwargs.get("params", {})
+        page = int(params.get("page", 1))
+        per_page = int(params.get("per_page", 100))
+        start = (page - 1) * per_page
+        return FakeResponse(mrs[start:start + per_page])
+
+    def _users_handler(method, url, **kwargs):
+        params = kwargs.get("params", {})
+        username = params.get("username", "")
+        return FakeResponse(_user_profiles.get(username, []))
+
+    n_with_assignees = sum(1 for i in range(n_issues) if i % 3 != 0)
+    n_with_milestones = sum(1 for i in range(n_issues) if i % 4 == 0)
+
+    return {
+        "routes": {
+            "/issues": _issues_handler,
+            "/merge_requests": _mrs_handler,
+            "/users": _users_handler,
+            "/search": FakeResponse([]),
+        },
+        "expected": {
+            "total_issues": n_issues,
+            "total_mrs": n_mrs,
+            "structural_claims": (
+                # Issues: authored_by + state + 2 labels + belongs_to(project)
+                #   + assigned_to + milestone
+                n_issues * 5  # authored_by + state + 2 labels + belongs_to
+                + n_with_assignees
+                + n_with_milestones
+                # MRs: authored_by + state + 1 label + belongs_to(project)
+                + n_mrs * 4
             ),
         },
     }
@@ -806,5 +930,555 @@ def generate_hubspot_responses(
                 + n_deals * 4
                 + n_notes * 2
             ),
+        },
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Box
+# ══════════════════════════════════════════════════════════════════════
+
+def generate_box_responses(
+    n_files: int = 10,
+    folder_id: str = "0",
+) -> dict:
+    """Generate Box API responses for folder listing and file downloads."""
+    files = []
+    file_contents = {}
+    for i in range(n_files):
+        name, email, _ = _person(i % len(_FIRST_NAMES))
+        dept = _DEPARTMENTS[i % len(_DEPARTMENTS)]
+        file_id = f"f-{i:04d}"
+        filename = f"report_{dept}_{i}.txt"
+        files.append({
+            "type": "file",
+            "id": file_id,
+            "name": filename,
+        })
+        file_contents[file_id] = (
+            f"Quarterly Report for {dept.title()} Department\n"
+            f"Author: {name} ({email})\n"
+            f"Status: {'complete' if i % 3 != 0 else 'draft'}\n"
+            f"Revenue target achieved: {70 + i * 3}%\n"
+            f"Headcount: {10 + i * 5}\n"
+        )
+
+    def _box_handler(method, url, **kwargs):
+        if f"/folders/{folder_id}/items" in url:
+            return FakeResponse({
+                "entries": files,
+                "total_count": len(files),
+            })
+        for fid, content in file_contents.items():
+            if f"/files/{fid}/content" in url:
+                return FakeResponse(text=content)
+        return FakeResponse({})
+
+    return {
+        "routes": {"api.box.com": _box_handler},
+        "expected": {
+            "n_files": n_files,
+            # Box is a text connector — claim count depends on extraction mode
+            # With extraction="none", each file produces 1 raw text claim
+            "structural_claims": n_files,
+        },
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Confluence
+# ══════════════════════════════════════════════════════════════════════
+
+def generate_confluence_responses(
+    n_pages: int = 10,
+    space_key: str = "ENG",
+) -> dict:
+    """Generate Confluence REST API responses for page listing and content."""
+    pages = []
+    for i in range(n_pages):
+        name, email, _ = _person(i % len(_FIRST_NAMES))
+        dept = _DEPARTMENTS[i % len(_DEPARTMENTS)]
+        title = f"{dept.title()} {['Runbook', 'Architecture', 'Onboarding', 'Postmortem', 'RFC'][i % 5]} #{i}"
+        body = (
+            f"<h1>{title}</h1>"
+            f"<p>Author: {name}. Department: {dept}.</p>"
+            f"<p>This document describes the {dept} team's "
+            f"{'operational procedures' if i % 2 == 0 else 'technical design'}.</p>"
+            f"<p>Status: {'approved' if i % 3 != 0 else 'draft'}. "
+            f"Last reviewed: 2024-0{(i % 9) + 1}-15.</p>"
+        )
+        pages.append({
+            "id": f"page-{i:04d}",
+            "title": title,
+            "body": {"storage": {"value": body}},
+            "space": {"key": space_key},
+            "status": "current",
+        })
+
+    def _confluence_handler(method, url, **kwargs):
+        params = kwargs.get("params", {})
+        if "/rest/api/content" in url:
+            start = int(params.get("start", 0))
+            limit = int(params.get("limit", 25))
+            chunk = pages[start:start + limit]
+            return FakeResponse({
+                "results": chunk,
+                "start": start,
+                "limit": limit,
+                "size": len(chunk),
+                "_links": {},
+            })
+        return FakeResponse({"results": []})
+
+    return {
+        "routes": {"atlassian.net": _confluence_handler},
+        "expected": {
+            "n_pages": n_pages,
+            # TextConnector — with extraction="none", no claims
+            "structural_claims": 0,
+        },
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Google Sheets
+# ══════════════════════════════════════════════════════════════════════
+
+def generate_google_sheets_data(
+    n_rows: int = 20,
+) -> dict:
+    """Generate Google Sheets API-compatible row data.
+
+    Returns row data suitable for mocking the Sheets API values.get response,
+    plus a mapping dict for the GoogleSheetsConnector.
+    """
+    headers = ["employee_name", "department", "title", "status", "manager"]
+    rows = [headers]
+    for i in range(n_rows):
+        name, _, _ = _person(i % len(_FIRST_NAMES))
+        mgr_name, _, _ = _person((i + 3) % len(_FIRST_NAMES))
+        dept = _DEPARTMENTS[i % len(_DEPARTMENTS)]
+        title = ["Engineer", "Manager", "Director", "VP", "Analyst"][i % 5]
+        status = "active" if i % 5 != 0 else "on_leave"
+        rows.append([name, dept, title, status, mgr_name])
+
+    mapping = {
+        "subject": "employee_name",
+        "subject_type": "person",
+        "predicate": "department",
+        "predicate_type": "part_of",
+        "object": "department",
+        "object_type": "entity",
+    }
+
+    return {
+        "values": rows,
+        "mapping": mapping,
+        "expected": {
+            "n_rows": n_rows,
+            "structural_claims": n_rows,
+        },
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Teams
+# ══════════════════════════════════════════════════════════════════════
+
+def generate_teams_responses(
+    n_channels: int = 2,
+    n_messages: int = 5,
+) -> dict:
+    """Generate Microsoft Teams Graph API responses."""
+    channels = [
+        {"id": f"ch-{i}", "displayName": f"channel-{i}"}
+        for i in range(n_channels)
+    ]
+
+    messages = []
+    for i in range(n_messages):
+        name, email, _ = _person(i % len(_FIRST_NAMES))
+        messages.append({
+            "messageType": "message",
+            "from": {"user": {"displayName": name, "mail": email}},
+            "body": {
+                "contentType": "text",
+                "content": f"Update from {name}: {_DEPARTMENTS[i % len(_DEPARTMENTS)]} "
+                           f"team completed sprint {i} review.",
+            },
+        })
+    # Add a system message (should be skipped)
+    messages.append({
+        "messageType": "systemEventMessage",
+        "body": {"contentType": "text", "content": "User joined the team"},
+    })
+
+    def _teams_handler(method, url, **kwargs):
+        if "/channels" in url and "/messages" not in url:
+            return FakeResponse({"value": channels})
+        if "/messages" in url:
+            return FakeResponse({"value": messages})
+        return FakeResponse({})
+
+    return {
+        "routes": {"graph.microsoft.com": _teams_handler},
+        "expected": {
+            "n_channels": n_channels,
+            "n_messages": n_messages,
+            # Text connector — structural claims depend on extraction mode
+            "structural_claims": 0,
+        },
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Gmail
+# ══════════════════════════════════════════════════════════════════════
+
+def generate_gmail_responses(n_threads: int = 5) -> dict:
+    """Generate Gmail REST API responses."""
+    import base64 as _b64
+
+    threads = [{"id": f"thread-{i:03d}"} for i in range(n_threads)]
+
+    def _gmail_handler(method, url, **kwargs):
+        if "/users/me/threads" in url and "format" not in str(kwargs.get("params", {})):
+            return FakeResponse({"threads": threads})
+        for i in range(n_threads):
+            if f"thread-{i:03d}" in url:
+                name, email, _ = _person(i % len(_FIRST_NAMES))
+                dept = _DEPARTMENTS[i % len(_DEPARTMENTS)]
+                body = (
+                    f"Hi team,\n\n{name} from {dept} reporting: "
+                    f"Q{(i % 4) + 1} results are in. "
+                    f"Revenue target {'met' if i % 3 != 0 else 'missed'}.\n\n"
+                    f"Best,\n{name}\n{email}"
+                )
+                encoded = _b64.urlsafe_b64encode(body.encode()).decode()
+                return FakeResponse({
+                    "messages": [{
+                        "payload": {
+                            "mimeType": "text/plain",
+                            "body": {"data": encoded},
+                        },
+                    }],
+                })
+        return FakeResponse({})
+
+    return {
+        "routes": {"googleapis.com": _gmail_handler},
+        "expected": {
+            "n_threads": n_threads,
+            "structural_claims": 0,  # Text connector
+        },
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Google Docs
+# ══════════════════════════════════════════════════════════════════════
+
+def generate_gdocs_responses(n_docs: int = 5) -> dict:
+    """Generate Google Drive + Docs API responses."""
+    files = [
+        {
+            "id": f"doc-{i:03d}",
+            "name": f"{_DEPARTMENTS[i % len(_DEPARTMENTS)].title()} Report #{i}",
+            "mimeType": "application/vnd.google-apps.document",
+        }
+        for i in range(n_docs)
+    ]
+
+    def _gdocs_handler(method, url, **kwargs):
+        if "drive/v3/files" in url:
+            return FakeResponse({"files": files})
+        for i in range(n_docs):
+            if f"doc-{i:03d}" in url:
+                name, _, _ = _person(i % len(_FIRST_NAMES))
+                dept = _DEPARTMENTS[i % len(_DEPARTMENTS)]
+                return FakeResponse({
+                    "body": {
+                        "content": [{
+                            "paragraph": {
+                                "elements": [{
+                                    "textRun": {
+                                        "content": (
+                                            f"Author: {name}, Department: {dept}. "
+                                            f"This document covers the {dept} team's "
+                                            f"Q{(i % 4) + 1} objectives and results.\n"
+                                        ),
+                                    },
+                                }],
+                            },
+                        }],
+                    },
+                })
+        return FakeResponse({})
+
+    return {
+        "routes": {"googleapis.com": _gdocs_handler},
+        "expected": {
+            "n_docs": n_docs,
+            "structural_claims": n_docs,  # GDocs has custom run() that ingests raw text
+        },
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Notion
+# ══════════════════════════════════════════════════════════════════════
+
+def generate_notion_responses(n_pages: int = 5) -> dict:
+    """Generate Notion API responses (POST search + GET blocks)."""
+    pages = []
+    for i in range(n_pages):
+        dept = _DEPARTMENTS[i % len(_DEPARTMENTS)]
+        pages.append({
+            "id": f"page-{i:03d}",
+            "properties": {
+                "Name": {
+                    "type": "title",
+                    "title": [{"plain_text": f"{dept.title()} Wiki #{i}"}],
+                },
+            },
+        })
+
+    def _notion_handler(method, url, **kwargs):
+        if method == "POST":
+            return FakeResponse({"results": pages, "has_more": False})
+        for i in range(n_pages):
+            if f"page-{i:03d}" in url:
+                name, _, _ = _person(i % len(_FIRST_NAMES))
+                dept = _DEPARTMENTS[i % len(_DEPARTMENTS)]
+                return FakeResponse({
+                    "results": [{
+                        "type": "paragraph",
+                        "paragraph": {
+                            "rich_text": [{
+                                "plain_text": (
+                                    f"Maintained by {name}. "
+                                    f"The {dept} team's internal knowledge base "
+                                    f"covering processes and runbooks."
+                                ),
+                            }],
+                        },
+                    }],
+                    "has_more": False,
+                })
+        return FakeResponse({"results": [], "has_more": False})
+
+    return {
+        "routes": {"api.notion.com": _notion_handler},
+        "expected": {
+            "n_pages": n_pages,
+            "structural_claims": 0,  # Text connector
+        },
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Zoho Mail
+# ══════════════════════════════════════════════════════════════════════
+
+def generate_zoho_responses(n_emails: int = 5) -> dict:
+    """Generate Zoho Mail API responses."""
+    emails = []
+    for i in range(n_emails):
+        name, email_addr, _ = _person(i % len(_FIRST_NAMES))
+        dept = _DEPARTMENTS[i % len(_DEPARTMENTS)]
+        emails.append({
+            "messageId": f"msg-{i:03d}",
+            "folderId": "inbox-001",
+            "subject": f"{dept.title()} Update from {name}",
+            "fromAddress": email_addr,
+            "receivedTime": 1700000000 + i * 3600000,
+            "content": (
+                f"<html><body><p>Hi team,</p>"
+                f"<p>{name} from {dept}: quarterly review complete. "
+                f"All targets {'achieved' if i % 3 != 0 else 'under review'}.</p>"
+                f"</body></html>"
+            ),
+        })
+
+    def _zoho_handler(method, url, **kwargs):
+        if "/messages/view" in url:
+            return FakeResponse({"data": emails})
+        for i in range(n_emails):
+            if f"msg-{i:03d}" in url and "/content" in url:
+                return FakeResponse({
+                    "data": {
+                        "subject": emails[i]["subject"],
+                        "content": emails[i]["content"],
+                    },
+                })
+        return FakeResponse({"data": {}})
+
+    return {
+        "routes": {"mail.zoho.com": _zoho_handler},
+        "expected": {
+            "n_emails": n_emails,
+            "structural_claims": 0,  # Text connector
+        },
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# HTTP (generic)
+# ══════════════════════════════════════════════════════════════════════
+
+def generate_http_responses(n_items: int = 10) -> dict:
+    """Generate generic HTTP/JSON API responses for HTTPConnector."""
+    items = []
+    for i in range(n_items):
+        name, _, _ = _person(i % len(_FIRST_NAMES))
+        dept = _DEPARTMENTS[i % len(_DEPARTMENTS)]
+        items.append({
+            "id": f"item-{i:03d}",
+            "name": name,
+            "relationship": "part_of",
+            "department": dept,
+            "status": _STATUSES[i % len(_STATUSES)],
+        })
+
+    return {
+        "routes": {
+            "example.com": FakeResponse(items),
+        },
+        "mapping": {
+            "subject": "name", "subject_type": "person",
+            "predicate": "relationship", "predicate_type": "part_of",
+            "object": "department", "object_type": "entity",
+        },
+        "expected": {
+            "n_items": n_items,
+            "structural_claims": n_items,
+        },
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Airtable
+# ══════════════════════════════════════════════════════════════════════
+
+def generate_airtable_responses(n_records: int = 10) -> dict:
+    """Generate Airtable API responses."""
+    records = []
+    for i in range(n_records):
+        name, _, _ = _person(i % len(_FIRST_NAMES))
+        dept = _DEPARTMENTS[i % len(_DEPARTMENTS)]
+        records.append({
+            "id": f"rec{i:04d}",
+            "fields": {
+                "Name": name,
+                "relationship": "part_of",
+                "Department": dept,
+                "Status": _STATUSES[i % len(_STATUSES)],
+            },
+        })
+
+    return {
+        "routes": {
+            "api.airtable.com": FakeResponse({"records": records}),
+        },
+        "mapping": {
+            "subject": "Name", "subject_type": "person",
+            "predicate": "relationship", "predicate_type": "part_of",
+            "object": "Department", "object_type": "entity",
+        },
+        "expected": {
+            "n_records": n_records,
+            "structural_claims": n_records,
+        },
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# GDrive
+# ══════════════════════════════════════════════════════════════════════
+
+def generate_gdrive_responses(n_files: int = 5) -> dict:
+    """Generate Google Drive API responses for file listing + download."""
+    files = []
+    file_contents = {}
+    for i in range(n_files):
+        name, email, _ = _person(i % len(_FIRST_NAMES))
+        dept = _DEPARTMENTS[i % len(_DEPARTMENTS)]
+        file_id = f"gdrive-{i:03d}"
+        files.append({
+            "id": file_id,
+            "name": f"{dept}_notes_{i}.txt",
+            "mimeType": "text/plain",
+        })
+        file_contents[file_id] = (
+            f"Meeting notes - {dept.title()} department\n"
+            f"Attendee: {name} ({email})\n"
+            f"Topic: Q{(i % 4) + 1} planning and resource allocation.\n"
+        )
+
+    def _gdrive_handler(method, url, **kwargs):
+        # List endpoint: drive/v3/files (no specific file ID after)
+        if "drive/v3/files" in url:
+            # Check if this is a file-specific request (has ID in path)
+            after = url.split("drive/v3/files")[-1]
+            if not after or after == "":
+                return FakeResponse({"files": files})
+            # File content download
+            for fid, content in file_contents.items():
+                if fid in url:
+                    return FakeResponse(text=content)
+        return FakeResponse({})
+
+    return {
+        "routes": {"googleapis.com": _gdrive_handler},
+        "expected": {
+            "n_files": n_files,
+            "structural_claims": n_files,  # 1 raw text claim per file
+        },
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SharePoint
+# ══════════════════════════════════════════════════════════════════════
+
+def generate_sharepoint_responses(n_files: int = 5) -> dict:
+    """Generate SharePoint Graph API responses."""
+    files = []
+    file_contents = {}
+    for i in range(n_files):
+        name, email, _ = _person(i % len(_FIRST_NAMES))
+        dept = _DEPARTMENTS[i % len(_DEPARTMENTS)]
+        item_id = f"sp-{i:03d}"
+        dl_url = f"https://download.sharepoint.com/{item_id}"
+        files.append({
+            "id": item_id,
+            "name": f"{dept}_policy_{i}.txt",
+            "file": {"mimeType": "text/plain"},
+            "size": 500 + i * 100,
+            "@microsoft.graph.downloadUrl": dl_url,
+        })
+        file_contents[dl_url] = (
+            f"Policy Document: {dept.title()} Department\n"
+            f"Owner: {name}\n"
+            f"Last review: 2024-0{(i % 9) + 1}-01\n"
+            f"Status: {'approved' if i % 3 != 0 else 'pending review'}\n"
+        )
+
+    def _sp_handler(method, url, **kwargs):
+        if "/children" in url or "/items" in url:
+            return FakeResponse({"value": files})
+        for dl_url, content in file_contents.items():
+            if dl_url in url or url == dl_url:
+                return FakeResponse(text=content)
+        return FakeResponse({})
+
+    return {
+        "routes": {
+            "graph.microsoft.com": _sp_handler,
+            "download.sharepoint.com": _sp_handler,
+        },
+        "expected": {
+            "n_files": n_files,
+            "structural_claims": n_files,
         },
     }

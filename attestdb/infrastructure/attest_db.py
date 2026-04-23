@@ -119,6 +119,23 @@ def _make_store(db_path: str, *, read_only: bool = False):
     return RustStore(rust_path)
 
 
+class TopologyNotComputedError(RuntimeError):
+    """Raised when a topology-gated method is called without compute_topology().
+
+    Servers can catch this and map to HTTP 409 Conflict with actionable hint.
+    Carries .operation (what was attempted) and .hint (how to fix).
+    """
+
+    def __init__(self, operation: str = "unknown"):
+        self.operation = operation
+        self.hint = (
+            "Knowledge topology has not been computed for this database. "
+            "Call db.compute_topology() first, or install attestdb-enterprise "
+            "to enable Leiden community detection."
+        )
+        super().__init__(f"{operation}: {self.hint}")
+
+
 class HypotheticalContext:
     """Sandbox for speculative what-if reasoning.
 
@@ -564,9 +581,22 @@ class AttestDB:
             if os.path.exists(index_path):
                 self._embedding_index = EmbeddingIndex.load_from(index_path)
 
+        # Predicate store — single source of truth for predicate metadata
+        from attestdb.core.predicate_store import PredicateStore
+        self._predicate_store = PredicateStore(self._store)
+        self._predicate_store.seed_core()
+
         # Ingestion pipeline
         self._pipeline = IngestionPipeline(
-            self._store, self._embedding_index, embedding_dim, strict
+            self._store, self._embedding_index, embedding_dim, strict,
+            predicate_store=self._predicate_store,
+        )
+        # Default extraction-quality gate: filters parenthetical-only and
+        # citation-context evidence from LLM extractors. Generic across
+        # all ingestion pipelines. See attestdb/core/extraction_quality.py.
+        from attestdb.infrastructure.ingestion import extraction_quality_gate
+        self._pipeline.register_quality_gate(
+            extraction_quality_gate(), name="extraction_quality",
         )
 
         # Python-level status overlays for statuses the Rust fast path doesn't track.
@@ -602,6 +632,16 @@ class AttestDB:
         self._rbac_mgr = RBACManager(rbac_path, self._audit, lambda: self._store.get_namespace_filter())
         self._events = EventBus(self._webhooks_mgr, lambda cid: self.get_claim(cid))
         self._entity_mgr = EntityManager(self)
+        self._entity_resolver = None
+
+        # Enable external_ids entity resolution by default.
+        # This is lightweight (dict lookups only, no fuzzy matching).
+        # Connectors emit external_ids via _make_claim(); the resolver
+        # matches entities across sources using those IDs at ingestion time.
+        try:
+            self.enable_entity_resolution("external_ids")
+        except Exception:
+            pass  # Non-critical — resolution degrades gracefully
 
         # Continuous ingestion scheduler (lazy-init)
         self._scheduler = None
@@ -713,6 +753,15 @@ class AttestDB:
         """Clear all cached analytical results (called on writes)."""
         self._cache.clear()
         self._cache_ts.clear()
+
+    def cached(self, key: str, fn, ttl: float = 120) -> object:
+        """Public wrapper around the TTL cache. Auto-invalidates on any write.
+
+        For user-defined aggregations — compute once, reuse until next ingest.
+        Example:
+            leads = db.cached("home_leads", lambda: expensive_compute(), ttl=300)
+        """
+        return self._cached(key, fn, ttl)
 
     # --- Security layer (delegated to SecurityLayer) ---
 
@@ -828,16 +877,16 @@ class AttestDB:
                 self._pipeline._embedding_index = self._embedding_index
                 self._pipeline._embedding_dim = dimensions
 
-            import openai
-            client = openai.OpenAI(api_key=api_key)
+            try:
+                from attestdb.intelligence.llm_client import make_openai_embedder
+            except ImportError as exc:
+                raise ValueError(
+                    "The 'openai' embedding provider requires the attestdb.intelligence "
+                    "layer to be installed. Pass a custom embed_fn callable instead, or "
+                    "install the enterprise package."
+                ) from exc
 
-            def _openai_embed(text: str) -> list[float]:
-                resp = client.embeddings.create(
-                    input=text, model=model, dimensions=dimensions,
-                )
-                return resp.data[0].embedding
-
-            self._pipeline._embed_fn = _openai_embed
+            self._pipeline._embed_fn = make_openai_embedder(api_key, model, dimensions)
         else:
             raise ValueError(f"Unknown embedding provider: {provider!r}. Use 'openai' or a callable.")
 
@@ -887,6 +936,11 @@ class AttestDB:
     def ingestion_pipeline(self) -> IngestionPipeline:
         """Access the ingestion pipeline for registering quality gates."""
         return self._pipeline
+
+    @property
+    def predicate_store(self):
+        """Access the predicate store for querying and registering predicates."""
+        return self._predicate_store
 
     @property
     def _is_memory_db(self) -> bool:
@@ -1001,6 +1055,37 @@ class AttestDB:
         """Return the total number of claims without materializing them."""
         return self._store.count_claims()
 
+    # --- Reader-slot maintenance ---
+
+    def reader_check(self) -> int:
+        """Prune LMDB reader slots left behind by dead processes.
+
+        Returns the number of stale slots freed. AttestDB calls this
+        automatically on every open, so manual invocation is only needed
+        by long-running services that want to run it on a background
+        timer (e.g. once a minute) as defense-in-depth against crash
+        loops that chew through the reader table faster than restart
+        healing can reclaim it. No-op for in-memory stores.
+        """
+        fn = getattr(self._store, "reader_check", None)
+        if fn is None:  # older compiled wheel
+            return 0
+        return int(fn())
+
+    def reader_info(self) -> tuple[int, int]:
+        """Return (slots_used, slots_max) for the LMDB reader table.
+
+        ``slots_used`` counts both live and stale entries. Call
+        ``reader_check()`` first if you want a live-only count.
+        Returns (0, 0) for in-memory stores or older compiled wheels
+        that predate the binding.
+        """
+        fn = getattr(self._store, "reader_info", None)
+        if fn is None:
+            return (0, 0)
+        used, maximum = fn()
+        return (int(used), int(maximum))
+
     # --- Database lifecycle ---
 
     def close(self) -> None:
@@ -1022,6 +1107,9 @@ class AttestDB:
                     self._scheduler.stop_all()
                     self._scheduler = None
                 self._webhooks_mgr.shutdown()
+                ps = getattr(self, "_predicate_store", None)
+                if ps is not None:
+                    ps.persist_all()
                 self._flush_chain_log()
                 if self._multi_embedding_index and len(self._multi_embedding_index) > 0:
                     self._multi_embedding_index.save(self._db_path)
@@ -2421,10 +2509,11 @@ class AttestDB:
     # --- Entity resolution ---
 
     def enable_entity_resolution(self, mode: str = "external_ids") -> None:
-        """Enable entity resolution during ingestion.
+        """Enable or re-enable entity resolution during ingestion.
 
         Modes: "external_ids" (exact + ext ID), "fuzzy" (+ text search), "full" (reserved).
-        Must be called explicitly -- resolution is opt-in.
+        External ID resolution is enabled by default at init. Call this to switch
+        modes (e.g., to "fuzzy") or to re-enable after disabling.
         """
         self._entity_mgr.enable_entity_resolution(mode)
 
@@ -2469,6 +2558,54 @@ class AttestDB:
     def search_entities(self, query: str, top_k: int = 10) -> list[EntitySummary]:
         """Search entities by text matching on id and display_name."""
         return self._entity_mgr.search_entities(query, top_k)
+
+    def lookup_entity(
+        self, query: str, entity_type: str | None = None,
+    ) -> EntitySummary | None:
+        """Best-effort "user typed this, which entity did they mean?" lookup.
+
+        Uses BM25 search_entities, then re-ranks by match tier
+        (exact name > token-match > prefix > substring) and falls back on
+        claim_count as a prominence tie-breaker. Returns None if no entity
+        contains any query token.
+
+        Different from resolve_entity — this is for interactive user queries,
+        not deduplication during ingest.
+        """
+        q = (query or "").strip().lower()
+        if not q:
+            return None
+        try:
+            hits = self.search_entities(query, top_k=30) or []
+        except Exception:
+            hits = []
+        if not hits:
+            return None
+
+        def _rank(e) -> tuple[int, int]:
+            if entity_type and (e.entity_type or "") != entity_type:
+                return (-1, 0)
+            name = (e.name or e.id or "").lower()
+            eid = (e.id or "").lower()
+            if name == q or eid == q:
+                tier = 4
+            elif q in name.split() or q in eid.split():
+                tier = 3
+            elif name.startswith(q + " ") or name.endswith(" " + q):
+                tier = 2
+            elif q in name or q in eid:
+                tier = 1
+            else:
+                q_toks = set(q.split())
+                name_toks = set(name.split())
+                tier = 1 if q_toks and q_toks.issubset(name_toks) else 0
+            return (tier, e.claim_count)
+
+        hits.sort(key=_rank, reverse=True)
+        top = hits[0]
+        if _rank(top)[0] <= 0:
+            return None
+        return top
 
     # --- Entity aliases ---
 
@@ -2541,16 +2678,18 @@ class AttestDB:
         """Generate a human-readable label for a cluster of entities."""
         return self._ask_engine._label_cluster(cluster, entity_map)
 
-    def ask(self, question: str, top_k: int = 10) -> AskResult:
+    def ask(self, question: str, top_k: int = 10, engine: str = "v2") -> AskResult:
         """Answer a natural-language question using the knowledge graph.
 
-        Fast path (search hits >= 3): search -> evidence -> single LLM call.
-        Slow path (few search hits): adds type catalog + LLM type selection.
+        Args:
+            question: Natural-language question.
+            top_k: Maximum entities to consider.
+            engine: Pipeline — "v2" (default), "v3" (Agent SDK), or "shadow".
 
         Returns AskResult with structured citations, contradictions, and gaps.
         Dict-compatible for backward compat (r["answer"] works).
         """
-        return self._ask_engine.ask(question, top_k)
+        return self._ask_engine.ask(question, top_k, engine=engine)
 
     def _gather_clustered_evidence(
         self,
@@ -2589,10 +2728,11 @@ class AttestDB:
         source_type: str | None = None,
         min_confidence: float = 0.0,
         principal: "Principal | None" = None,
+        limit: int = 0,
     ) -> list[Claim]:
         claims = [
             claim_from_dict(d)
-            for d in self._store.claims_for(entity_id, predicate_type, source_type, min_confidence)
+            for d in self._store.claims_for(entity_id, predicate_type, source_type, min_confidence, limit)
         ]
         claims = self._apply_trust_filter(claims)
         return self._security_filter(claims, principal)
@@ -2605,6 +2745,53 @@ class AttestDB:
         """Return all claims with the given source_id via Rust index (O(k))."""
         claims = [claim_from_dict(d) for d in self._store.claims_by_source_id(source_id)]
         return self._security_filter(claims)
+
+    def claims_by_payload(
+        self,
+        schema_ref: str | None = None,
+        record_id: str | None = None,
+        field: str | None = None,
+        value: str | None = None,
+        limit: int = 100,
+    ) -> list["Claim"]:
+        """Search claims by payload fields.
+
+        Scans claims with payloads and filters by:
+        - schema_ref: exact match on payload.schema_ref (e.g., "salesforce/opportunity")
+        - record_id: exact match on payload.data["record_id"]
+        - field+value: exact match on payload.data[field] == value
+
+        Returns up to `limit` matching claims, newest first.
+        """
+        if not schema_ref and not record_id and not (field and value):
+            return []
+
+        results: list[Claim] = []
+        # Use source_type scan if schema_ref gives us a hint
+        # Otherwise fall back to entity scan
+        seen: set[str] = set()
+        for entity in self.list_entities(limit=0):
+            if len(results) >= limit:
+                break
+            for claim in self.claims_for(entity.id):
+                if claim.claim_id in seen:
+                    continue
+                seen.add(claim.claim_id)
+                if not claim.payload:
+                    continue
+                pl = claim.payload
+                if schema_ref and pl.schema_ref != schema_ref:
+                    continue
+                if record_id and pl.data.get("record_id") != record_id:
+                    continue
+                if field and value and str(pl.data.get(field, "")) != value:
+                    continue
+                results.append(claim)
+                if len(results) >= limit:
+                    break
+
+        results.sort(key=lambda c: c.timestamp, reverse=True)
+        return self._security_filter(results[:limit])
 
     def corroboration_report(self, min_sources: int = 2) -> dict:
         """Report on corroboration status across the knowledge graph."""
@@ -3266,22 +3453,28 @@ class AttestDB:
         self._topology = KnowledgeTopology(adj, entity_types)
         self._topology.compute(resolutions, min_community_size)
 
+    def _require_topology(self, op: str) -> None:
+        """Raise a structured error if topology isn't computed.
+
+        Callers (servers, MCP) can catch TopologyNotComputedError and map
+        it to a 409 Conflict with actionable hint text.
+        """
+        if not hasattr(self, "_topology") or self._topology is None:
+            raise TopologyNotComputedError(operation=op)
+
     def topics(self, level: int | None = None) -> list[TopicNode]:
         """Return topic nodes from computed topology."""
-        if not hasattr(self, "_topology") or self._topology is None:
-            raise RuntimeError("Call compute_topology() first")
+        self._require_topology("topics")
         return self._topology.topics(level)
 
     def density_map(self) -> list[DensityMapEntry]:
         """Return density map from computed topology."""
-        if not hasattr(self, "_topology") or self._topology is None:
-            raise RuntimeError("Call compute_topology() first")
+        self._require_topology("density_map")
         return self._topology.density_map()
 
     def cross_domain_bridges(self, top_k: int = 20) -> list[CrossDomainBridge]:
         """Return cross-domain bridge entities from computed topology."""
-        if not hasattr(self, "_topology") or self._topology is None:
-            raise RuntimeError("Call compute_topology() first")
+        self._require_topology("cross_domain_bridges")
         return self._topology.cross_domain_bridges(top_k)
 
     # --- Quality report ---
@@ -3289,6 +3482,64 @@ class AttestDB:
     def quality_report(self, stale_threshold: int = 0, expected_patterns=None):
         """Generate a quality report over the entire knowledge graph."""
         return self._analytics.quality_report(stale_threshold, expected_patterns)
+
+    # --- Extraction benchmarking ---
+
+    def benchmark_extraction(
+        self,
+        messages: list[str] | None = None,
+        providers: list[str] | None = None,
+        max_cost_usd: float | None = None,
+        n_sample: int = 20,
+    ):
+        """Benchmark LLM extraction quality across providers.
+
+        Runs the same text samples through each available provider and
+        compares: claims extracted, acceptance rate, latency, and cost.
+        Use this to pick the best extraction model for your data and budget.
+
+        Args:
+            messages: Text samples to benchmark. If None, samples from
+                existing claim evidence in the database.
+            providers: Provider names to test (e.g. ["gemini", "groq"]).
+                If None, tests all providers with available API keys.
+            max_cost_usd: Skip providers whose estimated cost exceeds this.
+            n_sample: Number of messages to sample from the DB when
+                ``messages`` is not provided.
+
+        Returns:
+            ExtractionBenchmark with per-provider results and recommendation.
+            Call ``.summary()`` for a human-readable table, ``.recommend()``
+            for the best provider, or ``.recommend(budget_usd=0.01)`` to
+            constrain by cost.
+        """
+        from attestdb.intelligence.text_extractor import TextExtractor
+
+        if messages is None:
+            messages = []
+            for claim in self._all_claims():
+                ev = ""
+                if hasattr(claim, "payload") and isinstance(claim.payload, dict):
+                    ev = (claim.payload.get("data") or {}).get("evidence", "")
+                if ev and len(ev) > 50:
+                    messages.append(ev)
+                if len(messages) >= n_sample:
+                    break
+
+            if not messages:
+                raise ValueError(
+                    "No text samples available. Pass messages= explicitly "
+                    "or ingest some text first."
+                )
+
+        domain_ctx = getattr(self, "_domain_context", None)
+        return TextExtractor.benchmark(
+            messages=messages,
+            providers=providers,
+            max_cost_usd=max_cost_usd,
+            discovery_mode=True,
+            domain_context=domain_ctx,
+        )
 
     # --- Confidence calibration ---
 
@@ -3312,8 +3563,7 @@ class AttestDB:
         max_claims: int = DEFAULT_MAX_CLAIMS,
     ) -> list[ContextFrame]:
         """Query all entities in a topic, returning a ContextFrame per member."""
-        if not hasattr(self, "_topology") or self._topology is None:
-            raise RuntimeError("Call compute_topology() first")
+        self._require_topology("query_topic")
 
         # Find the topic node
         topic_node = None
@@ -3367,9 +3617,9 @@ class AttestDB:
         """Triage and ingest claims through the curator."""
         return self._intel.curate(claims, agent_id)
 
-    def ingest_text(self, text: str, source_id: str = "", use_curator: bool = True):
+    def ingest_text(self, text: str, source_id: str = "", source_type: str = "", use_curator: bool = True):
         """Extract claims from text and ingest. Optional curator triage."""
-        return self._intel.ingest_text(text, source_id=source_id, use_curator=use_curator)
+        return self._intel.ingest_text(text, source_id=source_id, source_type=source_type, use_curator=use_curator)
 
     def ingest_texts(self, texts: list[dict], use_curator: bool = True) -> dict:
         """Batch wrapper around ingest_text()."""
@@ -3536,6 +3786,10 @@ class AttestDB:
                     adaptive: bool = True, max_nodes: int = 10_000) -> dict[str, float]:
         """Approximate betweenness centrality (identifies bridge entities).
 
+        Prefers Rust implementation (runs Brandes algorithm directly on LMDB
+        adjacency index — no data crosses to Python). Falls back to Python
+        if Rust method unavailable.
+
         Args:
             sample_size: Number of source nodes for approximation (200 = fast).
             top_k: If > 0, return only the top-K entities. 0 = all.
@@ -3545,12 +3799,21 @@ class AttestDB:
         Returns:
             {entity_id: betweenness_score} sorted descending.
         """
-        from attestdb.intelligence.graph_embeddings import compute_betweenness_centrality
-
-        adj = self.get_adjacency_list()
-        scores = compute_betweenness_centrality(
-            adj, sample_size=sample_size, adaptive=adaptive, max_nodes=max_nodes,
-        )
+        # Rust path: entire Brandes algorithm runs in Rust on LMDB data
+        if hasattr(self._store, 'compute_betweenness_centrality'):
+            scores = self._store.compute_betweenness_centrality(
+                sample_size, 42, adaptive, max_nodes,
+            )
+        else:
+            # Python fallback for older attest-py wheels
+            from attestdb.intelligence.graph_embeddings import (
+                compute_betweenness_centrality,
+            )
+            adj = self.get_adjacency_list()
+            scores = compute_betweenness_centrality(
+                adj, sample_size=sample_size, adaptive=adaptive,
+                max_nodes=max_nodes,
+            )
         ranked = dict(sorted(scores.items(), key=lambda x: x[1], reverse=True))
         if top_k > 0:
             return dict(list(ranked.items())[:top_k])
@@ -3672,6 +3935,15 @@ class AttestDB:
         """Find knowledge blindspots: single-source entities and gaps."""
         return self._analytics.blindspots(min_claims)
 
+    def unanswered(
+        self,
+        limit: int = 50,
+        reason: str | None = None,
+        since: float | None = None,
+    ):
+        """Demand-driven gaps: questions ask_engine couldn't answer well."""
+        return self._analytics.unanswered(limit=limit, reason=reason, since=since)
+
     def consensus(self, topic):
         """Analyze consensus around a topic (entity)."""
         return self._analytics.consensus(topic)
@@ -3711,6 +3983,109 @@ class AttestDB:
     def predict(self, entity_id, max_intermediaries=100, min_paths=3, min_consensus=0.65, directional_only=False, entity_aliases=None, extra_causal_predicates=None):
         """Discover novel regulatory predictions via causal composition."""
         return self._analytics.predict(entity_id, max_intermediaries, min_paths, min_consensus, directional_only, entity_aliases, extra_causal_predicates)
+
+    # --- Analysis recommender (delegated to AnalysisRecommender) ---
+
+    def recommend_analyses(
+        self,
+        *,
+        top_k: int = 20,
+        target_pool: list[str] | None = None,
+        target_types: set[str] | None = None,
+        diversity: float = 0.4,
+        profile_tier: str = "sample",
+        persist: bool = True,
+    ):
+        """Rank (analysis × target) pairs by expected yield and persist
+        the result to the recommender sidecar. Returns a
+        :class:`RecommendationSet`. ``target_types`` restricts the
+        auto-selected target pool to specific entity types
+        (default: persons + orgs)."""
+        from attestdb.intelligence.analysis_recommender import build_recommender
+        return build_recommender(self, persist=persist).recommend(
+            top_k=top_k,
+            target_pool=target_pool,
+            target_types=target_types,
+            diversity=diversity,
+            profile_tier=profile_tier,
+            persist=persist,
+        )
+
+    def run_investigation(
+        self,
+        *,
+        analysis_slug: str,
+        target_entity: str,
+        min_findings: int = 1,
+        max_elapsed_s: float | None = None,
+        time_budget_s: float = 60.0,
+        token_budget: int = 0,
+        rec_id: str | None = None,
+        spec_id: str | None = None,
+        persist: bool = True,
+    ):
+        """Run one analysis against one target, persisting the run to
+        the sidecar and ingesting findings as claims. Returns an
+        :class:`InvestigationReport`."""
+        from attestdb.intelligence.analysis_registry import Budget
+        from attestdb.intelligence.investigative_agent import (
+            AcceptanceCriteria, build_investigative_agent,
+            make_investigative_spec,
+        )
+        import uuid
+        spec = make_investigative_spec(
+            spec_id=spec_id or f"ad-hoc:{uuid.uuid4().hex[:12]}",
+            analysis_slug=analysis_slug,
+            target_entity=target_entity,
+            acceptance_criteria=AcceptanceCriteria(
+                min_findings=min_findings,
+                max_elapsed_s=max_elapsed_s,
+            ),
+            budget=Budget(time_s=time_budget_s, tokens=token_budget),
+            rec_id=rec_id,
+        )
+        return build_investigative_agent(
+            self, persist=persist,
+        ).execute(spec)
+
+    def investigation_results(
+        self,
+        *,
+        limit: int = 50,
+        analysis_slug: str | None = None,
+        target_entity: str | None = None,
+    ) -> list[dict]:
+        """Most recent runs from the recommender sidecar."""
+        from attestdb.intelligence.recommender_store import get_recommender_store
+        store = get_recommender_store(self)
+        if store is None:
+            return []
+        return store.recent_runs(
+            analysis_slug=analysis_slug,
+            target_entity=target_entity,
+            limit=limit,
+        )
+
+    def top_recommendations(
+        self,
+        *,
+        limit: int = 20,
+        analysis_slug: str | None = None,
+        target_entity: str | None = None,
+        unconsumed_only: bool = False,
+    ) -> list[dict]:
+        """Highest-yield recommendations currently stored in the
+        sidecar. Call ``recommend_analyses()`` first to populate."""
+        from attestdb.intelligence.recommender_store import get_recommender_store
+        store = get_recommender_store(self)
+        if store is None:
+            return []
+        return store.top_recommendations(
+            limit=limit,
+            analysis_slug=analysis_slug,
+            target_entity=target_entity,
+            unconsumed_only=unconsumed_only,
+        )
 
     # --- Verification (delegated to VerificationEngine) ---
 
@@ -3957,6 +4332,39 @@ class AttestDB:
     def agent_leaderboard(self, domain=None):
         """Rank agents by eval score, optionally filtered by domain."""
         return self._agent_registry.leaderboard(domain)
+
+    # --- Agent factory (delegated to AgentFactory) ---
+
+    @property
+    def _agent_factory(self):
+        if not hasattr(self, "_agent_factory_instance"):
+            from attestdb.intelligence.agent_factory import AgentFactory
+            self._agent_factory_instance = AgentFactory(self)
+        return self._agent_factory_instance
+
+    def discover_workflows(self, **kwargs):
+        """Mine the claim graph for recurring workflow patterns."""
+        return self._agent_factory.discover_workflows(**kwargs)
+
+    def generate_agent_spec(self, workflow, **kwargs):
+        """Generate an agent specification from a discovered workflow."""
+        return self._agent_factory.generate_spec(workflow, **kwargs)
+
+    def build_agent_eval(self, spec, **kwargs):
+        """Build a domain-specific eval set for an agent spec."""
+        return self._agent_factory.build_eval(spec, **kwargs)
+
+    def assemble_agent(self, spec, eval_set=None, model=None):
+        """Assemble an agent from a spec: register, persist, and link eval."""
+        return self._agent_factory.assemble_agent(spec, eval_set, model)
+
+    def validate_agent_trust(self, agent_id):
+        """Validate an assembled agent's ongoing trustworthiness."""
+        return self._agent_factory.validate_trust(agent_id)
+
+    def run_agent_factory(self, **kwargs):
+        """Run the full agent factory pipeline: discover, spec, eval, assemble."""
+        return self._agent_factory.run_pipeline(**kwargs)
 
 
 # Backward-compat alias

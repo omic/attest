@@ -202,8 +202,10 @@ def load_fda_safety_communications(
     Returns:
         BatchResult with ingestion counts.
     """
+    from datetime import datetime, timezone
+
     t0 = time.time()
-    timestamp = int(t0 * 1_000_000_000)
+    fallback_timestamp = int(t0 * 1_000_000_000)
 
     entities: dict[str, tuple[str, str, str]] = {}
     claim_rows: list[tuple] = []
@@ -222,6 +224,16 @@ def load_fda_safety_communications(
             drug = (rec.get("drug") or "").strip()
             issue = (rec.get("safety_issue") or "").strip()
             comm_type = (rec.get("type") or "safety_communication").strip()
+
+            # Use communication date for temporal analysis
+            date_str = (rec.get("date") or "").strip()
+            timestamp = fallback_timestamp
+            if date_str:
+                try:
+                    dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                    timestamp = int(dt.timestamp() * 1_000_000_000)
+                except ValueError:
+                    pass
 
             if not drug or not issue:
                 continue

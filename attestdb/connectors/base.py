@@ -104,8 +104,8 @@ class Connector(abc.ABC):
             data = ts.get_token(f"{self.name}:checkpoint")
             if data:
                 self._checkpoint = data
-        except Exception:
-            pass  # No cryptography, no file, etc.
+        except Exception as e:
+            logger.debug("Failed to load checkpoint for %s: %s", self.name, e)
 
     def _save_checkpoint(self) -> None:
         """Persist ``self._checkpoint`` to TokenStore."""
@@ -125,6 +125,7 @@ class Connector(abc.ABC):
         *,
         max_retries: int = _DEFAULT_MAX_RETRIES,
         backoff_base: float = _DEFAULT_BACKOFF_BASE,
+        timeout: int | float | None = 30,
         **kwargs: object,
     ):
         """Issue an HTTP request with exponential backoff on transient errors.
@@ -139,6 +140,8 @@ class Connector(abc.ABC):
             Maximum number of retries after the initial attempt.
         backoff_base:
             Base delay in seconds; doubled on each retry.
+        timeout:
+            Request timeout in seconds. Defaults to 30.
         **kwargs:
             Passed through to ``self._session.request()``.
 
@@ -158,7 +161,7 @@ class Connector(abc.ABC):
         last_exc: Exception | None = None
         for attempt in range(max_retries + 1):
             try:
-                resp = self._session.request(method, url, **kwargs)
+                resp = self._session.request(method, url, timeout=timeout, **kwargs)
                 if resp.status_code not in _RETRIABLE_STATUS_CODES:
                     return resp
                 # Retriable HTTP status — fall through to backoff
@@ -268,11 +271,16 @@ class Connector(abc.ABC):
         confidence: float = 1.0,
         subj_ext: dict[str, str] | None = None,
         obj_ext: dict[str, str] | None = None,
+        timestamp: int | None = None,
+        payload: dict | None = None,
     ) -> dict:
-        """Build a claim dict with optional external_ids.
+        """Build a claim dict with optional external_ids, timestamp, and payload.
 
         Uses ``predicate_type()`` from ``attestdb.connectors.predicates``
         to classify the predicate automatically.
+
+        payload should be {"schema_ref": "system/object_type", "data": {...}}
+        for lookback to the originating record.
         """
         from attestdb.connectors.predicates import predicate_type
 
@@ -286,6 +294,10 @@ class Connector(abc.ABC):
             },
             "confidence": confidence,
         }
+        if timestamp is not None:
+            d["timestamp"] = timestamp
+        if payload is not None:
+            d["payload"] = payload
         ext: dict = {}
         if subj_ext:
             ext["subject"] = subj_ext
@@ -326,17 +338,19 @@ class StructuredConnector(Connector):
         result = ConnectorResult(connector_name=self.name)
         batch: list[dict] = []
 
-        for claim_dict in self.fetch():
-            batch.append(claim_dict)
-            if len(batch) >= batch_size:
+        try:
+            for claim_dict in self.fetch():
+                batch.append(claim_dict)
+                if len(batch) >= batch_size:
+                    self._flush(db, batch, result)
+                    batch = []
+
+            if batch:
                 self._flush(db, batch, result)
-                batch = []
-
-        if batch:
-            self._flush(db, batch, result)
-
-        self._finalize_result(result, start)
-        self._save_checkpoint()
+        finally:
+            # Save checkpoint even on exception so progress isn't lost
+            self._finalize_result(result, start)
+            self._save_checkpoint()
         return result
 
 
@@ -370,7 +384,7 @@ class TextConnector(Connector):
                 continue
             try:
                 extraction_result = db.ingest_text(
-                    text, source_id=source_id,
+                    text, source_id=source_id, source_type=self.name,
                 )
                 result.claims_ingested += extraction_result.n_valid
                 result.prompt_tokens += getattr(
@@ -418,8 +432,25 @@ class HybridConnector(Connector):
         return ``iter(self._bodies)``.
         """
 
-    def run(self, db: AttestDB, *, batch_size: int = 500) -> ConnectorResult:
-        """Structural pass then text extraction pass."""
+    def run(
+        self,
+        db: AttestDB,
+        *,
+        batch_size: int = 500,
+        max_cost_usd: float = 0.0,
+        model: str = "",
+    ) -> ConnectorResult:
+        """Structural pass then text extraction pass.
+
+        Args:
+            db: AttestDB instance.
+            batch_size: Claims per structural flush.
+            max_cost_usd: Hard cap on LLM spend for the text phase
+                (0 = unbounded). Logs cumulative cost every $1.
+            model: Model name for cost estimation (empty = auto-detect).
+        """
+        from attestdb.core.providers import estimate_cost
+
         start = time.monotonic()
         result = ConnectorResult(connector_name=self.name)
 
@@ -434,19 +465,42 @@ class HybridConnector(Connector):
             self._flush(db, batch, result)
 
         # --- Text extraction pass ---
+        last_dollar_logged = 0
         if self._extraction != "none":
             for source_id, body in self.fetch_bodies():
                 if not body or not body.strip():
                     continue
+                # Budget check: stop if we've exceeded the cap
+                cost_so_far = estimate_cost(
+                    model or "_default",
+                    result.prompt_tokens,
+                    result.completion_tokens,
+                )
+                if max_cost_usd > 0 and cost_so_far >= max_cost_usd:
+                    logger.warning(
+                        "%s: text extraction stopped at $%.2f (budget $%.2f)",
+                        self.name, cost_so_far, max_cost_usd,
+                    )
+                    break
                 try:
-                    er = db.ingest_text(body, source_id=source_id)
+                    er = db.ingest_text(body, source_id=source_id, source_type=self.name)
                     result.claims_ingested += er.n_valid
-                    result.prompt_tokens += getattr(
-                        er, "prompt_tokens", 0,
+                    result.prompt_tokens += getattr(er, "prompt_tokens", 0)
+                    result.completion_tokens += getattr(er, "completion_tokens", 0)
+
+                    cost_so_far = estimate_cost(
+                        model or "_default",
+                        result.prompt_tokens,
+                        result.completion_tokens,
                     )
-                    result.completion_tokens += getattr(
-                        er, "completion_tokens", 0,
-                    )
+                    current_dollar = int(cost_so_far)
+                    if current_dollar > last_dollar_logged:
+                        logger.info(
+                            "%s: LLM spend $%.2f (%d prompt + %d completion tokens)",
+                            self.name, cost_so_far,
+                            result.prompt_tokens, result.completion_tokens,
+                        )
+                        last_dollar_logged = current_dollar
                 except Exception as exc:
                     result.errors.append(f"{source_id}: {exc}")
 
@@ -515,5 +569,9 @@ class QueryConnector(StructuredConnector):
             },
         }
         if "confidence" in m and m["confidence"] in row:
-            claim["confidence"] = float(row[m["confidence"]])
+            try:
+                claim["confidence"] = float(row[m["confidence"]])
+            except (ValueError, TypeError) as exc:
+                logger.warning("%s: bad confidence value %r: %s",
+                               self.name, row[m["confidence"]], exc)
         return claim

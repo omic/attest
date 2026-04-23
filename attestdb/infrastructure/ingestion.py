@@ -55,12 +55,15 @@ class IngestionPipeline:
         embedding_index: EmbeddingIndex | None = None,
         embedding_dim: int | None = None,
         strict: bool = False,
+        predicate_store=None,
     ):
         self._store = store
         self._embedding_index = embedding_index
         self._embedding_dim = embedding_dim
         self._strict = strict
-        # Optional EntityResolver, set via AttestDB.enable_entity_resolution()
+        self._predicate_store = predicate_store
+        # EntityResolver — enabled by default (external_ids mode) at AttestDB init.
+        # Can be switched to fuzzy/full mode via enable_entity_resolution().
         self._resolver = None
         # Optional auto-embedding callback: (text) -> list[float]
         self._embed_fn: callable | None = None
@@ -165,12 +168,16 @@ class IngestionPipeline:
                     obj_canonical, obj_type,
                 )
 
-        # Entity resolution (optional): resolve names to existing entities
+        # Entity resolution (optional): resolve names to existing entities.
+        # Pass original display names (not normalized) so acronym/case
+        # detection works in the scorer.
         if self._resolver is not None:
             subj_ext = (claim_input.external_ids or {}).get("subject", {})
             obj_ext = (claim_input.external_ids or {}).get("object", {})
+            subj_display = claim_input.subject[0]
+            obj_display = claim_input.object[0]
             resolved_subj, subj_conf = self._resolver.resolve(
-                subj_canonical, subj_type, subj_ext,
+                subj_display, subj_type, subj_ext,
             )
             if resolved_subj is not None and resolved_subj != subj_canonical:
                 logger.info(
@@ -179,7 +186,7 @@ class IngestionPipeline:
                 )
                 subj_canonical = resolved_subj
             resolved_obj, obj_conf = self._resolver.resolve(
-                obj_canonical, obj_type, obj_ext,
+                obj_display, obj_type, obj_ext,
             )
             if resolved_obj is not None and resolved_obj != obj_canonical:
                 logger.info(
@@ -396,12 +403,20 @@ class IngestionPipeline:
                 f"possible LMDB write failure (check map_size, disk space)"
             )
 
-        # Keep resolver index current with new external_ids
+        # Keep resolver indexes current with new entities
         if self._resolver is not None:
             for ns, eid in (claim.subject.external_ids or {}).items():
                 self._resolver.register_external_id(claim.subject.id, ns, eid)
             for ns, eid in (claim.object.external_ids or {}).items():
                 self._resolver.register_external_id(claim.object.id, ns, eid)
+            self._resolver.register_entity(
+                claim.subject.id, claim.subject.display_name,
+                claim.subject.entity_type, claim.subject.external_ids,
+            )
+            self._resolver.register_entity(
+                claim.object.id, claim.object.display_name,
+                claim.object.entity_type, claim.object.external_ids,
+            )
 
         if embedding is not None and self._embedding_index is not None:
             self._embedding_index.add(claim.claim_id, embedding)
@@ -423,6 +438,11 @@ class IngestionPipeline:
                 flags = claim.payload.data.get("quality_flags", [])
                 flags.append(reason)
                 claim.payload.data["quality_flags"] = flags
+                # Extraction-quality gate also writes a top-level
+                # `extraction_quality` tag so downstream consumers can
+                # filter flagged LLM extractions without walking lists.
+                if gate_name == "extraction_quality":
+                    claim.payload.data["extraction_quality"] = f"flag:{reason}"
 
         # Rule 5: Corroboration tracking
         existing = self._store.claims_by_content_id(claim.content_id)
@@ -433,6 +453,15 @@ class IngestionPipeline:
             )
 
         self._persist(claim, embedding)
+
+        # Observe predicate usage for self-improving constraints
+        if self._predicate_store:
+            self._predicate_store.observe(
+                claim.predicate.id,
+                claim.subject.entity_type,
+                claim.object.entity_type,
+            )
+
         return claim.claim_id
 
     def _check_provenance_acyclicity(self, new_claim_id: str, chain: list[str]) -> None:
@@ -529,6 +558,15 @@ class IngestionPipeline:
                         self._resolver.register_external_id(claim.subject.id, ns, eid)
                     for ns, eid in (claim.object.external_ids or {}).items():
                         self._resolver.register_external_id(claim.object.id, ns, eid)
+
+            # Observe predicate usage for self-improving constraints
+            if self._predicate_store:
+                for claim, _ in validated:
+                    self._predicate_store.observe(
+                        claim.predicate.id,
+                        claim.subject.entity_type,
+                        claim.object.entity_type,
+                    )
         else:
             # Fallback: per-claim persist (old wheel without insert_claims_batch)
             for claim, embedding in validated:
@@ -536,6 +574,12 @@ class IngestionPipeline:
                 result.ingested += 1
                 if on_ingested is not None:
                     on_ingested(claim.claim_id)
+                if self._predicate_store:
+                    self._predicate_store.observe(
+                        claim.predicate.id,
+                        claim.subject.entity_type,
+                        claim.object.entity_type,
+                    )
 
         return result
 
@@ -565,4 +609,21 @@ def no_self_reference_gate() -> callable:
         if subj_norm == obj_norm:
             return ("reject", "Self-referencing claim (subject == object)")
         return ("accept", None)
+    return gate
+
+
+def extraction_quality_gate() -> callable:
+    """Reject/flag claims whose evidence_text is not a first-class assertion.
+
+    Delegates to :func:`attestdb.core.extraction_quality.is_substantive_claim`.
+    Register under the name ``"extraction_quality"`` so the ingestion pipeline
+    writes a top-level ``extraction_quality`` tag on flagged claims.
+    """
+    from attestdb.core.extraction_quality import is_substantive_claim
+
+    def gate(claim_input: ClaimInput) -> tuple[str, str | None]:
+        verdict, reason = is_substantive_claim(claim_input)
+        if verdict == "accept":
+            return ("accept", None)
+        return (verdict, reason)
     return gate

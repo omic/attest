@@ -55,8 +55,9 @@ PROVIDERS = {
 }
 
 # Recommended fallback chain for text extraction, ordered by benchmark performance.
-# groq (fastest) → gemini → together → openai → deepseek → grok
-EXTRACTION_FALLBACK_CHAIN = ["groq", "gemini", "together", "openai", "deepseek", "grok"]
+# gemini (best value: 100% acceptance, cheapest) → deepseek (most claims) →
+# groq (fastest) → openai → grok → anthropic
+EXTRACTION_FALLBACK_CHAIN = ["gemini", "deepseek", "groq", "openai", "grok", "anthropic"]
 
 # Token pricing per 1M tokens (input, output) in USD.
 # Used by prompt_kit tools for cost estimation and waste analysis.
@@ -64,6 +65,7 @@ MODEL_PRICING: dict[str, tuple[float, float]] = {
     # Anthropic
     "claude-opus-4-6": (15.0, 75.0),
     "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-sonnet-4-5": (3.0, 15.0),
     "claude-haiku-4-5-20251001": (0.80, 4.0),
     # OpenAI
     "gpt-4.1": (2.0, 8.0),
@@ -92,6 +94,7 @@ MODEL_TIERS: dict[str, int] = {
     "gpt-4.1": 1,
     "gemini-2.5-pro": 1,
     "grok-4-1-fast-non-reasoning": 1,
+    "claude-sonnet-4-5": 2,
     "claude-sonnet-4-6": 2,
     "gpt-4.1-mini": 2,
     "o4-mini": 2,

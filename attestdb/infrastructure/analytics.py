@@ -234,6 +234,44 @@ class AnalyticsEngine:
 
     # --- Quality report ---
 
+    def _extraction_quality_breakdown(self) -> dict[str, object]:
+        """Scan all claims, classify via extraction-quality gate.
+
+        Returns {accept, flag, reject, reasons: {reason: count}}.
+        Cached (TTL 120s) via ``_cached``.
+        """
+        from attestdb.core.extraction_quality import is_substantive_claim_obj
+
+        def _compute() -> dict[str, object]:
+            counts = {"accept": 0, "flag": 0, "reject": 0}
+            reasons: dict[str, int] = {}
+            for claim in self.db.iter_claims():
+                verdict, reason = is_substantive_claim_obj(claim)
+                counts[verdict] = counts.get(verdict, 0) + 1
+                reasons[reason] = reasons.get(reason, 0) + 1
+            return {
+                "accept": counts["accept"],
+                "flag": counts["flag"],
+                "reject": counts["reject"],
+                "reasons": reasons,
+            }
+
+        return self.db._cached("extraction_quality_breakdown", _compute, ttl=120)
+
+    def _equivalence_group_count(self) -> int:
+        """Count multi-member equivalence groups (cached, TTL 120s)."""
+        from attestdb.infrastructure.claim_equivalence import (
+            find_equivalent_claim_groups,
+        )
+
+        def _compute() -> int:
+            groups = find_equivalent_claim_groups(
+                self.db, numeric_tolerance=0.05, time_window_days=7,
+            )
+            return len(groups)
+
+        return self.db._cached("equivalence_group_count", _compute, ttl=120)
+
     def quality_report(
         self,
         stale_threshold: int = 0,
@@ -310,6 +348,10 @@ class AnalyticsEngine:
         alerts = self.db.find_confidence_alerts(min_claims=2)
         report.confidence_alert_count = len(alerts)
 
+        # Extraction-quality + claim-equivalence metrics (cached)
+        report.extraction_quality_breakdown = self._extraction_quality_breakdown()
+        report.equivalence_group_count = self._equivalence_group_count()
+
         self.db._cache[cache_key] = report
         self.db._cache_ts[cache_key] = time.time()
         return report
@@ -345,6 +387,10 @@ class AnalyticsEngine:
         rust_stats = self.db._store.stats()
         h.total_entities = rust_stats.get("entity_count", 0)
         if h.total_entities == 0:
+            h.extraction_quality_breakdown = {
+                "accept": 0, "flag": 0, "reject": 0, "reasons": {},
+            }
+            h.equivalence_group_count = 0
             return h
 
         # Multi-source detection via Rust index (no claim materialization)
@@ -386,6 +432,10 @@ class AnalyticsEngine:
 
         h.total_claims = len(all_confidences)
         if h.total_claims == 0:
+            h.extraction_quality_breakdown = {
+                "accept": 0, "flag": 0, "reject": 0, "reasons": {},
+            }
+            h.equivalence_group_count = 0
             return h
 
         # Basic metrics
@@ -427,6 +477,10 @@ class AnalyticsEngine:
             + min(1.0, h.source_diversity / 5.0) * 15.0
             + max(0.0, min(1.0, 0.5 + h.confidence_trend)) * 10.0
         )))
+
+        # Extraction-quality + claim-equivalence metrics (cached)
+        h.extraction_quality_breakdown = self._extraction_quality_breakdown()
+        h.equivalence_group_count = self._equivalence_group_count()
 
         self.db._cache["knowledge_health"] = h
         self.db._cache_ts["knowledge_health"] = time.time()
@@ -562,6 +616,49 @@ class AnalyticsEngine:
             low_confidence_areas=low_conf,
             unresolved_warnings=unresolved,
         )
+        self.db._cache[cache_key] = result
+        self.db._cache_ts[cache_key] = time.time()
+        return result
+
+    def unanswered(
+        self,
+        limit: int = 50,
+        reason: str | None = None,
+        since: float | None = None,
+    ) -> dict:
+        """Demand-driven gap signal: questions ask_engine couldn't answer well.
+
+        Distinct from blindspots() (structural / graph-level) — this surfaces
+        what users actually asked but didn't get back. Failed compositions =
+        roadmap.
+
+        Args:
+            limit: max questions to return.
+            reason: filter to one of {no_entities, no_evidence, low_confidence,
+                no_answer, fallback}; None returns all.
+            since: only include records with created_at >= this timestamp.
+
+        Returns:
+            {"summary": {reason: count}, "recent": [UnansweredQuery dicts]}.
+        """
+        from dataclasses import asdict
+
+        from attestdb.infrastructure.unanswered_log import get_unanswered_log
+
+        log_obj = get_unanswered_log(self.db)
+        if log_obj is None:
+            return {"summary": {}, "recent": []}
+
+        cache_key = f"unanswered:{limit}:{reason}:{since}"
+        cached = self.db._cache.get(cache_key)
+        if cached is not None and (time.time() - self.db._cache_ts.get(cache_key, 0)) < 60:
+            return cached
+
+        recent = [asdict(q) for q in log_obj.recent(limit=limit, reason=reason, since=since)]
+        result = {
+            "summary": log_obj.summary(since=since),
+            "recent": recent,
+        }
         self.db._cache[cache_key] = result
         self.db._cache_ts[cache_key] = time.time()
         return result
@@ -3929,7 +4026,7 @@ class AnalyticsEngine:
         Returns:
             AgentConsensusResult with synthesized answer and provenance.
         """
-        from attestdb.core.consensus import ConsensusEngine
+        from attestdb.intelligence.consensus import ConsensusEngine
 
         # Pull evidence from the DB to ground the consensus in real data
         if not context:

@@ -20,7 +20,7 @@ class EntityManager:
     # --- Basic entity access ---
 
     def get_entity(self, entity_id: str) -> EntitySummary | None:
-        canonical = self.db._store.resolve(normalize_entity_id(entity_id))
+        canonical = self.db._store.resolve_readonly(normalize_entity_id(entity_id))
         raw = self.db._store.get_entity(canonical)
         return entity_summary_from_dict(raw) if raw else None
 
@@ -51,10 +51,11 @@ class EntityManager:
         return self.db._store.resolve(normalize_entity_id(entity_id))
 
     def enable_entity_resolution(self, mode: str = "external_ids") -> None:
-        """Enable entity resolution during ingestion.
+        """Enable or re-enable entity resolution during ingestion.
 
         Modes: "external_ids" (exact + ext ID), "fuzzy" (+ text search), "full" (reserved).
-        Must be called explicitly -- resolution is opt-in.
+        External ID resolution is enabled by default at init. Call this to switch
+        modes (e.g., to "fuzzy") or to re-enable after disabling.
         """
         from attestdb.infrastructure.entity_resolver import EntityResolver
 

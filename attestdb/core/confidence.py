@@ -34,6 +34,25 @@ SOURCE_TYPE_WEIGHTS: dict[str, float] = {
     "expert_annotation": 0.80,
     # Multi-source loaders
     "pathway_database": 0.70,
+    # Compliance vertical
+    "regulatory_requirement": 0.95,
+    "compliance_evidence": 0.80,
+    # System-generated (deterministic operations)
+    "system": 0.90,
+    # Investigation vertical
+    "flight_log": 0.90,
+    "court_filing": 0.85,
+    "fbi_302": 0.80,
+    "law_enforcement_memo": 0.80,
+    "financial_record": 0.85,
+    "deposition_transcript": 0.80,
+    "email_printout": 0.65,
+    "doj_release": 0.90,
+    "house_oversight_release": 0.85,
+    "independent_archive": 0.60,
+    "ocr_extraction": 0.55,
+    "cbp_record": 0.85,
+    "directory_listing": 0.70,
 }
 
 DEFAULT_WEIGHT = 0.50
@@ -98,6 +117,29 @@ DEFAULT_PREDICATE_HALF_LIVES: dict[str, int] = {
     "relates_to": 365,
     "causes": 365,
     "treats": 365,
+    # Compliance — regulations change slowly, evidence decays faster
+    "requires": 1460,
+    "satisfied_by": 180,
+    "verified_by": 365,
+    "superseded_by": 1460,
+    # Project management — status decays fast, approvals moderate,
+    # deployments durable
+    "on_track": 14,
+    "off_track": 14,
+    "completed": 365,
+    "incomplete": 30,
+    "deployed": 730,
+    "reverted": 30,
+    "approved": 180,
+    "rejected": 30,
+    "committed_to": 90,
+    "at_risk": 30,
+    "acceptance_met": 365,
+    "acceptance_unmet": 30,
+    "requires_delivery": 1460,
+    "assigned_to": 60,
+    "scoped_in": 730,
+    "scoped_out": 730,
 }
 
 
@@ -157,7 +199,8 @@ def count_independent_sources(claims: list) -> int:
       source_id and provenance.chain sets. Claims with overlapping chains
       are merged into one source group.
 
-    Returns the number of distinct source groups.
+    Returns the number of distinct source groups, or 0 for an empty list.
+    For non-empty input, always returns at least 1.
     """
     if not claims:
         return 0
@@ -219,7 +262,7 @@ def _extract_external_id(claim) -> str | None:
         parts = source_id.split(":")
         if len(parts) >= 2 and parts[1].isdigit():
             return _normalize_pmid(parts[1])
-    if source_id.startswith("PMID:") or source_id.startswith("pmid:"):
+    if source_id.startswith("PMID:") or source_id.startswith("pmid:") or source_id.startswith("pubmed:"):
         return _normalize_pmid(source_id)
 
     return None
@@ -383,8 +426,8 @@ def calibrate_llm_confidence(
     - Numeric strings: "0.9" → 0.72 (compressed toward center)
     - Already numeric: 0.9 → 0.72 (compressed toward center)
 
-    LLMs are overconfident — they cluster at 0.85-0.95.  Compression
-    maps the LLM's [0.5, 1.0] range to a more useful [0.35, 0.85] range.
+    LLMs are overconfident — they cluster at 0.85-0.95.  Linear compression
+    maps the full input range to [0.1, 0.95] via extrapolation + clamping.
 
     Args:
         value: Raw confidence from an LLM (string label, numeric string,

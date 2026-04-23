@@ -4,7 +4,7 @@ The truth layer for AI agents. Every fact has a source, a confidence score, and 
 
 [![PyPI](https://img.shields.io/pypi/v/attestdb)](https://pypi.org/project/attestdb/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/downloads/)
-[![License: BSL-1.1](https://img.shields.io/badge/license-BSL--1.1-green)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/omic/attest)](https://github.com/omic/attest)
 
 ```bash
@@ -239,4 +239,4 @@ The intelligence layer (LLM-powered features, connectors) is available separatel
 
 ## License
 
-BSL-1.1 — free for non-production use. Converts to Apache 2.0 after 4 years. See [LICENSE](LICENSE) for details.
+Apache License, Version 2.0. Use it, modify it, ship it in your own products — commercial or otherwise. See [LICENSE](LICENSE) for the full text. Prior releases (≤ 0.1.42) were distributed under the Business Source License 1.1 with Apache-2.0 as the scheduled change license.

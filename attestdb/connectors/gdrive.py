@@ -119,7 +119,7 @@ class GDriveConnector(Connector):
                     result.claims_ingested += 1
 
                 if self._extraction != "none":
-                    er = db.ingest_text(text, source_id=source_id)
+                    er = db.ingest_text(text, source_id=source_id, source_type="gdrive")
                     result.claims_ingested += er.n_valid
             except Exception as exc:
                 result.errors.append(f"gdrive/{file_id} ingest: {exc}")

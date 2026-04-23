@@ -89,3 +89,35 @@ class TestKnowledgeHealth:
         # All claims have default confidence, so trend ≈ 0
         assert abs(h.confidence_trend) < 0.01
 
+    def test_extraction_quality_breakdown_present(self, db):
+        """knowledge_health exposes extraction-quality breakdown + equivalence count."""
+        _ingest(db, subject="alpha", obj="beta")
+        h = db.knowledge_health()
+        assert isinstance(h.extraction_quality_breakdown, dict)
+        bd = h.extraction_quality_breakdown
+        for key in ("accept", "flag", "reject", "reasons"):
+            assert key in bd
+        # Sum of verdict buckets equals total claims scanned (raw store count).
+        total_scanned = bd["accept"] + bd["flag"] + bd["reject"]
+        assert total_scanned == db.stats()["total_claims"]
+        assert isinstance(h.equivalence_group_count, int)
+        assert h.equivalence_group_count >= 0
+
+    def test_extraction_quality_flags_low_quality_claim(self, db):
+        """A claim with empty evidence_text is flagged or rejected."""
+        # Ingest one claim with empty evidence_text (too-short → flag).
+        db.ingest(
+            subject=("weak", "entity"),
+            predicate=("relates_to", "relation"),
+            object=("thing", "entity"),
+            provenance={"source_type": "test", "source_id": "s1"},
+            payload={"schema_ref": "test.v1", "data": {"evidence_text": ""}},
+        )
+        h = db.knowledge_health()
+        bd = h.extraction_quality_breakdown
+        assert (bd["flag"] + bd["reject"]) > 0
+
+    def test_equivalence_group_count_nonnegative_empty(self, db):
+        h = db.knowledge_health()
+        assert h.equivalence_group_count == 0
+

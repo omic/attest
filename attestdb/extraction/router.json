@@ -1,0 +1,53 @@
+{
+  "_meta": {
+    "version": 1,
+    "derived_from": "_cache/ocr_bench/summary.md (6 samples: transcript/handwritten/transcript-alt/form Phase-0 DOJ + CL motion + SCOTUS cert)",
+    "date": "2026-04-14",
+    "quality_proxy": "fragment_ratio (words of length <=2 / total) — lower is better; validated manually on DOJ-OGR-00022402 where PSM 6 output matches ground-truth transcript exactly"
+  },
+  "pipelines": {
+    "pdf_text_layer": {
+      "primary": "pdftotext-layout",
+      "fallback": "pdfplumber",
+      "probe_first": true,
+      "use_when": "PDF has an extractable text layer (pdftotext returns >=50 chars with fragment_ratio<=0.2 on probe page)"
+    },
+    "scanned_typed": {
+      "primary": "tesseract-psm6",
+      "fallback": "gemini-3.1-flash-lite",
+      "use_when": "scanned document (TIFF/JPG or image-only PDF) with typed text — transcripts, forms, memos",
+      "fallback_trigger": "chars < 200 OR (fragment_ratio > 0.40 AND chars < 500) — avoids false-positives on line-numbered transcripts where frag naturally runs 0.23-0.36"
+    },
+    "scanned_sparse_or_handwritten": {
+      "primary": "tesseract-psm3",
+      "fallback": "gemini-3.1-flash-lite",
+      "use_when": "mostly-blank scan, handwriting, or photo — PSM 6 collapses to <50 chars on these (observed on DOJ-OGR-00002641)",
+      "fallback_trigger": "chars < 100 OR fragment_ratio > 0.35"
+    },
+    "placeholder": {
+      "primary": "skeleton_only",
+      "use_when": "every pipeline returns <30 chars — emit bates skeleton claim, skip OCR"
+    }
+  },
+  "benchmark_summary": {
+    "DOJ-OGR-00022402 (transcript)":   {"winner": "tesseract-psm6", "psm3_frag": 0.305, "psm6_frag": 0.234, "gemini_frag": 0.238},
+    "DOJ-OGR-00002641 (handwritten)":  {"winner": "gemini-3.1-flash-lite", "psm3_chars": 114, "psm6_chars": 29, "gemini_chars": 28, "note": "PSM 3 picks up a header stamp that PSM 6 misses; Gemini + PSM 3 tie on content — escalate to Gemini when PSM 6 returns <100c"},
+    "DOJ-OGR-00000242 (transcript alt)": {"winner": "tesseract-psm6", "psm3_frag": 0.176, "psm6_frag": 0.169},
+    "DOJ-OGR-00000353 (form)":          {"winner": "gemini-3.1-flash-lite", "psm6_frag": 0.233, "gemini_frag": 0.209, "note": "tesseract close; keep PSM 6 as primary given cost"},
+    "CL motion (text layer)":           {"winner": "pdftotext-layout", "pdftotext_chars": 353, "layout_chars": 718, "pdfplumber_chars": 5099, "note": "pdfplumber inflated by whitespace padding"},
+    "SCOTUS cert (text layer)":         {"winner": "pdftotext-layout", "pdftotext_chars": 503, "layout_chars": 868}
+  },
+  "kind_mapping": {
+    "pdf": "pdf_text_layer",
+    "tif": "scanned_typed",
+    "tiff": "scanned_typed",
+    "jpg": "scanned_typed",
+    "jpeg": "scanned_typed",
+    "png": "scanned_typed"
+  },
+  "todo_samples": [
+    "phase1_ds3 photograph (EFTA00003862.pdf)",
+    "phase1_ds3 placeholder_slip (EFTA00003919.pdf)",
+    "fbi_vault foia_scan (gdrive:External-Sources/FBI-Vault)"
+  ]
+}

@@ -313,12 +313,21 @@ class LinearConnector(HybridConnector):
         identifier = node.get("identifier", node.get("id", ""))
         source_id = f"linear:{identifier}"
 
+        state_name = (node.get("state") or {}).get("name", "")
+        team_name = (node.get("team") or {}).get("name", "")
+        pl: dict = {"schema_ref": "linear/issue", "data": {
+            "record_id": identifier,
+            "title": (node.get("title") or "")[:200],
+            "team": team_name,
+            "state": state_name,
+        }}
+
         # Title
         title = node.get("title", "")
         if title:
             yield self._make_claim(
                 identifier, "issue", "titled",
-                title, "title", source_id,
+                title, "title", source_id, payload=pl,
             )
 
         # Creator (with external_ids)
@@ -327,16 +336,15 @@ class LinearConnector(HybridConnector):
         if creator:
             yield self._make_claim(
                 identifier, "issue", "authored_by",
-                creator, "person", source_id,
+                creator, "person", source_id, payload=pl,
                 obj_ext=self._person_ext(creator_data),
             )
 
         # State
-        state = (node.get("state") or {}).get("name", "")
-        if state:
+        if state_name:
             yield self._make_claim(
                 identifier, "issue", "has_state",
-                state, "status", source_id,
+                state_name, "status", source_id, payload=pl,
             )
 
         # Assignee (with external_ids)
@@ -345,7 +353,7 @@ class LinearConnector(HybridConnector):
         if assignee:
             yield self._make_claim(
                 identifier, "issue", "assigned_to",
-                assignee, "person", source_id,
+                assignee, "person", source_id, payload=pl,
                 obj_ext=self._person_ext(assignee_data),
             )
 
@@ -356,15 +364,14 @@ class LinearConnector(HybridConnector):
             if label_name:
                 yield self._make_claim(
                     identifier, "issue", "labeled",
-                    label_name, "label", source_id,
+                    label_name, "label", source_id, payload=pl,
                 )
 
         # Team
-        team = (node.get("team") or {}).get("name", "")
-        if team:
+        if team_name:
             yield self._make_claim(
                 identifier, "issue", "belongs_to",
-                team, "team", source_id,
+                team_name, "team", source_id, payload=pl,
             )
 
         # Priority
@@ -375,7 +382,7 @@ class LinearConnector(HybridConnector):
             )
             yield self._make_claim(
                 identifier, "issue", "has_priority",
-                priority_label, "priority", source_id,
+                priority_label, "priority", source_id, payload=pl,
             )
 
         # Project
@@ -383,5 +390,5 @@ class LinearConnector(HybridConnector):
         if project:
             yield self._make_claim(
                 identifier, "issue", "belongs_to",
-                project, "project", source_id,
+                project, "project", source_id, payload=pl,
             )

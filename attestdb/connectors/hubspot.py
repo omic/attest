@@ -156,6 +156,15 @@ class HubSpotConnector(HybridConnector):
     # Object → claim converters
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _hs_payload(obj_type: str, obj: dict) -> dict:
+        props = obj.get("properties", {})
+        data: dict = {"record_id": obj.get("id", "")}
+        for k, v in props.items():
+            if isinstance(v, (str, int, float, bool)) or v is None:
+                data[k] = v
+        return {"schema_ref": f"hubspot/{obj_type}", "data": data}
+
     def _contact_to_claims(self, obj: dict) -> Iterator[dict]:
         props = obj.get("properties", {})
         email = (props.get("email") or "").strip()
@@ -164,6 +173,7 @@ class HubSpotConnector(HybridConnector):
 
         hs_id = obj.get("id", "")
         sid = f"hubspot:contacts/{hs_id}"
+        pl = self._hs_payload("contact", obj)
         first = (props.get("firstname") or "").strip()
         last = (props.get("lastname") or "").strip()
         full_name = f"{first} {last}".strip()
@@ -175,7 +185,7 @@ class HubSpotConnector(HybridConnector):
         if company:
             yield self._make_claim(
                 email, "contact", "works_at",
-                company, "company", sid,
+                company, "company", sid, payload=pl,
                 subj_ext=contact_ext,
                 obj_ext={"company_name": company},
             )
@@ -184,7 +194,7 @@ class HubSpotConnector(HybridConnector):
         if jobtitle:
             yield self._make_claim(
                 email, "contact", "has_role",
-                jobtitle, "role", sid,
+                jobtitle, "role", sid, payload=pl,
                 subj_ext=contact_ext,
             )
 
@@ -192,7 +202,7 @@ class HubSpotConnector(HybridConnector):
         if stage:
             yield self._make_claim(
                 email, "contact", "has_stage",
-                stage, "stage", sid,
+                stage, "stage", sid, payload=pl,
             )
 
     def _company_to_claims(self, obj: dict) -> Iterator[dict]:
@@ -202,26 +212,27 @@ class HubSpotConnector(HybridConnector):
             return
 
         sid = f"hubspot:companies/{obj.get('id', '')}"
+        pl = self._hs_payload("company", obj)
 
         industry = (props.get("industry") or "").strip()
         if industry:
             yield self._make_claim(
                 name, "company", "in_industry",
-                industry, "industry", sid,
+                industry, "industry", sid, payload=pl,
             )
 
         domain = (props.get("domain") or "").strip()
         if domain:
             yield self._make_claim(
                 name, "company", "has_domain",
-                domain, "domain", sid,
+                domain, "domain", sid, payload=pl,
             )
 
         size = (props.get("numberofemployees") or "").strip()
         if size:
             yield self._make_claim(
                 name, "company", "has_size",
-                size, "size", sid,
+                size, "size", sid, payload=pl,
             )
 
     def _deal_to_claims(self, obj: dict) -> Iterator[dict]:
@@ -231,33 +242,34 @@ class HubSpotConnector(HybridConnector):
             return
 
         sid = f"hubspot:deals/{obj.get('id', '')}"
+        pl = self._hs_payload("deal", obj)
 
         stage_raw = (props.get("dealstage") or "").strip()
         if stage_raw:
             yield self._make_claim(
                 dealname, "deal", "has_stage",
-                self._resolve_stage(stage_raw), "stage", sid,
+                self._resolve_stage(stage_raw), "stage", sid, payload=pl,
             )
 
         amount = (props.get("amount") or "").strip()
         if amount:
             yield self._make_claim(
                 dealname, "deal", "has_amount",
-                f"${amount}", "currency", sid,
+                f"${amount}", "currency", sid, payload=pl,
             )
 
         pipeline = (props.get("pipeline") or "").strip()
         if pipeline:
             yield self._make_claim(
                 dealname, "deal", "in_pipeline",
-                pipeline, "pipeline", sid,
+                pipeline, "pipeline", sid, payload=pl,
             )
 
         closedate = (props.get("closedate") or "").strip()
         if closedate:
             yield self._make_claim(
                 dealname, "deal", "closes_on",
-                closedate, "date", sid,
+                closedate, "date", sid, payload=pl,
             )
 
     def _note_to_claims(self, obj: dict) -> Iterator[dict]:
@@ -265,6 +277,7 @@ class HubSpotConnector(HybridConnector):
         body = (props.get("hs_note_body") or "").strip()
         hs_id = obj.get("id", "")
         sid = f"hubspot:notes/{hs_id}"
+        pl = self._hs_payload("note", obj)
 
         associations = obj.get("associations", {})
         for assoc_type in ("contacts", "companies", "deals"):
@@ -279,7 +292,7 @@ class HubSpotConnector(HybridConnector):
                         f"note:{hs_id}", "note",
                         "associated_with",
                         f"{assoc_type}/{assoc_id}",
-                        assoc_type.rstrip("s"), sid,
+                        assoc_type.rstrip("s"), sid, payload=pl,
                     )
 
         if body:

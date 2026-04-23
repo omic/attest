@@ -163,6 +163,23 @@ class Claim:
     acl: list[str] = field(default_factory=list)
 
 
+def claim_evidence_text(claim: "Claim") -> str:
+    """Return the evidence_text string stored on a Claim's payload.
+
+    Claims store evidence_text in ``payload.data["evidence_text"]``; it
+    is NOT a direct attribute. Code that uses ``getattr(c, "evidence_text",
+    "")`` silently yields empty strings. Use this helper instead.
+    """
+    payload = getattr(claim, "payload", None)
+    if payload is None:
+        return ""
+    data = getattr(payload, "data", None)
+    if not isinstance(data, dict):
+        return ""
+    val = data.get("evidence_text", "")
+    return val if isinstance(val, str) else ""
+
+
 @dataclass
 class ClaimInput:
     """Input structure for ingesting a new claim."""
@@ -423,6 +440,8 @@ class QualityReport:
     avg_claims_per_entity: float = 0.0
     source_type_distribution: dict[str, int] = field(default_factory=dict)
     predicate_distribution: dict[str, int] = field(default_factory=dict)
+    extraction_quality_breakdown: dict[str, object] = field(default_factory=dict)
+    equivalence_group_count: int = 0
 
 
 @dataclass
@@ -498,6 +517,8 @@ class KnowledgeHealth:
     confidence_trend: float = 0.0         # positive = improving over time
     knowledge_density: float = 0.0        # claims_per_entity
     health_score: float = 0.0             # 0-100 composite
+    extraction_quality_breakdown: dict[str, object] = field(default_factory=dict)
+    equivalence_group_count: int = 0
 
 
 @dataclass
@@ -988,7 +1009,19 @@ class SimulationReport:
 
 @dataclass
 class Citation:
-    """A cited claim with provenance metadata."""
+    """A cited claim with provenance metadata.
+
+    ``kind`` distinguishes real evidence from structural hints so the UI can
+    render them separately:
+
+    * ``"evidence"`` — a real claim from the store with a source_id / payload.
+      Default.
+    * ``"inferred_path"`` — a structural bridge derived from shared graph
+      neighbors (A → M → B). No source document; confidence is the bridge
+      score. UIs should render these as "potential paths", never as sources.
+    * ``"predicate_summary"`` — an aggregate ("N claims of predicate X").
+      Object is a count label, not an entity.
+    """
     claim_id: str
     subject: str
     predicate: str
@@ -997,6 +1030,23 @@ class Citation:
     source_id: str = ""
     source_type: str = ""
     corroboration_count: int = 0
+    evidence_text: str = ""
+    score: float = 0.0
+    kind: str = "evidence"
+
+
+@dataclass
+class AnswerSegment:
+    """A span of an answer tagged as verified (claim-quote) or synthesized (LLM inference).
+
+    Makes the interpretive boundary explicit: callers can render verified spans with
+    direct provenance and synthesized spans with the "interpretation required" treatment
+    rather than presenting both with the same confidence.
+    """
+    kind: str  # "verified" | "synthesized"
+    text: str
+    claim_ids: list[str] = field(default_factory=list)
+    confidence: float = 0.0
 
 
 @dataclass
@@ -1012,6 +1062,7 @@ class AskResult:
     entities: list = field(default_factory=list)
     evidence: str = ""
     meta: dict = field(default_factory=dict)
+    segments: list[AnswerSegment] = field(default_factory=list)
 
     # Dict-like backward compatibility
     def __getitem__(self, key: str):
@@ -1021,7 +1072,8 @@ class AskResult:
         return getattr(self, key, default)
 
     def keys(self):
-        return ("answer", "citations", "contradictions", "gaps", "entities", "evidence", "meta")
+        return ("answer", "citations", "contradictions", "gaps",
+                "entities", "evidence", "meta", "segments")
 
 
 @dataclass

@@ -1,11 +1,16 @@
-"""Entity matchers — exact ID, fuzzy name, domain-based, and AI-assisted matching."""
+"""Entity matchers — exact ID, fuzzy name, domain-based.
+
+The AI-assisted matcher (``AIMatcher``) lives in
+``attestdb.intelligence.ai_matcher`` because it pulls in an LLM SDK.
+``EntityMatcher`` here accepts an ``ai_matcher`` by duck typing — pass
+an ``AIMatcher`` instance to enable LLM-assisted matching for the
+ambiguous tail.
+"""
 
 from __future__ import annotations
 
 import difflib
-import json
 import logging
-import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -211,117 +216,6 @@ class DomainMatcher:
         return matches
 
 
-class AIMatcher:
-    """Match ambiguous entity pairs using an LLM (Claude API via OpenAI-compatible endpoint).
-
-    Sends candidate pairs with all available context and receives a match
-    probability plus reasoning.  Requires ``ANTHROPIC_API_KEY`` in the
-    environment.
-    """
-
-    def __init__(self, model: str = "claude-haiku-4-5-20251001") -> None:
-        self.model = model
-        self._api_key = os.environ.get("ANTHROPIC_API_KEY")
-
-    @property
-    def available(self) -> bool:
-        return bool(self._api_key)
-
-    def match(
-        self,
-        records_a: list[dict],
-        records_b: list[dict],
-        *,
-        min_confidence: float = 0.60,
-    ) -> list[MatchCandidate]:
-        """Score all cross-source pairs via LLM.  Only pairs above *min_confidence* are returned."""
-        if not self.available:
-            log.debug("AIMatcher: no ANTHROPIC_API_KEY, skipping")
-            return []
-
-        try:
-            import openai  # noqa: F811
-        except ImportError:
-            log.debug("AIMatcher: openai package not installed, skipping")
-            return []
-
-        client = openai.OpenAI(
-            api_key=self._api_key,
-            base_url="https://api.anthropic.com/v1/",
-        )
-
-        matches: list[MatchCandidate] = []
-        seen_pairs: set[tuple[str, str]] = set()
-
-        for rec_a in records_a:
-            source_a = rec_a.get("_source_id", "unknown")
-            rid_a = rec_a.get("_record_id", "unknown")
-            key_a = f"{source_a}:{rid_a}"
-
-            for rec_b in records_b:
-                source_b = rec_b.get("_source_id", "unknown")
-                rid_b = rec_b.get("_record_id", "unknown")
-                key_b = f"{source_b}:{rid_b}"
-
-                if key_a == key_b:
-                    continue
-                pair = (min(key_a, key_b), max(key_a, key_b))
-                if pair in seen_pairs:
-                    continue
-                seen_pairs.add(pair)
-
-                result = self._score_pair(client, rec_a, rec_b)
-                if result is not None and result[0] >= min_confidence:
-                    matches.append(
-                        MatchCandidate(
-                            entity_a=key_a,
-                            entity_b=key_b,
-                            confidence=result[0],
-                            match_method="ai",
-                            reasoning=result[1],
-                        )
-                    )
-
-        return matches
-
-    def _score_pair(
-        self,
-        client: object,
-        rec_a: dict,
-        rec_b: dict,
-    ) -> tuple[float, str] | None:
-        """Call the LLM to score a single pair.  Returns (confidence, reasoning) or None on error."""
-        skip_keys = {"_source_id", "_record_id"}
-        context_a = {k: v for k, v in rec_a.items() if k not in skip_keys}
-        context_b = {k: v for k, v in rec_b.items() if k not in skip_keys}
-
-        prompt = (
-            "You are an entity-resolution expert. Determine whether these two records "
-            "refer to the same real-world entity.\n\n"
-            f"Record A: {json.dumps(context_a, default=str)}\n"
-            f"Record B: {json.dumps(context_b, default=str)}\n\n"
-            "Respond with ONLY a JSON object: "
-            '{"confidence": <float 0-1>, "reasoning": "<one sentence>"}'
-        )
-
-        try:
-            response = client.chat.completions.create(  # type: ignore[union-attr]
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=200,
-                temperature=0.0,
-            )
-            text = response.choices[0].message.content.strip()
-            # Parse JSON from response (handle markdown fences)
-            if text.startswith("```"):
-                text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-            data = json.loads(text)
-            return (float(data["confidence"]), str(data.get("reasoning", "")))
-        except Exception as exc:
-            log.debug("AIMatcher: LLM call failed for pair: %s", exc)
-            return None
-
-
 class EntityMatcher:
     """Orchestrator that runs matchers in cascade: exact -> fuzzy -> domain -> AI.
 
@@ -331,7 +225,7 @@ class EntityMatcher:
     def __init__(
         self,
         threshold_engine: object | None = None,
-        ai_matcher: AIMatcher | None = None,
+        ai_matcher: object | None = None,
     ) -> None:
         self.threshold_engine = threshold_engine
         self._exact = ExactMatcher()

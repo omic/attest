@@ -14,6 +14,9 @@ import atexit
 import json
 import logging
 import os
+import signal
+import sys
+import threading
 import time
 import uuid
 
@@ -45,12 +48,12 @@ You have a persistent knowledge brain that remembers across sessions. USE IT PRO
 **Token discipline (proactive):**
 - When a user wants to read or ingest a PDF/image: suggest converting to markdown first \
 (5-20x token savings). Commands: `pandoc file.pdf -o file.md` or `markitdown file.pdf > file.md`.
-- In long sessions (15+ human turns): suggest starting a fresh conversation or using \
-`prompt_kit_rescue` to compress context.
-- For bulk or repeated LLM tasks: call `prompt_kit_optimize(task)` for model routing advice.
-- Token usage from brain LLM calls (ingest_text, attest_ask, agent_consensus) is auto-tracked.
+- In long sessions (15+ human turns): suggest starting a fresh conversation to reset context.
+- Token usage from brain LLM calls (ingest_text, attest_ask) is auto-tracked.
 
-Record knowledge liberally — anything that would save time if encountered again."""
+Record knowledge liberally — anything that would save time if encountered again.
+(Advanced tools — corroboration, source health, review queue, graph analytics — live in the \
+`standard` profile. Set ATTEST_MCP_PROFILE=standard if you need them.)"""
 
 mcp = FastMCP("attest", instructions=_BRAIN_INSTRUCTIONS)
 
@@ -120,6 +123,7 @@ TOOL_CATEGORIES: dict[str, str] = {
     "attest_source_health": "query",
     "attest_source_reliability": "query",
     "attest_blindspots": "query",
+    "attest_unanswered": "query",
     "attest_fragile": "query",
     "attest_stale": "query",
     "attest_drift": "query",
@@ -195,6 +199,7 @@ TOOL_CATEGORIES: dict[str, str] = {
     # --- viz (mcp_tools_viz) ---
     "attest_dashboard": "viz",
     "attest_graph": "viz",
+    "gateway_savings_summary": "viz",
     # --- team (mcp_tools_team) ---
     "team_setup": "team",
     "team_configure": "team",
@@ -234,6 +239,49 @@ TOOL_CATEGORIES: dict[str, str] = {
     # --- query (attestdb/query/mcp_handler) ---
     "query_unified": "query",
     "drill_down": "query",
+    # --- compliance (mcp_tools_compliance) ---
+    "compliance_posture": "compliance",
+    "compliance_gaps": "compliance",
+    "compliance_evidence_for": "compliance",
+    "compliance_ingest_evidence": "compliance",
+    # --- audit (audit/mcp_tools) ---
+    "audit_user": "audit",
+    "audit_claim": "audit",
+    "audit_denied": "audit",
+    "compliance_report": "audit",
+    "audit_export_csv": "audit",
+    "audit_integrity": "audit",
+    # --- predicate management ---
+    "predicate_catalog": "admin",
+    "predicate_infer": "admin",
+    # --- reconcile (mcp_tools_reconcile) — agent action verification ---
+    "verify_before_act": "reconcile",
+    "reconcile_batch": "reconcile",
+    "get_evidence_for": "reconcile",
+    "log_agent_action": "reconcile",
+    "explain_agent_action": "reconcile",
+    "export_agent_imprint": "reconcile",
+    "verify_agent_imprint": "reconcile",
+    "claims_at": "query",
+    "export_liability_ledger": "reconcile",
+    "verify_liability_ledger": "reconcile",
+    # --- trust (mcp_tools_trust) — composite entity trust score ---
+    "trust_score": "reconcile",
+    # --- transaction (mcp_tools_transaction) — agentic transaction gateway ---
+    "check_transaction": "reconcile",
+    # --- agent_factory (mcp_tools_agent_factory) ---
+    "factory_discover_workflows": "agent_factory",
+    "factory_generate_spec": "agent_factory",
+    "factory_build_eval": "agent_factory",
+    "factory_assemble_agent": "agent_factory",
+    "factory_validate_trust": "agent_factory",
+    "factory_run_pipeline": "agent_factory",
+    "factory_list_workflows": "agent_factory",
+    "factory_list_agents": "agent_factory",
+    "factory_workflow_evolution": "agent_factory",
+    "factory_export_agent": "agent_factory",
+    "factory_execute_agent": "agent_factory",
+    "factory_run_eval": "agent_factory",
 }
 
 ALL_CATEGORIES = sorted(set(TOOL_CATEGORIES.values()))
@@ -253,7 +301,7 @@ def _filter_tools_by_category(allowed_categories: set[str]) -> int:
 
 def _serialize(obj: object) -> str:
     """Serialize a dataclass to JSON (used by most MCP tool return values)."""
-    return json.dumps(asdict(obj))
+    return json.dumps(asdict(obj), default=str)
 
 
 def _cap_response(json_str: str, max_chars: int = 4000) -> str:
@@ -404,10 +452,10 @@ def _flush_session():
                         },
                     },
                 )
-            except Exception:
+            except BaseException:
                 pass
-    except Exception:
-        pass  # Best-effort — process is exiting
+    except BaseException:
+        pass  # Best-effort — process is exiting; swallow even Rust PanicException
 
 
 def configure(db) -> None:
@@ -429,6 +477,10 @@ class _namespace_scope:
     (no threading), so concurrent tool calls are impossible — the set-
     query-restore pattern is safe.  This wrapper ensures the namespace
     filter is always restored, even on exceptions.
+
+    WARNING: NOT safe for concurrent async tasks on HTTP/streaming transports
+    where multiple requests may interleave. If HTTP transport with concurrent
+    requests is needed, replace with task-local storage or per-request DB wrapper.
     """
 
     __slots__ = ("_db", "_prev")
@@ -463,30 +515,30 @@ def ingest_claim(
     ttl_seconds: int = 0,
     verify: bool = False,
 ) -> str:
-    """Add a claim (subject-predicate-object triple) to the knowledge graph.
+    """Add a subject-predicate-object claim. Returns claim_id (SHA-256).
 
-    Returns the claim_id (SHA-256 hash). Requires all fields — omitting
-    source_type or source_id will raise a ProvenanceError.
-    Optional namespace for team isolation (empty = global).
-    Optional ttl_seconds for automatic expiry (0 = never expires).
-    Optional verify=True to run verification pipeline after ingest.
-    Confidence is automatically calibrated for LLM sources and capped by
-    source type ceiling.
+    source_type + source_id are required (ProvenanceError if missing).
+    namespace for team isolation, ttl_seconds for expiry (0=never),
+    verify=True runs verification. Confidence auto-calibrated per source.
     """
     _track_tool_call("ingest_claim", f"{subject_id} {predicate_id} {object_id}")
-    _track_claims_ingested(1)
     db = _get_db()
-    return db.ingest(
-        subject=(subject_id, subject_type),
-        predicate=(predicate_id, predicate_type),
-        object=(object_id, object_type),
-        provenance={"source_type": source_type, "source_id": source_id},
-        confidence=confidence,
-        payload=payload,
-        namespace=namespace,
-        ttl_seconds=ttl_seconds,
-        verify=verify,
-    )
+    try:
+        claim_id = db.ingest(
+            subject=(subject_id, subject_type),
+            predicate=(predicate_id, predicate_type),
+            object=(object_id, object_type),
+            provenance={"source_type": source_type, "source_id": source_id},
+            confidence=confidence,
+            payload=payload,
+            namespace=namespace,
+            ttl_seconds=ttl_seconds,
+            verify=verify,
+        )
+        _track_claims_ingested(1)
+        return claim_id
+    except Exception as exc:
+        return json.dumps({"error": f"ingest failed: {exc}"})
 
 
 @mcp.tool()
@@ -554,24 +606,259 @@ def ingest_batch(claims: list[dict]) -> str:
     from attestdb.core.types import ClaimInput
 
     db = _get_db()
-    claim_inputs = [
-        ClaimInput(
-            subject=_to_pair(c["subject"]),
-            predicate=_to_pair(c["predicate"], "predicate"),
-            object=_to_pair(c["object"]),
-            provenance=c["provenance"],
-            confidence=c.get("confidence"),
-            payload=c.get("payload"),
-        )
-        for c in claims
-    ]
-    result = db.ingest_batch(claim_inputs)
+    claim_inputs = []
+    parse_errors = []
+    for i, c in enumerate(claims):
+        try:
+            claim_inputs.append(ClaimInput(
+                subject=_to_pair(c["subject"]),
+                predicate=_to_pair(c["predicate"], "predicate"),
+                object=_to_pair(c["object"]),
+                provenance=c["provenance"],
+                confidence=c.get("confidence"),
+                payload=c.get("payload"),
+            ))
+        except (KeyError, TypeError) as exc:
+            parse_errors.append(f"claim[{i}]: {exc}")
+    result = db.ingest_batch(claim_inputs) if claim_inputs else type(
+        "R", (), {"ingested": 0, "duplicates": 0, "errors": []},
+    )()
     _track_claims_ingested(result.ingested)
+    all_errors = list(result.errors) + parse_errors
     return json.dumps({
         "ingested": result.ingested,
         "duplicates": result.duplicates,
-        "errors": result.errors,
+        "errors": all_errors,
     })
+
+
+@mcp.tool()
+def ingest_custom_data(
+    rows: list[dict],
+    domain_context: str = "",
+    mappings: list[dict] | None = None,
+    commit: bool = False,
+) -> str:
+    """Ingest structured rows — auto-discover mappings, preview, then commit.
+
+    Call first with rows to get proposed mappings + sample claims. Call again
+    with mappings=<validated> and commit=True to ingest. domain_context (e.g.
+    "pharma CRM") improves LLM proposals.
+    """
+    db = _get_db()
+
+    try:
+        from attestdb.discovery.schema_reasoner import (
+            preview_batch,
+            execute_rows_batch,
+            propose_and_validate,
+            export_vocabulary_for_llm,
+        )
+    except ImportError:
+        return json.dumps({"error": "Schema reasoner not available"})
+
+    if not rows:
+        return json.dumps({"error": "No rows provided"})
+
+    # Discovery mode: propose + validate
+    if mappings is None:
+        mappings, preview = propose_and_validate(
+            rows, domain_context=domain_context, db=db,
+        )
+        return json.dumps({
+            "mode": "preview",
+            "mappings": mappings,
+            "preview": {
+                "total_rows": preview.total_rows,
+                "expected_claims": preview.expected_claims,
+                "produced_claims": preview.produced_claims,
+                "drop_rate": f"{preview.drop_rate:.0%}",
+                "field_coverage": {
+                    k: f"{v:.0%}" for k, v in preview.field_coverage.items()
+                },
+                "sample_claims": preview.sample_claims,
+                "warnings": preview.warnings,
+            },
+            "next_step": "Review the mappings and sample claims above. "
+            "If they look correct, call ingest_custom_data again with "
+            "mappings=<these mappings> and commit=True to ingest.",
+        })
+
+    # Preview mode with explicit mappings
+    if not commit:
+        preview = preview_batch(rows, mappings)
+        return json.dumps({
+            "mode": "preview",
+            "mappings": mappings,
+            "preview": {
+                "total_rows": preview.total_rows,
+                "expected_claims": preview.expected_claims,
+                "produced_claims": preview.produced_claims,
+                "drop_rate": f"{preview.drop_rate:.0%}",
+                "field_coverage": {
+                    k: f"{v:.0%}" for k, v in preview.field_coverage.items()
+                },
+                "sample_claims": preview.sample_claims,
+                "warnings": preview.warnings,
+            },
+            "next_step": "Add commit=True to ingest these claims.",
+        })
+
+    # Commit mode: ingest for real
+    claims = execute_rows_batch(
+        rows, mappings, include_payload=True,
+        source_type="custom_import",
+        source_id=domain_context or "custom",
+    )
+    if not claims:
+        return json.dumps({"error": "No claims produced from mappings", "mappings": mappings})
+
+    # Auto-register payload schemas from the data
+    registered_schemas: list[str] = []
+    seen_schemas: set[str] = set()
+    for c in claims:
+        if c.payload and "schema_ref" in c.payload:
+            ref = c.payload["schema_ref"]
+            if ref not in seen_schemas:
+                seen_schemas.add(ref)
+                # Build schema from first claim's payload data keys
+                field_types = {}
+                for k, v in c.payload.get("data", {}).items():
+                    if isinstance(v, bool):
+                        field_types[k] = "boolean"
+                    elif isinstance(v, int):
+                        field_types[k] = "integer"
+                    elif isinstance(v, float):
+                        field_types[k] = "number"
+                    else:
+                        field_types[k] = "string"
+                try:
+                    db.register_payload_schema(ref, {
+                        "schema_ref": ref,
+                        "fields": field_types,
+                        "source_type": "custom_import",
+                    })
+                    registered_schemas.append(ref)
+                except Exception as exc:
+                    logger.warning("Failed to register schema %s: %s", ref, exc)
+
+    result = db.ingest_batch(claims)
+    _track_claims_ingested(result.ingested)
+
+    # Post-ingestion audit: reconcile a sample against existing graph
+    audit = {}
+    try:
+        from attestdb.intelligence.reconciler import Reconciler
+        reconciler = Reconciler(db)
+        sample = claims[:20]
+        observations = [
+            {"entity": c.subject[0], "predicate": c.predicate[0], "object": c.object[0]}
+            for c in sample
+        ]
+        batch_result = reconciler.reconcile_batch(observations)
+        audit = {
+            "verified": batch_result.verified,
+            "unverified": batch_result.unverified,
+            "contradicted": batch_result.contradicted,
+            "stale": batch_result.stale,
+            "total_checked": batch_result.total,
+        }
+        # Surface contradictions as warnings
+        contradictions = [
+            f"{r.entity} --{r.predicate}--> {r.object}: {r.evidence_summary}"
+            for r in batch_result.results if r.verdict == "contradicted"
+        ]
+        if contradictions:
+            audit["contradiction_details"] = contradictions
+    except Exception as exc:
+        logger.warning("Post-ingestion reconciliation failed: %s", exc)
+
+    return json.dumps({
+        "mode": "committed",
+        "ingested": result.ingested,
+        "duplicates": result.duplicates,
+        "errors": list(result.errors),
+        "total_rows": len(rows),
+        "total_mappings": len(mappings),
+        "registered_schemas": registered_schemas,
+        "audit": audit,
+    })
+
+
+@mcp.tool()
+def search_by_payload(
+    schema_ref: str = "",
+    record_id: str = "",
+    field: str = "",
+    value: str = "",
+    limit: int = 20,
+) -> str:
+    """Search claims by source record payload (schema_ref, record_id, or field/value).
+
+    schema_ref: source system like "salesforce/opportunity" or "jira/bug".
+    record_id: specific source record. field+value: match payload data field.
+    """
+    db = _get_db()
+    claims = db.claims_by_payload(
+        schema_ref=schema_ref or None,
+        record_id=record_id or None,
+        field=field or None,
+        value=value or None,
+        limit=limit,
+    )
+    results = []
+    for c in claims:
+        entry = {
+            "claim_id": c.claim_id,
+            "subject": c.subject.id,
+            "predicate": c.predicate.id,
+            "object": c.object.id,
+            "confidence": c.confidence,
+        }
+        if c.payload:
+            entry["payload"] = {
+                "schema_ref": c.payload.schema_ref,
+                "record_id": c.payload.data.get("record_id"),
+                "data": c.payload.data,
+            }
+        results.append(entry)
+    return json.dumps({"claims": results, "total": len(results)})
+
+
+@mcp.tool()
+def run_connector(
+    connector: str,
+    config: dict | None = None,
+) -> str:
+    """Run a data connector to fetch from an external system and ingest claims.
+    connector: slack|gmail|jira|github|salesforce|hubspot|linear|zendesk|servicenow|
+    pagerduty|postgres|mysql|csv|notion|confluence|gdocs|teams|s3|elasticsearch|
+    mongodb|airtable|google_sheets|zoho|http. config: connector-specific dict.
+    """
+    db = _get_db()
+    cfg = config or {}
+
+    try:
+        from attestdb.connectors import connect, CONNECTOR_REGISTRY
+    except ImportError:
+        return json.dumps({"error": "Connectors module not available"})
+
+    if connector not in CONNECTOR_REGISTRY:
+        available = sorted(CONNECTOR_REGISTRY.keys())
+        return json.dumps({"error": f"Unknown connector: {connector}", "available": available})
+
+    try:
+        conn = connect(connector, **cfg)
+        result = conn.run(db)
+        return json.dumps({
+            "connector": connector,
+            "claims_ingested": result.claims_ingested,
+            "claims_skipped": result.claims_skipped,
+            "errors": result.errors[:10],
+            "elapsed_seconds": round(result.elapsed_seconds, 1),
+        })
+    except Exception as exc:
+        return json.dumps({"error": f"Connector {connector} failed: {exc}"})
 
 
 @mcp.tool()
@@ -753,6 +1040,34 @@ def schema() -> str:
 
 
 @mcp.tool()
+def predicate_catalog() -> str:
+    """List registered predicates with descriptions, allowed subject/object types,
+    data patterns, directionality, opposition pairs, and observation counts.
+    """
+    db = _get_db()
+    store = getattr(db, "_predicate_store", None)
+    if store is None:
+        return json.dumps({"error": "PredicateStore not available"})
+    return json.dumps(store.export_catalog(), indent=2)
+
+
+@mcp.tool()
+def predicate_infer(min_observations: int = 20) -> str:
+    """Crystallize predicate type constraints (subject_types/object_types) from
+    observed usage. min_observations: minimum claims required before inferring.
+    """
+    db = _get_db()
+    store = getattr(db, "_predicate_store", None)
+    if store is None:
+        return json.dumps({"error": "PredicateStore not available"})
+    results = store.infer_constraints(min_observations=min_observations)
+    return json.dumps({
+        "inferred": results,
+        "count": len(results),
+    }, indent=2)
+
+
+@mcp.tool()
 def stats() -> str:
     """Get database statistics."""
     db = _get_db()
@@ -824,13 +1139,13 @@ def audit_log(
 
 
 @mcp.tool()
-def attest_ask(question: str, namespace: str = "", top_k: int = 10) -> str:
-    """Answer a natural-language question using the knowledge graph.
+def attest_ask(question: str, namespace: str = "", top_k: int = 10,
+               engine: str = "v2") -> str:
+    """Answer a NL question against the knowledge graph. Returns answer with
+    citations, contradictions, and gap analysis.
 
-    Returns structured answer with citations, contradictions, and gap analysis.
-
-    Pass a namespace to scope the answer to a specific session or team.
-    Leave empty to search the global namespace (all claims).
+    namespace: scope to session/team ("" = global). engine: v2 (default) | v3
+    (Agent SDK, needs ANTHROPIC_API_KEY) | shadow (runs both).
     """
     _track_tool_call("attest_ask", question[:100])
     db = _get_db()
@@ -842,21 +1157,16 @@ def attest_ask(question: str, namespace: str = "", top_k: int = 10) -> str:
 
     if namespace:
         with _namespace_scope(db, namespace):
-            result = attest_ask_impl(db, question, top_k)
+            result = attest_ask_impl(db, question, top_k, engine=engine)
     else:
-        result = attest_ask_impl(db, question, top_k)
+        result = attest_ask_impl(db, question, top_k, engine=engine)
     return _cap_response(result) if isinstance(result, str) else result
 
 
 @mcp.tool()
 def claims_in_namespace(namespace: str, limit: int = 500) -> str:
-    """Return all claims stored under the given namespace.
-
-    Used to build a full KB snapshot for a session without relying on
-    in-memory state in the client. Each ReAct3 chat session uses its
-    chatId as the namespace, so this returns all claims for that session.
-
-    An empty namespace string returns ``{"namespace": "", "count": 0, "claims": []}``.
+    """Return all claims stored under a namespace — full session KB snapshot.
+    Empty namespace returns an empty result (no global listing).
     """
     _track_tool_call("claims_in_namespace", namespace[:100])
     if not namespace:
@@ -919,6 +1229,29 @@ def attest_blindspots(min_claims: int = 5) -> str:
 
 
 @mcp.tool()
+def attest_unanswered(
+    limit: int = 20,
+    reason: str | None = None,
+    since_days: float | None = None,
+) -> str:
+    """Demand-driven gap signal: questions ask_engine couldn't answer well.
+
+    Distinct from attest_blindspots (structural / graph-level) — this surfaces
+    what users actually asked but didn't get back. Returns a per-reason summary
+    and the most recent unanswered queries.
+
+    reason: filter to one of {no_entities, no_evidence, low_confidence,
+    no_answer, fallback}; None returns all.
+    since_days: only include records from the last N days (default: all time).
+    """
+    import time as _time
+    db = _get_db()
+    since = (_time.time() - since_days * 86400) if since_days else None
+    result = db.unanswered(limit=limit, reason=reason, since=since)
+    return _cap_response(json.dumps(result, default=str))
+
+
+@mcp.tool()
 def attest_consensus(topic: str) -> str:
     """Analyze consensus around an entity/topic across sources."""
     db = _get_db()
@@ -928,14 +1261,8 @@ def attest_consensus(topic: str) -> str:
 
 @mcp.tool()
 def attest_corroboration(min_sources: int = 2) -> str:
-    """Report on corroboration status: what's independently confirmed vs single-source.
-
-    Shows which claims have been attested by multiple independent sources (with
-    confidence boost info) and which need corroboration. Use this to understand
-    knowledge reliability and identify where independent confirmation is needed.
-
-    Args:
-        min_sources: Minimum independent sources to count as corroborated (default: 2)
+    """Corroboration report: which claims are independently confirmed vs single-source.
+    min_sources: minimum independent sources to count as corroborated (default 2).
     """
     _track_tool_call("attest_corroboration", str(min_sources))
     db = _get_db()
@@ -977,13 +1304,8 @@ def attest_corroboration(min_sources: int = 2) -> str:
 
 @mcp.tool()
 def attest_diagnose_corroboration(content_id: str) -> str:
-    """Show how corroboration is counted for a content_id. Useful for debugging inflation.
-
-    Returns external ID clustering vs provenance overlap breakdown, making it
-    visible when the same paper ingested via multiple paths inflates counts.
-
-    Args:
-        content_id: The content_id to diagnose (SHA-256 of subject+predicate+object)
+    """Debug corroboration inflation: external-ID clustering vs provenance overlap
+    breakdown for a content_id (SHA-256 of subject+predicate+object).
     """
     _track_tool_call("attest_diagnose_corroboration", content_id)
     db = _get_db()
@@ -1181,109 +1503,245 @@ def list_tool_categories() -> str:
 # ---------------------------------------------------------------------------
 # Register tool groups from submodules
 # ---------------------------------------------------------------------------
+# ATTEST_MCP_PROFILE gates which groups are registered to keep the per-turn
+# tool-list footprint small. Each tool's name+description+schema is sent to
+# the LLM on every turn, so 165 tools ≈ 24K tokens of fixed overhead.
+#
+# Profiles (comma-sep groups also accepted):
+#   core     — lean allowlist of hot-path tools   (~16 tools, ~2K tokens)
+#   standard — core + analysis + viz + audit      (~60 tools, ~10K tokens)
+#   full     — all registered groups              (~165 tools, ~24K tokens)
+#
+# Default is "core". Set ATTEST_MCP_PROFILE=full to restore the full surface,
+# or e.g. ATTEST_MCP_PROFILE=core,team to opt specific groups in.
+#
+# The `core` profile additionally applies a post-registration allowlist
+# (_LEAN_CORE_TOOLS) so that tools registered at module-level in mcp_server.py
+# are pruned unless they're on the allowlist. Selection is driven by actual
+# usage telemetry from Claude Code transcripts.
+import os as _os
 
+_GROUP_PROFILES = {
+    "core": {"learning", "query", "review"},
+    "standard": {"learning", "query", "review", "analysis", "viz", "audit"},
+    "full": {
+        "learning", "query", "review", "analysis", "viz", "audit",
+        "autonomous", "team", "prompt_kit", "compliance", "reconcile",
+        "trust", "transaction", "agent_factory", "narrative", "novelty",
+    },
+}
+
+# Tools kept in the `core` profile. Selection: every tool with recorded usage
+# in Claude Code transcripts, plus the canonical write/read/admin surface that
+# the MCP instructions promote. Everything else is available via `standard`.
+_LEAN_CORE_TOOLS = frozenset({
+    # write path
+    "ingest_claim", "ingest_text", "ingest_batch", "ingest_custom_data",
+    # read path
+    "query_entity", "search_entities", "get_entity", "attest_ask",
+    # learning loop (promoted in MCP instructions)
+    "attest_learned", "attest_negative_result", "attest_check_file",
+    "attest_session_end", "attest_get_prior_approaches",
+    # basic admin
+    "stats", "changes", "schema", "list_tool_categories",
+})
+
+def _resolve_enabled_groups() -> set[str]:
+    raw = _os.environ.get("ATTEST_MCP_PROFILE", "core").strip().lower()
+    if raw in _GROUP_PROFILES:
+        return set(_GROUP_PROFILES[raw])
+    # Treat as comma-separated list — may include profile names or bare groups.
+    enabled: set[str] = set()
+    for token in (t.strip() for t in raw.split(",") if t.strip()):
+        if token in _GROUP_PROFILES:
+            enabled |= _GROUP_PROFILES[token]
+        else:
+            enabled.add(token)
+    return enabled or set(_GROUP_PROFILES["core"])
+
+_ENABLED_GROUPS = _resolve_enabled_groups()
+
+def _register_group(name: str, fn) -> None:
+    if name not in _ENABLED_GROUPS:
+        return
+    try:
+        fn()
+    except ImportError:
+        pass
+
+
+def _reg_learning_group():
+    from attestdb.mcp_tools_learning import register_tools as _reg
+    _reg(mcp, _get_db)
+
+def _reg_viz_group():
+    from attestdb.mcp_tools_viz import register_tools as _reg
+    _reg(mcp, _get_db)
+
+def _reg_autonomous_group():
+    from attestdb.mcp_tools_autonomous import register_tools as _reg
+    _reg(mcp, _get_db)
+
+def _reg_analysis_group():
+    from attestdb.mcp_tools_analysis import register_tools as _reg
+    _reg(mcp, _get_db)
+
+def _reg_team_group():
+    from attestdb.mcp_tools_team import register_tools as _reg
+    _reg(mcp, _get_db)
+
+def _reg_prompt_kit_group():
+    from attestdb.mcp_tools_prompt_kit import register_tools as _reg
+    _reg(mcp, _get_db)
+
+def _reg_review_group():
+    from attestdb.review.mcp_tools import register_review_tools as _reg
+    _reg(mcp, _get_db)
+
+def _reg_query_group():
+    from attestdb.query.mcp_handler import register_query_tools as _reg
+    _reg(mcp, _get_db)
+
+def _reg_compliance_group():
+    from attestdb.mcp_tools_compliance import register_tools as _reg
+    _reg(mcp, _get_db)
+
+def _reg_audit_group():
+    from attestdb.audit.mcp_tools import register_audit_tools as _reg
+    _reg(mcp, lambda: _get_db()._audit)
+
+def _reg_reconcile_group():
+    from attestdb.mcp_tools_reconcile import register_tools as _reg
+    _reg(mcp, _get_db)
+
+def _reg_trust_group():
+    from attestdb.mcp_tools_trust import register_tools as _reg
+    _reg(mcp, _get_db)
+
+def _reg_transaction_group():
+    from attestdb.mcp_tools_transaction import register_tools as _reg
+    _reg(mcp, _get_db)
+
+def _reg_agent_factory_group():
+    from attestdb.mcp_tools_agent_factory import register_tools as _reg
+    _reg(mcp, _get_db)
+
+
+def _reg_narrative_group():
+    from attestdb.mcp_tools_narrative import register_tools as _reg
+    _reg(mcp, _get_db)
+
+
+def _reg_novelty_group():
+    from attestdb.mcp_tools_novelty import register_tools as _reg
+    _reg(mcp, _get_db)
+
+
+def _reg_recommender_group():
+    from attestdb.mcp_tools_recommender import register_tools as _reg
+    _reg(mcp, _get_db)
+
+
+# learning is always needed for test re-exports; register then check.
 try:
-    from attestdb.mcp_tools_learning import register_tools as _reg_learning
     from attestdb.mcp_tools_learning import (  # re-export helpers used by tests
         _retrieve_candidates,
         _ASK_STOP_WORDS,
         attest_ask_impl as _attest_ask_impl,
     )
-    _reg_learning(mcp, _get_db)
 except ImportError:
     pass
 
+_register_group("learning", _reg_learning_group)
+_register_group("viz", _reg_viz_group)
+_register_group("autonomous", _reg_autonomous_group)
+_register_group("analysis", _reg_analysis_group)
+_register_group("team", _reg_team_group)
+_register_group("prompt_kit", _reg_prompt_kit_group)
+_register_group("review", _reg_review_group)
+_register_group("query", _reg_query_group)
+_register_group("compliance", _reg_compliance_group)
+_register_group("audit", _reg_audit_group)
+_register_group("agent_factory", _reg_agent_factory_group)
+_register_group("narrative", _reg_narrative_group)
+_register_group("novelty", _reg_novelty_group)
+_register_group("recommender", _reg_recommender_group)
+
+# reconcile / trust / transaction register UNCONDITIONALLY so the gateway's
+# curation layer and direct-import demos always see them. Under the `core`
+# profile the lean-core allowlist below prunes them; under any broader
+# profile they stay exposed. (Steve's original flat-registration pattern.)
 try:
-    from attestdb.mcp_tools_viz import register_tools as _reg_viz
-    _reg_viz(mcp, _get_db)
+    _reg_reconcile_group()
+except ImportError:
+    pass
+try:
+    _reg_trust_group()
+except ImportError:
+    pass
+try:
+    _reg_transaction_group()
 except ImportError:
     pass
 
-try:
-    from attestdb.mcp_tools_autonomous import register_tools as _reg_autonomous
-    _reg_autonomous(mcp, _get_db)
-except ImportError:
-    pass
-
-try:
-    from attestdb.mcp_tools_analysis import register_tools as _reg_analysis
-    _reg_analysis(mcp, _get_db)
-except ImportError:
-    pass
-
-try:
-    from attestdb.mcp_tools_team import register_tools as _reg_team
-    _reg_team(mcp, _get_db)
-except ImportError:
-    pass
-
-try:
-    from attestdb.mcp_tools_prompt_kit import register_tools as _reg_prompt_kit
-    _reg_prompt_kit(mcp, _get_db)
-except ImportError:
-    pass
-
-try:
-    from attestdb.review.mcp_tools import register_review_tools as _reg_review
-    _reg_review(mcp, _get_db)
-except ImportError:
-    pass
-
-try:
-    from attestdb.query.mcp_handler import register_query_tools as _reg_query
-    _reg_query(mcp, _get_db)
-except ImportError:
-    pass
+# When the user explicitly chose exactly the `core` profile, prune everything
+# outside the lean allowlist. Any broader profile (standard/full/custom groups)
+# keeps the full registered surface.
+if _os.environ.get("ATTEST_MCP_PROFILE", "core").strip().lower() == "core":
+    _mgr = mcp._tool_manager
+    for _name in list(_mgr._tools.keys()):
+        if _name not in _LEAN_CORE_TOOLS:
+            _mgr._tools.pop(_name, None)
 
 # Re-export tool functions from submodules so tests and external code can
 # import them from attestdb.mcp_server (backward compatibility).
 _tool_lookup = {t.name: t.fn for t in mcp._tool_manager.list_tools()}
-attest_learned = _tool_lookup["attest_learned"]
-attest_check_file = _tool_lookup["attest_check_file"]
-attest_session_end = _tool_lookup["attest_session_end"]
-attest_negative_result = _tool_lookup["attest_negative_result"]
-attest_research_context = _tool_lookup["attest_research_context"]
-attest_observe_session = _tool_lookup["attest_observe_session"]
-attest_record_outcome = _tool_lookup["attest_record_outcome"]
-attest_get_prior_approaches = _tool_lookup["attest_get_prior_approaches"]
-attest_confidence_trail = _tool_lookup["attest_confidence_trail"]
-attest_dashboard = _tool_lookup["attest_dashboard"]
-attest_graph = _tool_lookup["attest_graph"]
-autoresearch_log_experiment = _tool_lookup["autoresearch_log_experiment"]
-autoresearch_get_priors = _tool_lookup["autoresearch_get_priors"]
-autoresearch_suggest_next = _tool_lookup["autoresearch_suggest_next"]
-openclaw_ingest_action = _tool_lookup["openclaw_ingest_action"]
-openclaw_query_knowledge = _tool_lookup["openclaw_query_knowledge"]
-openclaw_heartbeat_check = _tool_lookup["openclaw_heartbeat_check"]
-openclaw_ingest_conversation = _tool_lookup["openclaw_ingest_conversation"]
-openclaw_get_preferences = _tool_lookup["openclaw_get_preferences"]
-autodidact_enable = _tool_lookup["autodidact_enable"]
-autodidact_disable = _tool_lookup["autodidact_disable"]
-autodidact_status = _tool_lookup["autodidact_status"]
-autodidact_run_now = _tool_lookup["autodidact_run_now"]
-autodidact_history = _tool_lookup["autodidact_history"]
-agent_consensus = _tool_lookup["agent_consensus"]
-attest_what_if = _tool_lookup["attest_what_if"]
-attest_sandbox_create = _tool_lookup["attest_sandbox_create"]
-attest_sandbox_analyze = _tool_lookup["attest_sandbox_analyze"]
-attest_predict = _tool_lookup["attest_predict"]
-attest_verify_claim = _tool_lookup["attest_verify_claim"]
-attest_verification_status = _tool_lookup["attest_verification_status"]
-attest_challenge_claim = _tool_lookup["attest_challenge_claim"]
-attest_verification_budget = _tool_lookup["attest_verification_budget"]
-attest_create_thread = _tool_lookup["attest_create_thread"]
-attest_resume_thread = _tool_lookup["attest_resume_thread"]
-attest_extend_thread = _tool_lookup["attest_extend_thread"]
-attest_list_threads = _tool_lookup["attest_list_threads"]
-attest_thread_context = _tool_lookup["attest_thread_context"]
-attest_audit_paper = _tool_lookup["attest_audit_paper"]
-attest_bulk_audit = _tool_lookup["attest_bulk_audit"]
-attest_check_freshness = _tool_lookup["attest_check_freshness"]
-attest_sweep_stale = _tool_lookup["attest_sweep_stale"]
-attest_archive = _tool_lookup["attest_archive"]
-attest_graph_stats = _tool_lookup["attest_graph_stats"]
-attest_investigate = _tool_lookup["attest_investigate"]
-attest_research = _tool_lookup["attest_research"]
+attest_learned = _tool_lookup.get("attest_learned")
+attest_check_file = _tool_lookup.get("attest_check_file")
+attest_session_end = _tool_lookup.get("attest_session_end")
+attest_negative_result = _tool_lookup.get("attest_negative_result")
+attest_research_context = _tool_lookup.get("attest_research_context")
+attest_observe_session = _tool_lookup.get("attest_observe_session")
+attest_record_outcome = _tool_lookup.get("attest_record_outcome")
+attest_get_prior_approaches = _tool_lookup.get("attest_get_prior_approaches")
+attest_confidence_trail = _tool_lookup.get("attest_confidence_trail")
+attest_dashboard = _tool_lookup.get("attest_dashboard")
+attest_graph = _tool_lookup.get("attest_graph")
+autoresearch_log_experiment = _tool_lookup.get("autoresearch_log_experiment")
+autoresearch_get_priors = _tool_lookup.get("autoresearch_get_priors")
+autoresearch_suggest_next = _tool_lookup.get("autoresearch_suggest_next")
+openclaw_ingest_action = _tool_lookup.get("openclaw_ingest_action")
+openclaw_query_knowledge = _tool_lookup.get("openclaw_query_knowledge")
+openclaw_heartbeat_check = _tool_lookup.get("openclaw_heartbeat_check")
+openclaw_ingest_conversation = _tool_lookup.get("openclaw_ingest_conversation")
+openclaw_get_preferences = _tool_lookup.get("openclaw_get_preferences")
+autodidact_enable = _tool_lookup.get("autodidact_enable")
+autodidact_disable = _tool_lookup.get("autodidact_disable")
+autodidact_status = _tool_lookup.get("autodidact_status")
+autodidact_run_now = _tool_lookup.get("autodidact_run_now")
+autodidact_history = _tool_lookup.get("autodidact_history")
+agent_consensus = _tool_lookup.get("agent_consensus")
+attest_what_if = _tool_lookup.get("attest_what_if")
+attest_sandbox_create = _tool_lookup.get("attest_sandbox_create")
+attest_sandbox_analyze = _tool_lookup.get("attest_sandbox_analyze")
+attest_predict = _tool_lookup.get("attest_predict")
+attest_verify_claim = _tool_lookup.get("attest_verify_claim")
+attest_verification_status = _tool_lookup.get("attest_verification_status")
+attest_challenge_claim = _tool_lookup.get("attest_challenge_claim")
+attest_verification_budget = _tool_lookup.get("attest_verification_budget")
+attest_create_thread = _tool_lookup.get("attest_create_thread")
+attest_resume_thread = _tool_lookup.get("attest_resume_thread")
+attest_extend_thread = _tool_lookup.get("attest_extend_thread")
+attest_list_threads = _tool_lookup.get("attest_list_threads")
+attest_thread_context = _tool_lookup.get("attest_thread_context")
+attest_audit_paper = _tool_lookup.get("attest_audit_paper")
+attest_bulk_audit = _tool_lookup.get("attest_bulk_audit")
+attest_check_freshness = _tool_lookup.get("attest_check_freshness")
+attest_sweep_stale = _tool_lookup.get("attest_sweep_stale")
+attest_archive = _tool_lookup.get("attest_archive")
+attest_graph_stats = _tool_lookup.get("attest_graph_stats")
+attest_investigate = _tool_lookup.get("attest_investigate")
+attest_research = _tool_lookup.get("attest_research")
 prompt_kit_track = _tool_lookup.get("prompt_kit_track")
 prompt_kit_diagnose = _tool_lookup.get("prompt_kit_diagnose")
 prompt_kit_report = _tool_lookup.get("prompt_kit_report")
@@ -1322,6 +1780,76 @@ def get_schema() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Version watchdog — auto-restart when package is updated
+# ---------------------------------------------------------------------------
+
+_RESTART_SENTINEL = os.path.join(os.path.expanduser("~"), ".attest", ".mcp-restart")
+_VERSION_CHECK_INTERVAL = 10  # seconds
+
+
+def _get_installed_version() -> str | None:
+    """Read the current installed package version from metadata (not cached module)."""
+    try:
+        from importlib.metadata import version
+        return version("attestdb")
+    except Exception:
+        return None
+
+
+def _start_version_watchdog():
+    """Background thread that exits the server when a restart is signaled.
+
+    Two triggers:
+    1. Sentinel file ~/.attest/.mcp-restart exists (touched by `attest-mcp install`)
+    2. Installed package version differs from what we started with (new wheel installed)
+
+    On either trigger, the server exits cleanly (exit code 0).
+    Claude Code automatically relaunches MCP servers that exit, so the new
+    version picks up immediately.
+    """
+    startup_version = _get_installed_version()
+    logger.info("Version watchdog started (v=%s)", startup_version)
+
+    def _watchdog():
+        while True:
+            time.sleep(_VERSION_CHECK_INTERVAL)
+            try:
+                # Check 1: restart sentinel file
+                if os.path.exists(_RESTART_SENTINEL):
+                    try:
+                        os.unlink(_RESTART_SENTINEL)
+                    except OSError:
+                        pass
+                    logger.info("Restart sentinel detected — exiting for relaunch")
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    return
+
+                # Check 2: package version changed on disk
+                if startup_version:
+                    # Clear cached metadata so we read fresh from disk
+                    try:
+                        from importlib.metadata import distributions
+                        # Force re-read by clearing any caches
+                        import importlib
+                        importlib.invalidate_caches()
+                    except Exception:
+                        pass
+                    current = _get_installed_version()
+                    if current and current != startup_version:
+                        logger.info(
+                            "Package updated: %s → %s — exiting for relaunch",
+                            startup_version, current,
+                        )
+                        os.kill(os.getpid(), signal.SIGTERM)
+                        return
+            except Exception:
+                pass  # watchdog must never crash the server
+
+    t = threading.Thread(target=_watchdog, daemon=True, name="mcp-version-watchdog")
+    t.start()
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1356,6 +1884,18 @@ def main():
         ),
     )
     args = parser.parse_args()
+
+    # Agent-reconcile mode: curated tool subset for agent behavioral memory
+    # lifecycle (verify-before-act + evidence lookup). Triggered by
+    # ATTEST_RECONCILE_MODE=1.
+    if os.environ.get("ATTEST_RECONCILE_MODE") == "1":
+        reconcile_categories = {"query", "ingestion", "learning", "admin", "reconcile"}
+        removed = _filter_tools_by_category(reconcile_categories)
+        logger.info(
+            "Reconcile mode: keeping %s, removed %d tools",
+            ", ".join(sorted(reconcile_categories)),
+            removed,
+        )
 
     # Filter tools by category if requested
     tools_spec = args.tools or os.environ.get("ATTEST_MCP_TOOLS")
@@ -1418,7 +1958,23 @@ def main():
         mcp.settings.host = args.host
         mcp.settings.port = args.port
 
-    mcp.run(transport=args.transport)
+    # Start version watchdog — auto-restarts when package is updated
+    _start_version_watchdog()
+
+    # Handle SIGTERM gracefully (sent by watchdog or system)
+    def _sigterm_handler(signum, frame):
+        logger.info("SIGTERM received — shutting down for relaunch")
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
+    try:
+        mcp.run(transport=args.transport)
+    except KeyboardInterrupt:
+        logger.info("Interrupted — shutting down")
+    except Exception:
+        logger.exception("MCP server crashed — exiting for relaunch")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -147,7 +147,7 @@ class GDocsConnector(Connector):
                     )
                     result.claims_ingested += 1
 
-                extract_result = db.ingest_text(text, source_id=source_id)
+                extract_result = db.ingest_text(text, source_id=source_id, source_type="gdocs")
                 result.claims_ingested += extract_result.n_valid
                 result.prompt_tokens += getattr(extract_result, "prompt_tokens", 0)
                 result.completion_tokens += getattr(extract_result, "completion_tokens", 0)

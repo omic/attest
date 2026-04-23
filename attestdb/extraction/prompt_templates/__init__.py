@@ -42,6 +42,16 @@ _CONTENT_PROMPTS: dict[str, str] = {
 }
 
 
+def register_content_prompt(content_type: str, prompt: str) -> None:
+    """Register an additional content-type-specific prompt.
+
+    Lets external packages (e.g. investigation demos) extend the content
+    type registry without editing this module. Registering an existing
+    key overrides it.
+    """
+    _CONTENT_PROMPTS[content_type] = prompt
+
+
 def get_system_prompt() -> str:
     """Return the base system prompt for JSON array claim extraction."""
     return _SYSTEM_PROMPT

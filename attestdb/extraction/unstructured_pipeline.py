@@ -140,10 +140,34 @@ class UnstructuredExtractor:
         self,
         entity_index: object | None = None,
         prediction_log: object | None = None,
+        max_cost_usd: float = 0.0,
     ) -> None:
         self._entity_index = entity_index
         self._linker = EntityLinker(entity_index) if entity_index is not None else None
         self._prediction_log = prediction_log
+        self._max_cost_usd = max_cost_usd  # 0 = unbounded
+        self._total_cost_usd = 0.0
+        self._total_prompt_tokens = 0
+        self._total_completion_tokens = 0
+        self._last_reported_dollar = 0  # for $N increment logging
+        self._budget_exceeded = False
+
+    @property
+    def total_cost_usd(self) -> float:
+        return round(self._total_cost_usd, 4)
+
+    @property
+    def budget_exceeded(self) -> bool:
+        return self._budget_exceeded
+
+    def usage_summary(self) -> dict:
+        return {
+            "cost_usd": round(self._total_cost_usd, 4),
+            "prompt_tokens": self._total_prompt_tokens,
+            "completion_tokens": self._total_completion_tokens,
+            "max_cost_usd": self._max_cost_usd,
+            "budget_exceeded": self._budget_exceeded,
+        }
 
     def extract_claims(
         self,
@@ -169,6 +193,10 @@ class UnstructuredExtractor:
             return []
 
         metadata = metadata or {}
+
+        # Budget check — once exceeded, fall back to rule-based for free
+        if self._budget_exceeded:
+            return self._extract_rule_based(content, content_type)
 
         # Try LLM extraction first
         client, model = _get_llm_client()
@@ -276,6 +304,7 @@ class UnstructuredExtractor:
                     temperature=0.1,
                 )
                 raw_content = response.choices[0].message.content or ""
+                self._record_usage(response, model)
                 return self._parse_llm_response(raw_content, content_type)
             except Exception as exc:
                 if attempt < _MAX_RETRIES - 1:
@@ -290,6 +319,39 @@ class UnstructuredExtractor:
                     return self._extract_rule_based(content, content_type)
 
         return []  # unreachable but satisfies type checker
+
+    def _record_usage(self, response: object, model: str) -> None:
+        """Track cumulative cost from an OpenAI-compatible response. Trip budget if over."""
+        from attestdb.core.providers import estimate_cost
+
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        prompt = int(getattr(usage, "prompt_tokens", 0) or 0)
+        completion = int(getattr(usage, "completion_tokens", 0) or 0)
+        cost = estimate_cost(model, prompt, completion)
+
+        self._total_prompt_tokens += prompt
+        self._total_completion_tokens += completion
+        self._total_cost_usd += cost
+
+        # Dollar-increment logging (every whole $1 passed)
+        current_dollar = int(self._total_cost_usd)
+        if current_dollar > self._last_reported_dollar:
+            logger.info(
+                "LLM extraction spend: $%.2f (%d prompt + %d completion tokens)",
+                self._total_cost_usd, self._total_prompt_tokens, self._total_completion_tokens,
+            )
+            self._last_reported_dollar = current_dollar
+
+        # Budget trip
+        if self._max_cost_usd > 0 and self._total_cost_usd >= self._max_cost_usd:
+            if not self._budget_exceeded:
+                logger.warning(
+                    "LLM extraction budget hit: $%.2f >= $%.2f — falling back to rule-based",
+                    self._total_cost_usd, self._max_cost_usd,
+                )
+                self._budget_exceeded = True
 
     def _parse_llm_response(
         self,
@@ -395,31 +457,17 @@ class UnstructuredExtractor:
 
 
 def _get_llm_client() -> tuple[object | None, str]:
-    """Walk the extraction fallback chain and return the first available client."""
-    for provider_name in EXTRACTION_FALLBACK_CHAIN:
-        provider = PROVIDERS.get(provider_name)
-        if not provider:
-            continue
+    """Get an LLM client via the intelligence layer, if installed.
 
-        api_key = os.environ.get(provider["env_key"])
-        if not api_key:
-            env_vars = _load_env_file(".env")
-            api_key = env_vars.get(provider["env_key"])
-
-        if not api_key:
-            continue
-
-        try:
-            from openai import OpenAI
-            client = OpenAI(api_key=api_key, base_url=provider["base_url"])
-            return client, provider["default_model"]
-        except ImportError:
-            return None, ""
-        except Exception as exc:
-            logger.warning("Failed to init %s client: %s", provider_name, exc)
-            continue
-
-    return None, ""
+    Falls back to ``(None, "")`` — which the extractor handles by
+    routing to its rule-based path — when ``attestdb.intelligence`` is
+    not available or no provider is configured.
+    """
+    try:
+        from attestdb.intelligence.llm_client import get_llm_client
+    except ImportError:
+        return None, ""
+    return get_llm_client()
 
 
 def _extract_subject(sentence: str, full_content: str = "") -> str:

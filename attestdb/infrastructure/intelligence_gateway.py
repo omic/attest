@@ -98,6 +98,7 @@ class IntelligenceGateway:
 
             # Use "auto" fallback chain unless a specific LLM provider was configured.
             extractor_model = self._curator_model if self._curator_model != "heuristic" else "auto"
+            pred_store = getattr(self._db, "_predicate_store", None)
             self._text_extractor = TextExtractor(
                 model=extractor_model,
                 api_key=self._curator_api_key,
@@ -107,6 +108,7 @@ class IntelligenceGateway:
                 predicate_constraints=predicate_constraints,
                 discovery_mode=True,
                 domain_context=self._domain_context,
+                predicate_store=pred_store,
             )
         return self._text_extractor
 
@@ -147,11 +149,14 @@ class IntelligenceGateway:
         """Triage and ingest claims through the curator."""
         return self._get_curator().process_agent_output(agent_id, claims)
 
-    def ingest_text(self, text: str, source_id: str = "", use_curator: bool = True):
+    def ingest_text(self, text: str, source_id: str = "", source_type: str = "", use_curator: bool = True):
         """Extract claims from text and ingest. Optional curator triage."""
         curator = self._get_curator() if use_curator else None
+        kwargs: dict = {"source_id": source_id, "curator": curator}
+        if source_type:
+            kwargs["source_type"] = source_type
         return self._get_text_extractor().extract_and_ingest(
-            text, self._db, source_id=source_id, curator=curator,
+            text, self._db, **kwargs,
         )
 
     def ingest_texts(
