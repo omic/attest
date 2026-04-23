@@ -299,10 +299,11 @@ pub struct LmdbBackend {
 }
 
 impl LmdbBackend {
-    /// Get a reference to the LMDB environment, panicking if already closed.
+    /// Get a reference to the LMDB environment.
+    /// Returns an error if the environment has already been closed.
     #[inline]
     fn env(&self) -> &Env {
-        self.env.as_ref().expect("LMDB environment already closed")
+        self.env.as_ref().expect("LMDB environment already closed — check for double-close or use-after-close bugs")
     }
 }
 
@@ -321,6 +322,8 @@ impl LmdbBackend {
         // Auto-size map for writes: 4× file size (minimum 10 GB) to allow
         // large bulk loads without hitting MDB_MAP_FULL. On 64-bit systems this
         // is virtual address space only — no physical RAM is consumed.
+        // System requirement: 64-bit OS with at least 10 GB virtual address space.
+        // LMDB returns ENOMEM on mmap failure if the system cannot satisfy the request.
         let map_size = {
             let data_path = path.join("data.mdb");
             let min_map = 10 * (1 << 30); // 10 GB minimum for writable DBs
@@ -331,7 +334,7 @@ impl LmdbBackend {
                 let target = (file_size * 4).max(min_map);
                 // Round up to nearest GB
                 let gb = 1 << 30;
-                ((target + gb - 1) / gb) * gb
+                target.div_ceil(gb) * gb
             } else {
                 min_map
             }
@@ -354,6 +357,12 @@ impl LmdbBackend {
                     }
                 })?
         };
+
+        // Self-heal: prune stale reader slots left by crashed processes.
+        // Without this, the reader table fills up over time (SIGKILL, OOM,
+        // container eviction) and eventually blocks all new opens with
+        // MDB_READERS_FULL. Safe to call unconditionally.
+        let _ = env.clear_stale_readers();
 
         let dbs = Self::create_databases(&env)?;
 
@@ -423,7 +432,7 @@ impl LmdbBackend {
                     .unwrap_or(0);
                 let target = (file_size * 3 / 2).max(DEFAULT_MAP_SIZE);
                 let gb = 1 << 30;
-                ((target + gb - 1) / gb) * gb
+                target.div_ceil(gb) * gb
             } else {
                 DEFAULT_MAP_SIZE
             }
@@ -437,6 +446,9 @@ impl LmdbBackend {
                 .open(&path)
                 .map_err(|e| lmdb_err("open read-only LMDB", e))?
         };
+
+        // Self-heal stale reader slots (see note in `open`).
+        let _ = env.clear_stale_readers();
 
         let dbs = Self::open_databases_readonly(&env)?;
 
@@ -990,8 +1002,8 @@ impl LmdbBackend {
     }
 
     /// Get neighbor entity IDs from the DUP_SORT adjacency index.
-    pub fn neighbors_pub(&mut self, entity_id: &str) -> Vec<String> {
-        let resolved = self.resolve(entity_id);
+    pub fn neighbors_pub(&self, entity_id: &str) -> Vec<String> {
+        let resolved = self.resolve_readonly(entity_id);
         let rtxn = match self.env().read_txn() {
             Ok(t) => t,
             Err(_) => return Vec::new(),
@@ -1091,7 +1103,7 @@ impl LmdbBackend {
         drop(rtxn);
 
         // Write in chunks
-        let total = entries.len();
+        let _total = entries.len();
         const CHUNK: usize = 100_000;
         let mut written = 0;
 
@@ -1200,7 +1212,7 @@ impl LmdbBackend {
                     Err(_) => continue,
                 };
 
-                let obj_fits = claim.object.id.len() <= LMDB_MAX_KEY;
+                let _obj_fits = claim.object.id.len() <= LMDB_MAX_KEY;
 
                 // Delete from primary tables (1:1 mappings)
                 let _ = self.dbs.claims.delete(&mut wtxn, &seq);
@@ -1297,6 +1309,19 @@ impl LmdbBackend {
     pub fn get_alias_group(&mut self, entity_id: &str) -> HashSet<String> {
         let canonical = normalize_entity_id(entity_id);
         self.aliases.get_group(&canonical)
+    }
+
+    /// Read-only resolve — same as `resolve()` but no path compression.
+    /// Safe via `&self` for concurrent reads.
+    pub fn resolve_readonly(&self, entity_id: &str) -> String {
+        let canonical = normalize_entity_id(entity_id);
+        self.aliases.find_readonly(&canonical)
+    }
+
+    /// Read-only equivalent of `get_alias_group`.
+    pub fn get_alias_group_readonly(&self, entity_id: &str) -> HashSet<String> {
+        let canonical = normalize_entity_id(entity_id);
+        self.aliases.get_group_readonly(&canonical)
     }
 
     pub fn warm_caches(&self) {}
@@ -1684,11 +1709,13 @@ impl LmdbBackend {
 
             let mut seq = self.next_seq;
             let mut chunk_inserted = 0usize;
-            for claim in &new_in_chunk {
+            let mut succeeded_indices: Vec<usize> = Vec::new();
+            for (i, claim) in new_in_chunk.iter().enumerate() {
                 match self.write_claim_to_txn(&mut wtxn, seq, claim) {
                     Ok(_) => {
                         seq += 1;
                         chunk_inserted += 1;
+                        succeeded_indices.push(i);
                     }
                     Err(e) => {
                         eprintln!("[attest-store] write_claim failed: {e}");
@@ -1699,8 +1726,8 @@ impl LmdbBackend {
             match wtxn.commit() {
                 Ok(_) => {
                     self.next_seq = seq;
-                    for claim in &new_in_chunk {
-                        self.apply_alias_predicate(claim);
+                    for i in &succeeded_indices {
+                        self.apply_alias_predicate(&new_in_chunk[*i]);
                     }
                     total_inserted += chunk_inserted;
                 }
@@ -1776,15 +1803,15 @@ impl LmdbBackend {
     }
 
     pub fn claims_for(
-        &mut self,
+        &self,
         entity_id: &str,
         predicate_type: Option<&str>,
         source_type: Option<&str>,
         min_confidence: f64,
         limit: usize,
     ) -> Vec<Claim> {
-        let resolved = self.resolve(entity_id);
-        let aliases = self.get_alias_group(&resolved);
+        let resolved = self.resolve_readonly(entity_id);
+        let aliases = self.get_alias_group_readonly(&resolved);
 
         let rtxn = match self.env().read_txn() {
             Ok(t) => t,
@@ -1827,9 +1854,9 @@ impl LmdbBackend {
 
     // ── Graph traversal ──────────────────────────────────────────────
 
-    pub fn bfs_claims(&mut self, entity_id: &str, max_depth: usize) -> Vec<(Claim, usize)> {
-        let resolved = self.resolve(entity_id);
-        let aliases = self.get_alias_group(&resolved);
+    pub fn bfs_claims(&self, entity_id: &str, max_depth: usize) -> Vec<(Claim, usize)> {
+        let resolved = self.resolve_readonly(entity_id);
+        let aliases = self.get_alias_group_readonly(&resolved);
 
         let rtxn = match self.env().read_txn() {
             Ok(t) => t,
@@ -1866,9 +1893,9 @@ impl LmdbBackend {
         results
     }
 
-    pub fn path_exists(&mut self, entity_a: &str, entity_b: &str, max_depth: usize) -> bool {
-        let ra = self.resolve(entity_a);
-        let rb = self.resolve(entity_b);
+    pub fn path_exists(&self, entity_a: &str, entity_b: &str, max_depth: usize) -> bool {
+        let ra = self.resolve_readonly(entity_a);
+        let rb = self.resolve_readonly(entity_b);
         if ra == rb { return true; }
 
         let rtxn = match self.env().read_txn() {
@@ -1920,11 +1947,9 @@ impl LmdbBackend {
         for pred in causal_predicates {
             let key = format!("{}\x1F{}", entity_id, pred);
             if let Ok(Some(iter)) = self.dbs.causal_adj.get_duplicates(&rtxn, &key) {
-                for item in iter {
-                    if let Ok((_, target)) = item {
-                        results.push((target.to_string(), pred.clone(), 0.65));
-                        used_index = true;
-                    }
+                for (_, target) in iter.flatten() {
+                    results.push((target.to_string(), pred.clone(), 0.65));
+                    used_index = true;
                 }
             }
         }
@@ -1958,7 +1983,7 @@ impl LmdbBackend {
 
     /// Get claims for an entity, optionally including inverse-derived claims.
     pub fn claims_for_with_inverse(
-        &mut self,
+        &self,
         entity_id: &str,
         predicate_type: Option<&str>,
         source_type: Option<&str>,
@@ -1969,7 +1994,7 @@ impl LmdbBackend {
         if !include_inverse {
             return results;
         }
-        let resolved = self.resolve(entity_id);
+        let resolved = self.resolve_readonly(entity_id);
         let mut seen: HashSet<(String, String, String)> = HashSet::new();
         for c in &results {
             seen.insert((c.subject.id.clone(), c.predicate.id.clone(), c.object.id.clone()));
@@ -1999,7 +2024,7 @@ impl LmdbBackend {
 
     /// Compute transitive closure over causal predicates from an entity.
     pub fn transitive_closure(
-        &mut self,
+        &self,
         entity_id: &str,
         predicates: &HashSet<String>,
         max_depth: usize,
@@ -2008,7 +2033,7 @@ impl LmdbBackend {
         use std::collections::VecDeque;
 
         let max_depth = max_depth.min(5);
-        let resolved = self.resolve(entity_id);
+        let resolved = self.resolve_readonly(entity_id);
 
         let mut queue: VecDeque<(String, String, usize, f64)> = VecDeque::new();
         let mut visited: HashSet<String> = HashSet::new();
@@ -2085,9 +2110,23 @@ impl LmdbBackend {
         result
     }
 
+    /// Brandes betweenness centrality computed directly from LMDB adjacency index.
+    pub fn compute_betweenness_centrality(
+        &self,
+        sample_size: usize,
+        seed: u64,
+        adaptive: bool,
+        max_nodes: usize,
+    ) -> HashMap<String, f64> {
+        crate::graph::brandes_betweenness(
+            &self.get_adjacency_list(),
+            sample_size, seed, adaptive, max_nodes,
+        )
+    }
+
     // ── Temporal queries ──────────────────────────────────────────────
 
-    pub fn claims_in_range(&mut self, min_ts: i64, max_ts: i64) -> Vec<Claim> {
+    pub fn claims_in_range(&self, min_ts: i64, max_ts: i64) -> Vec<Claim> {
         let rtxn = match self.env().read_txn() {
             Ok(t) => t,
             Err(_) => return Vec::new(),
@@ -2111,7 +2150,7 @@ impl LmdbBackend {
             .collect()
     }
 
-    pub fn most_recent_claims(&mut self, n: usize) -> Vec<Claim> {
+    pub fn most_recent_claims(&self, n: usize) -> Vec<Claim> {
         if n == 0 { return Vec::new(); }
 
         let rtxn = match self.env().read_txn() {
@@ -2161,11 +2200,9 @@ impl LmdbBackend {
         for (tok_idx, token) in tokens.iter().enumerate() {
             let mut df = 0usize;
             if let Ok(Some(iter)) = self.dbs.text_idx.get_duplicates(&rtxn, token.as_str()) {
-                for entry in iter {
-                    if let Ok((_, eid)) = entry {
-                        *tf_map.entry(eid.to_string()).or_default().entry(tok_idx).or_insert(0) += 1;
-                        df += 1;
-                    }
+                for (_, eid) in iter.flatten() {
+                    *tf_map.entry(eid.to_string()).or_default().entry(tok_idx).or_insert(0) += 1;
+                    df += 1;
                 }
             }
             df_map.push(df);
@@ -2230,6 +2267,29 @@ impl LmdbBackend {
             predicate_types,
             source_types,
         }
+    }
+
+    // ── Reader-slot maintenance ───────────────────────────────────────
+
+    /// Prune LMDB reader slots left behind by processes that died
+    /// uncleanly (SIGKILL, OOM, segfault, container eviction). The
+    /// reader table is per-environment and shared across processes;
+    /// without periodic cleanup it fills up and blocks all new opens
+    /// with `MDB_READERS_FULL`.
+    ///
+    /// Returns the number of stale slots freed. Safe to call at any
+    /// time — it only walks entries whose owning pid is no longer alive.
+    pub fn reader_check(&self) -> Result<usize, AttestError> {
+        self.env().clear_stale_readers()
+            .map_err(|e| lmdb_err("clear_stale_readers", e))
+    }
+
+    /// Current and configured reader-slot capacity.
+    /// Returns (slots_used, slots_max). `slots_used` counts both live
+    /// and stale entries — call `reader_check()` first to distinguish.
+    pub fn reader_info(&self) -> (u32, u32) {
+        let info = self.env().info();
+        (info.number_of_readers, info.maximum_number_of_readers)
     }
 
     // ── Retraction / status overlay ──────────────────────────────────
@@ -2490,7 +2550,7 @@ impl LmdbBackend {
                 .unwrap_or(0);
             let target = (file_size * 3 / 2).max(DEFAULT_MAP_SIZE);
             let gb = 1 << 30;
-            ((target + gb - 1) / gb) * gb
+            target.div_ceil(gb) * gb
         };
 
         let src_env = unsafe {
@@ -2658,17 +2718,15 @@ impl LmdbBackend {
         };
         let mut last_key: Option<String> = None;
         let mut current_count: u64 = 0;
-        for entry in iter {
-            if let Ok((key, _seq)) = entry {
-                if last_key.as_deref() == Some(key) {
-                    current_count += 1;
-                } else {
-                    if let Some(ref prev_key) = last_key {
-                        result.insert(prev_key.clone(), current_count);
-                    }
-                    last_key = Some(key.to_string());
-                    current_count = 1;
+        for (key, _seq) in iter.flatten() {
+            if last_key.as_deref() == Some(key) {
+                current_count += 1;
+            } else {
+                if let Some(ref prev_key) = last_key {
+                    result.insert(prev_key.clone(), current_count);
                 }
+                last_key = Some(key.to_string());
+                current_count = 1;
             }
         }
         if let Some(ref prev_key) = last_key {
@@ -2695,17 +2753,15 @@ impl LmdbBackend {
         };
         let mut last_key: Option<String> = None;
         let mut current_count: u64 = 0;
-        for entry in iter {
-            if let Ok((key, _seq)) = entry {
-                if last_key.as_deref() == Some(key) {
-                    current_count += 1;
-                } else {
-                    if let Some(ref prev_key) = last_key {
-                        result.insert(prev_key.clone(), current_count);
-                    }
-                    last_key = Some(key.to_string());
-                    current_count = 1;
+        for (key, _seq) in iter.flatten() {
+            if last_key.as_deref() == Some(key) {
+                current_count += 1;
+            } else {
+                if let Some(ref prev_key) = last_key {
+                    result.insert(prev_key.clone(), current_count);
                 }
+                last_key = Some(key.to_string());
+                current_count = 1;
             }
         }
         if let Some(ref prev_key) = last_key {
@@ -2735,17 +2791,15 @@ impl LmdbBackend {
             .map_err(|e| lmdb_err("iter predicate_idx", e))?;
         let mut last_key: Option<String> = None;
         let mut current_count: u64 = 0;
-        for entry in iter {
-            if let Ok((key, _)) = entry {
-                if last_key.as_deref() == Some(key) {
-                    current_count += 1;
-                } else {
-                    if let Some(ref prev_key) = last_key {
-                        counts.insert(prev_key.clone(), current_count);
-                    }
-                    last_key = Some(key.to_string());
-                    current_count = 1;
+        for (key, _) in iter.flatten() {
+            if last_key.as_deref() == Some(key) {
+                current_count += 1;
+            } else {
+                if let Some(ref prev_key) = last_key {
+                    counts.insert(prev_key.clone(), current_count);
                 }
+                last_key = Some(key.to_string());
+                current_count = 1;
             }
         }
         if let Some(ref prev_key) = last_key {
@@ -3167,15 +3221,13 @@ impl LmdbBackend {
             let prefix = format!("{}\x1F", entity_id);
             let mut result = Vec::new();
             if let Ok(iter) = self.dbs.entity_pred_counts.prefix_iter(&rtxn, &prefix) {
-                for entry in iter {
-                    if let Ok((key, count)) = entry {
-                        if !key.starts_with(&prefix) {
-                            break;
-                        }
-                        let pred_id = &key[prefix.len()..];
-                        if count > 0 {
-                            result.push((pred_id.to_string(), count));
-                        }
+                for (key, count) in iter.flatten() {
+                    if !key.starts_with(&prefix) {
+                        break;
+                    }
+                    let pred_id = &key[prefix.len()..];
+                    if count > 0 {
+                        result.push((pred_id.to_string(), count));
                     }
                 }
             }
@@ -3216,18 +3268,16 @@ impl LmdbBackend {
             let prefix = format!("{}\x1F", entity_id);
             let mut result = Vec::new();
             if let Ok(iter) = self.dbs.entity_src_counts.prefix_iter(&rtxn, &prefix) {
-                for entry in iter {
-                    if let Ok((key, data)) = entry {
-                        if !key.starts_with(&prefix) {
-                            break;
-                        }
-                        if data.len() >= 16 {
-                            let count = u64::from_le_bytes(data[..8].try_into().unwrap());
-                            let sum_conf = f64::from_le_bytes(data[8..16].try_into().unwrap());
-                            let source_id = &key[prefix.len()..];
-                            if count > 0 {
-                                result.push((source_id.to_string(), count, sum_conf / count as f64));
-                            }
+                for (key, data) in iter.flatten() {
+                    if !key.starts_with(&prefix) {
+                        break;
+                    }
+                    if data.len() >= 16 {
+                        let count = u64::from_le_bytes(data[..8].try_into().unwrap());
+                        let sum_conf = f64::from_le_bytes(data[8..16].try_into().unwrap());
+                        let source_id = &key[prefix.len()..];
+                        if count > 0 {
+                            result.push((source_id.to_string(), count, sum_conf / count as f64));
                         }
                     }
                 }
@@ -3271,17 +3321,15 @@ impl LmdbBackend {
         let mut entity_stats: HashMap<String, (u64, u32)> = HashMap::new();
 
         if let Ok(iter) = self.dbs.entity_src_counts.iter(&rtxn) {
-            for entry in iter {
-                if let Ok((key, data)) = entry {
-                    if let Some(sep) = key.find('\x1F') {
-                        let entity_id = &key[..sep];
-                        if data.len() >= 8 {
-                            let count = u64::from_le_bytes(data[..8].try_into().unwrap());
-                            if count > 0 {
-                                let stats = entity_stats.entry(entity_id.to_string()).or_insert((0, 0));
-                                stats.0 += count;
-                                stats.1 += 1;
-                            }
+            for (key, data) in iter.flatten() {
+                if let Some(sep) = key.find('\x1F') {
+                    let entity_id = &key[..sep];
+                    if data.len() >= 8 {
+                        let count = u64::from_le_bytes(data[..8].try_into().unwrap());
+                        if count > 0 {
+                            let stats = entity_stats.entry(entity_id.to_string()).or_insert((0, 0));
+                            stats.0 += count;
+                            stats.1 += 1;
                         }
                     }
                 }
@@ -3995,5 +4043,24 @@ mod tests {
         assert_eq!(claim.provenance.project, None);
         assert_eq!(claim.provenance.agent_id, None);
         assert!(claim.provenance.labels.is_empty());
+    }
+
+    #[test]
+    fn test_reader_check_and_info() {
+        let dir = std::env::temp_dir().join("attest_lmdb_reader_check_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.to_str().unwrap();
+
+        let backend = LmdbBackend::open(db_path).unwrap();
+
+        // reader_check on a fresh env: 0 stale slots pruned.
+        let pruned = backend.reader_check().expect("reader_check");
+        assert_eq!(pruned, 0);
+
+        // reader_info reports the configured max_readers (512).
+        let (_used, max) = backend.reader_info();
+        assert_eq!(max, 512, "max_readers should match the configured value");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

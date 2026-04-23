@@ -197,7 +197,23 @@ fn extract_string_dict(obj: &Bound<'_, PyAny>) -> PyResult<HashMap<String, Strin
     if obj.is_none() {
         return Ok(HashMap::new());
     }
-    obj.extract::<HashMap<String, String>>().or_else(|_| Ok(HashMap::new()))
+    match obj.extract::<HashMap<String, String>>() {
+        Ok(map) => Ok(map),
+        Err(_) => {
+            // Try JSON roundtrip for dicts with non-string values
+            if let Ok(dict) = obj.downcast::<PyDict>() {
+                let mut map = HashMap::new();
+                for (k, v) in dict.iter() {
+                    if let (Ok(key), Ok(val)) = (k.extract::<String>(), v.str()) {
+                        map.insert(key, val.to_string());
+                    }
+                }
+                Ok(map)
+            } else {
+                Ok(HashMap::new())
+            }
+        }
+    }
 }
 
 // ── Python vocab dict → Rust Vocabulary ────────────────────────────────
@@ -384,6 +400,18 @@ impl PyRustStore {
         Ok(set.into())
     }
 
+    /// Read-only resolve — no path compression, safe for concurrent reads.
+    fn resolve_readonly(&self, entity_id: &str) -> String {
+        self.inner.resolve_readonly(entity_id)
+    }
+
+    /// Read-only equivalent of `get_alias_group`.
+    fn get_alias_group_readonly<'py>(&self, entity_id: &str, py: Python<'py>) -> PyResult<PyObject> {
+        let group = self.inner.get_alias_group_readonly(entity_id);
+        let set = PySet::new(py, group.into_iter().collect::<Vec<_>>())?;
+        Ok(set.into())
+    }
+
     // ── Cache management ───────────────────────────────────────────
 
     fn warm_caches(&self) {
@@ -462,7 +490,7 @@ impl PyRustStore {
         for item in claims.iter() {
             rust_claims.push(claim_from_py(py, &item)?);
         }
-        let count = self.inner.insert_claims_batch(rust_claims);
+        let count = py.allow_threads(|| self.inner.insert_claims_batch(rust_claims));
         Ok(count)
     }
 
@@ -493,7 +521,7 @@ impl PyRustStore {
 
     #[pyo3(signature = (entity_id, predicate_type=None, source_type=None, min_confidence=0.0, limit=0))]
     fn claims_for<'py>(
-        &mut self,
+        &self,
         entity_id: &str,
         predicate_type: Option<&str>,
         source_type: Option<&str>,
@@ -501,9 +529,10 @@ impl PyRustStore {
         limit: usize,
         py: Python<'py>,
     ) -> PyResult<PyObject> {
-        let claims =
+        let claims = py.allow_threads(|| {
             self.inner
-                .claims_for(entity_id, predicate_type, source_type, min_confidence, limit);
+                .claims_for(entity_id, predicate_type, source_type, min_confidence, limit)
+        });
         let list = PyList::empty(py);
         for c in &claims {
             list.append(claim_to_dict(py, c)?)?;
@@ -513,7 +542,7 @@ impl PyRustStore {
 
     /// Get claims for an entity, optionally including inverse-derived claims.
     fn claims_for_with_inverse<'py>(
-        &mut self,
+        &self,
         entity_id: &str,
         predicate_type: Option<&str>,
         source_type: Option<&str>,
@@ -521,9 +550,11 @@ impl PyRustStore {
         include_inverse: bool,
         py: Python<'py>,
     ) -> PyResult<PyObject> {
-        let claims = self.inner.claims_for_with_inverse(
-            entity_id, predicate_type, source_type, min_confidence, include_inverse,
-        );
+        let claims = py.allow_threads(|| {
+            self.inner.claims_for_with_inverse(
+                entity_id, predicate_type, source_type, min_confidence, include_inverse,
+            )
+        });
         let list = PyList::empty(py);
         for c in &claims {
             list.append(claim_to_dict(py, c)?)?;
@@ -533,9 +564,9 @@ impl PyRustStore {
 
     /// Compute transitive closure over causal predicates.
     /// Returns list of (target_entity_id, composed_predicate, depth, confidence).
-    fn transitive_closure(&mut self, entity_id: &str, causal_predicates: Vec<String>, max_depth: usize) -> Vec<(String, String, usize, f64)> {
+    fn transitive_closure(&self, entity_id: &str, causal_predicates: Vec<String>, max_depth: usize, py: Python<'_>) -> Vec<(String, String, usize, f64)> {
         let predset: std::collections::HashSet<String> = causal_predicates.into_iter().collect();
-        self.inner.transitive_closure(entity_id, &predset, max_depth)
+        py.allow_threads(|| self.inner.transitive_closure(entity_id, &predset, max_depth))
     }
 
     /// Get corroboration count for a content_id.
@@ -590,7 +621,7 @@ impl PyRustStore {
     // ── Graph traversal ────────────────────────────────────────────
 
     /// Get neighbor entity IDs from adjacency index — no claim materialization.
-    fn neighbors<'py>(&mut self, entity_id: &str, py: Python<'py>) -> PyResult<PyObject> {
+    fn neighbors<'py>(&self, entity_id: &str, py: Python<'py>) -> PyResult<PyObject> {
         let nbrs = self.inner.neighbors(entity_id);
         let list = PyList::empty(py);
         for n in &nbrs {
@@ -601,12 +632,12 @@ impl PyRustStore {
 
     #[pyo3(signature = (entity_id, max_depth=2))]
     fn bfs_claims<'py>(
-        &mut self,
+        &self,
         entity_id: &str,
         max_depth: usize,
         py: Python<'py>,
     ) -> PyResult<PyObject> {
-        let results = self.inner.bfs_claims(entity_id, max_depth);
+        let results = py.allow_threads(|| self.inner.bfs_claims(entity_id, max_depth));
         let list = PyList::empty(py);
         for (claim, depth) in &results {
             let tuple = (claim_to_dict(py, claim)?, *depth);
@@ -616,8 +647,8 @@ impl PyRustStore {
     }
 
     #[pyo3(signature = (entity_a, entity_b, max_depth=3))]
-    fn path_exists(&mut self, entity_a: &str, entity_b: &str, max_depth: usize) -> bool {
-        self.inner.path_exists(entity_a, entity_b, max_depth)
+    fn path_exists(&self, entity_a: &str, entity_b: &str, max_depth: usize, py: Python<'_>) -> bool {
+        py.allow_threads(|| self.inner.path_exists(entity_a, entity_b, max_depth))
     }
 
     fn get_adjacency_list<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
@@ -630,15 +661,37 @@ impl PyRustStore {
         Ok(dict.into())
     }
 
+    /// Brandes betweenness centrality computed entirely in Rust.
+    #[pyo3(signature = (sample_size=200, seed=42, adaptive=true, max_nodes=10000))]
+    fn compute_betweenness_centrality<'py>(
+        &self,
+        sample_size: usize,
+        seed: u64,
+        adaptive: bool,
+        max_nodes: usize,
+        py: Python<'py>,
+    ) -> PyResult<PyObject> {
+        let scores = py.allow_threads(|| {
+            self.inner.compute_betweenness_centrality(
+                sample_size, seed, adaptive, max_nodes,
+            )
+        });
+        let dict = PyDict::new(py);
+        for (k, v) in &scores {
+            dict.set_item(k, v)?;
+        }
+        Ok(dict.into())
+    }
+
     // ── Temporal queries ────────────────────────────────────────────
 
     fn claims_in_range<'py>(
-        &mut self,
+        &self,
         min_ts: i64,
         max_ts: i64,
         py: Python<'py>,
     ) -> PyResult<PyObject> {
-        let claims = self.inner.claims_in_range(min_ts, max_ts);
+        let claims = py.allow_threads(|| self.inner.claims_in_range(min_ts, max_ts));
         let list = PyList::empty(py);
         for c in &claims {
             list.append(claim_to_dict(py, c)?)?;
@@ -646,7 +699,7 @@ impl PyRustStore {
         Ok(list.into())
     }
 
-    fn most_recent_claims<'py>(&mut self, n: usize, py: Python<'py>) -> PyResult<PyObject> {
+    fn most_recent_claims<'py>(&self, n: usize, py: Python<'py>) -> PyResult<PyObject> {
         let claims = self.inner.most_recent_claims(n);
         let list = PyList::empty(py);
         for c in &claims {
@@ -676,13 +729,36 @@ impl PyRustStore {
 
     fn stats<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
         let s = self.inner.stats();
+        let (reader_slots_used, reader_slots_max) = self.inner.reader_info();
         let dict = PyDict::new(py);
         dict.set_item("total_claims", s.total_claims)?;
         dict.set_item("entity_count", s.entity_count)?;
         dict.set_item("entity_types", s.entity_types.clone().into_py_any(py)?)?;
         dict.set_item("predicate_types", s.predicate_types.clone().into_py_any(py)?)?;
         dict.set_item("source_types", s.source_types.clone().into_py_any(py)?)?;
+        dict.set_item("reader_slots_used", reader_slots_used)?;
+        dict.set_item("reader_slots_max", reader_slots_max)?;
         Ok(dict.into())
+    }
+
+    /// Prune LMDB reader slots left behind by dead processes
+    /// (SIGKILL, OOM, container eviction). Without periodic cleanup
+    /// the shared reader table eventually fills up and blocks all new
+    /// opens with MDB_READERS_FULL. Called automatically on every
+    /// `RustStore` open; exposed here for operators who want to run
+    /// it on a background timer in long-lived services.
+    ///
+    /// Returns the number of stale slots freed. No-op for in-memory stores.
+    fn reader_check(&self) -> PyResult<usize> {
+        self.inner.reader_check()
+            .map_err(|e| PyValueError::new_err(format!("reader_check failed: {e}")))
+    }
+
+    /// Current reader-slot occupancy as (used, max). `used` includes
+    /// live *and* stale slots — call `reader_check()` first to prune
+    /// stale entries if you want a live-only count.
+    fn reader_info(&self) -> (u32, u32) {
+        self.inner.reader_info()
     }
 
     // ── Batch insert (bulk loader fast path) ─────────────────────

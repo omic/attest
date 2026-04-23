@@ -190,7 +190,7 @@ impl RustStore {
         for (mid, (pred, conf)) in &outgoing {
             let preds = neighbor_preds.get(mid).cloned().unwrap_or_default();
             let has_contradiction = preds.iter().any(|p| {
-                opposites.get(p).map_or(false, |opp| preds.contains(opp))
+                opposites.get(p).is_some_and(|opp| preds.contains(opp))
             });
             if !has_contradiction {
                 clean.push((mid.clone(), pred.clone(), *conf));
@@ -354,6 +354,16 @@ impl RustStore {
         self.backend.get_alias_group(entity_id)
     }
 
+    /// Read-only resolve — concurrent-safe via `&self`.
+    pub fn resolve_readonly(&self, entity_id: &str) -> String {
+        self.backend.resolve_readonly(entity_id)
+    }
+
+    /// Read-only equivalent of `get_alias_group`.
+    pub fn get_alias_group_readonly(&self, entity_id: &str) -> HashSet<String> {
+        self.backend.get_alias_group_readonly(entity_id)
+    }
+
     // ── Cache management ───────────────────────────────────────────────
 
     /// No-op in Rust — everything is already in memory.
@@ -478,7 +488,7 @@ impl RustStore {
     }
 
     pub fn claims_for(
-        &mut self,
+        &self,
         entity_id: &str,
         predicate_type: Option<&str>,
         source_type: Option<&str>,
@@ -490,7 +500,7 @@ impl RustStore {
 
     /// Get claims for an entity, optionally including inverse-derived claims.
     pub fn claims_for_with_inverse(
-        &mut self,
+        &self,
         entity_id: &str,
         predicate_type: Option<&str>,
         source_type: Option<&str>,
@@ -502,7 +512,7 @@ impl RustStore {
 
     /// Compute transitive closure over causal predicates.
     pub fn transitive_closure(
-        &mut self,
+        &self,
         entity_id: &str,
         predicates: &std::collections::HashSet<String>,
         max_depth: usize,
@@ -523,17 +533,17 @@ impl RustStore {
     // ── Graph traversal ────────────────────────────────────────────────
 
     /// Get neighbor entity IDs from adjacency index — no claim materialization.
-    pub fn neighbors(&mut self, entity_id: &str) -> Vec<String> {
+    pub fn neighbors(&self, entity_id: &str) -> Vec<String> {
         self.backend.neighbors(entity_id)
     }
 
     /// BFS traversal collecting claims at each hop depth.
-    pub fn bfs_claims(&mut self, entity_id: &str, max_depth: usize) -> Vec<(Claim, usize)> {
+    pub fn bfs_claims(&self, entity_id: &str, max_depth: usize) -> Vec<(Claim, usize)> {
         self.backend.bfs_claims(entity_id, max_depth)
     }
 
     /// Check if a path exists between two entities within max_depth hops.
-    pub fn path_exists(&mut self, entity_a: &str, entity_b: &str, max_depth: usize) -> bool {
+    pub fn path_exists(&self, entity_a: &str, entity_b: &str, max_depth: usize) -> bool {
         self.backend.path_exists(entity_a, entity_b, max_depth)
     }
 
@@ -542,13 +552,24 @@ impl RustStore {
         self.backend.get_adjacency_list()
     }
 
+    /// Brandes betweenness centrality computed directly from LMDB adjacency index.
+    pub fn compute_betweenness_centrality(
+        &self,
+        sample_size: usize,
+        seed: u64,
+        adaptive: bool,
+        max_nodes: usize,
+    ) -> HashMap<String, f64> {
+        self.backend.compute_betweenness_centrality(sample_size, seed, adaptive, max_nodes)
+    }
+
     /// Get claims within a timestamp range [min_ts, max_ts] (inclusive).
-    pub fn claims_in_range(&mut self, min_ts: i64, max_ts: i64) -> Vec<Claim> {
+    pub fn claims_in_range(&self, min_ts: i64, max_ts: i64) -> Vec<Claim> {
         self.backend.claims_in_range(min_ts, max_ts)
     }
 
     /// Get the most recent N claims by timestamp.
-    pub fn most_recent_claims(&mut self, n: usize) -> Vec<Claim> {
+    pub fn most_recent_claims(&self, n: usize) -> Vec<Claim> {
         self.backend.most_recent_claims(n)
     }
 
@@ -561,6 +582,26 @@ impl RustStore {
 
     pub fn stats(&self) -> StoreStats {
         self.backend.stats()
+    }
+
+    // ── Reader-slot maintenance (LMDB only) ────────────────────────────
+
+    /// Prune LMDB reader slots left behind by dead processes.
+    /// Returns the number of stale slots freed. No-op for in-memory stores.
+    pub fn reader_check(&self) -> Result<usize, AttestError> {
+        match &self.backend {
+            Backend::InMemory(_) => Ok(0),
+            Backend::Lmdb(l) => l.reader_check(),
+        }
+    }
+
+    /// Current and configured reader-slot capacity: (used, max).
+    /// Returns (0, 0) for in-memory stores.
+    pub fn reader_info(&self) -> (u32, u32) {
+        match &self.backend {
+            Backend::InMemory(_) => (0, 0),
+            Backend::Lmdb(l) => l.reader_info(),
+        }
     }
 
     // ── Retraction / status overlay ─────────────────────────────────────
