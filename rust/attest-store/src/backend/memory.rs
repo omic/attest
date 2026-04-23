@@ -316,6 +316,19 @@ impl MemoryBackend {
         self.aliases.get_group(&canonical)
     }
 
+    /// Read-only resolve — same answer as `resolve()` but does not perform
+    /// path compression, so it can be called via `&self` for concurrent reads.
+    pub fn resolve_readonly(&self, entity_id: &str) -> String {
+        let canonical = normalize_entity_id(entity_id);
+        self.aliases.find_readonly(&canonical)
+    }
+
+    /// Read-only equivalent of `get_alias_group()`.
+    pub fn get_alias_group_readonly(&self, entity_id: &str) -> HashSet<String> {
+        let canonical = normalize_entity_id(entity_id);
+        self.aliases.get_group_readonly(&canonical)
+    }
+
     // ── Cache management ───────────────────────────────────────────────
 
     /// No-op in memory backend — everything is already in memory.
@@ -705,15 +718,15 @@ impl MemoryBackend {
     }
 
     pub fn claims_for(
-        &mut self,
+        &self,
         entity_id: &str,
         predicate_type: Option<&str>,
         source_type: Option<&str>,
         min_confidence: f64,
         limit: usize,
     ) -> Vec<Claim> {
-        let resolved = self.resolve(entity_id);
-        let aliases = self.get_alias_group(&resolved);
+        let resolved = self.resolve_readonly(entity_id);
+        let aliases = self.get_alias_group_readonly(&resolved);
         let iter = self.claims
             .for_entity_filtered(&aliases, predicate_type, source_type, min_confidence)
             .into_iter()
@@ -757,7 +770,7 @@ impl MemoryBackend {
 
     /// Get claims for an entity, optionally including inverse-derived claims.
     pub fn claims_for_with_inverse(
-        &mut self,
+        &self,
         entity_id: &str,
         predicate_type: Option<&str>,
         source_type: Option<&str>,
@@ -768,7 +781,7 @@ impl MemoryBackend {
         if !include_inverse {
             return results;
         }
-        let resolved = self.resolve(entity_id);
+        let resolved = self.resolve_readonly(entity_id);
         // Track existing (subject, predicate, object) triples to avoid duplicates
         let mut seen: HashSet<(String, String, String)> = HashSet::new();
         for c in &results {
@@ -801,7 +814,7 @@ impl MemoryBackend {
 
     /// Compute transitive closure over causal predicates from an entity.
     pub fn transitive_closure(
-        &mut self,
+        &self,
         entity_id: &str,
         predicates: &HashSet<String>,
         max_depth: usize,
@@ -810,7 +823,7 @@ impl MemoryBackend {
         use std::collections::VecDeque;
 
         let max_depth = max_depth.min(5); // hard cap
-        let resolved = self.resolve(entity_id);
+        let resolved = self.resolve_readonly(entity_id);
 
         // BFS: (current_entity, accumulated_predicate, depth, accumulated_confidence)
         let mut queue: VecDeque<(String, String, usize, f64)> = VecDeque::new();
@@ -874,9 +887,9 @@ impl MemoryBackend {
     // ── Graph traversal ────────────────────────────────────────────────
 
     /// BFS traversal collecting claims at each hop depth.
-    pub fn neighbors(&mut self, entity_id: &str) -> Vec<String> {
-        let resolved = self.resolve(entity_id);
-        let aliases = self.get_alias_group(&resolved);
+    pub fn neighbors(&self, entity_id: &str) -> Vec<String> {
+        let resolved = self.resolve_readonly(entity_id);
+        let aliases = self.get_alias_group_readonly(&resolved);
         let mut nbrs: HashSet<String> = HashSet::new();
         for claim in self.claims.for_entity(&resolved) {
             if !self.should_include_claim(&claim.claim_id) || !self.should_include_namespace(&claim.namespace) {
@@ -892,9 +905,9 @@ impl MemoryBackend {
         nbrs.into_iter().collect()
     }
 
-    pub fn bfs_claims(&mut self, entity_id: &str, max_depth: usize) -> Vec<(Claim, usize)> {
-        let resolved = self.resolve(entity_id);
-        let aliases = self.get_alias_group(&resolved);
+    pub fn bfs_claims(&self, entity_id: &str, max_depth: usize) -> Vec<(Claim, usize)> {
+        let resolved = self.resolve_readonly(entity_id);
+        let aliases = self.get_alias_group_readonly(&resolved);
         let mut visited: HashSet<String> = aliases.clone();
         let mut frontier: HashSet<String> = aliases;
         let mut results: Vec<(Claim, usize)> = Vec::new();
@@ -929,9 +942,9 @@ impl MemoryBackend {
     }
 
     /// Check if a path exists between two entities within max_depth hops.
-    pub fn path_exists(&mut self, entity_a: &str, entity_b: &str, max_depth: usize) -> bool {
-        let ra = self.resolve(entity_a);
-        let rb = self.resolve(entity_b);
+    pub fn path_exists(&self, entity_a: &str, entity_b: &str, max_depth: usize) -> bool {
+        let ra = self.resolve_readonly(entity_a);
+        let rb = self.resolve_readonly(entity_b);
 
         if ra == rb {
             return true;
@@ -974,8 +987,22 @@ impl MemoryBackend {
         self.claims.adjacency_list().clone()
     }
 
+    pub fn compute_betweenness_centrality(
+        &self,
+        sample_size: usize,
+        seed: u64,
+        adaptive: bool,
+        max_nodes: usize,
+    ) -> HashMap<String, f64> {
+        // Delegate to the shared algorithm via adjacency list
+        crate::graph::brandes_betweenness(
+            &self.get_adjacency_list(),
+            sample_size, seed, adaptive, max_nodes,
+        )
+    }
+
     /// Get claims within a timestamp range [min_ts, max_ts] (inclusive).
-    pub fn claims_in_range(&mut self, min_ts: i64, max_ts: i64) -> Vec<Claim> {
+    pub fn claims_in_range(&self, min_ts: i64, max_ts: i64) -> Vec<Claim> {
         let include_retracted = self.include_retracted;
         let retracted_ids = &self.retracted_ids;
         let ns_filter = &self.namespace_filter;
@@ -990,7 +1017,7 @@ impl MemoryBackend {
     }
 
     /// Get the most recent N claims by timestamp.
-    pub fn most_recent_claims(&mut self, n: usize) -> Vec<Claim> {
+    pub fn most_recent_claims(&self, n: usize) -> Vec<Claim> {
         let extra = self.retracted_ids.len();
         let include_retracted = self.include_retracted;
         let retracted_ids = &self.retracted_ids;

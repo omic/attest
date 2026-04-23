@@ -106,7 +106,7 @@ impl JournalFile {
     /// Append an entry and fsync.
     fn append(&mut self, entry: &JournalEntry) -> Result<(), io::Error> {
         let data = bincode::serialize(entry)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(|e| io::Error::other(e))?;
         let len = data.len() as u32;
         let crc = crc32fast::hash(&data);
 
@@ -257,7 +257,7 @@ impl WriterQueue {
                     apply_fn,
                 );
             })
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(|e| io::Error::other(e))?;
 
         Ok(Self {
             next_ticket: AtomicU64::new(1),

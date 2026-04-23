@@ -79,6 +79,24 @@ impl UnionFind {
         root
     }
 
+    /// Find the root representative for `x` WITHOUT path compression.
+    /// For use on the read path — does not mutate, enabling concurrent
+    /// read access via `&self`. Same answer as `find()`, slightly slower
+    /// on deep alias chains (O(chain_len) instead of amortized O(α(n))).
+    pub fn find_readonly(&self, x: &str) -> String {
+        if !self.parent.contains_key(x) {
+            return x.to_string();
+        }
+        let mut root = x.to_string();
+        while let Some(p) = self.parent.get(&root) {
+            if p == &root {
+                break;
+            }
+            root = p.clone();
+        }
+        root
+    }
+
     /// Merge the sets containing `a` and `b` (same_as).
     pub fn union(&mut self, a: &str, b: &str) {
         let ra = self.find(a);
@@ -182,6 +200,19 @@ impl UnionFind {
             group.clone()
         } else {
             // Singleton — not part of any union
+            let mut group = HashSet::new();
+            group.insert(entity_id.to_string());
+            group
+        }
+    }
+
+    /// Get all entity IDs in `entity_id`'s group WITHOUT path compression.
+    /// Read-only equivalent of `get_group()`, safe to call via `&self`.
+    pub fn get_group_readonly(&self, entity_id: &str) -> HashSet<String> {
+        let root = self.find_readonly(entity_id);
+        if let Some(group) = self.groups.get(&root) {
+            group.clone()
+        } else {
             let mut group = HashSet::new();
             group.insert(entity_id.to_string());
             group
@@ -292,6 +323,35 @@ mod tests {
         uf.union("a", "b");
         uf.union("c", "d");
         assert_ne!(uf.find("a"), uf.find("c"));
+    }
+
+    #[test]
+    fn test_find_readonly_matches_find() {
+        let mut uf = UnionFind::new();
+        uf.union("a", "b");
+        uf.union("b", "c");
+        uf.union("d", "e");
+        // Snapshot find's answer for each, then verify find_readonly agrees.
+        let expected: Vec<(String, String)> = ["a", "b", "c", "d", "e", "z"]
+            .iter()
+            .map(|k| (k.to_string(), uf.find(k)))
+            .collect();
+        for (k, want) in expected {
+            assert_eq!(uf.find_readonly(&k), want, "mismatch for {k}");
+        }
+    }
+
+    #[test]
+    fn test_get_group_readonly_matches_get_group() {
+        let mut uf = UnionFind::new();
+        uf.union("a", "b");
+        uf.union("b", "c");
+        uf.union("d", "e");
+        for k in ["a", "b", "c", "d", "e", "z"] {
+            let want = uf.get_group(k);
+            let got = uf.get_group_readonly(k);
+            assert_eq!(got, want, "mismatch for {k}");
+        }
     }
 
     #[test]

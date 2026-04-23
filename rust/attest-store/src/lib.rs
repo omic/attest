@@ -15,6 +15,7 @@
 pub mod backend;
 pub mod claim_log;
 pub mod entity_store;
+pub mod graph;
 pub mod file_format;
 pub mod journal;
 pub mod metadata;

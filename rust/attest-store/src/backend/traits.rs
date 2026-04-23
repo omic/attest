@@ -26,6 +26,8 @@ pub trait StorageBackend {
     fn checkpoint(&mut self) -> Result<(), AttestError>;
 
     /// Rebuild the causal_adj index from existing claims.
+    /// Default: no-op returning 0. Backend implementations must override
+    /// all trait methods — defaults exist only as compile-time placeholders.
     fn rebuild_causal_adj(&mut self) -> Result<usize, AttestError> {
         Ok(0)
     }
@@ -55,7 +57,7 @@ pub trait StorageBackend {
     /// derive a synthetic claim with subject/object swapped and predicate replaced
     /// by its inverse (e.g., A→causes→B becomes B→caused_by→A when querying B).
     fn claims_for_with_inverse(
-        &mut self,
+        &self,
         _entity_id: &str,
         _predicate_type: Option<&str>,
         _source_type: Option<&str>,
@@ -70,7 +72,7 @@ pub trait StorageBackend {
     /// Follows outgoing causal edges up to max_depth hops, composing predicates via
     /// the PREDICATE_COMPOSITION table.
     fn transitive_closure(
-        &mut self,
+        &self,
         _entity_id: &str,
         _predicates: &std::collections::HashSet<String>,
         _max_depth: usize,
@@ -124,6 +126,12 @@ pub trait StorageBackend {
 
     /// Get all entity IDs that resolve to the same canonical.
     fn get_alias_group(&mut self, entity_id: &str) -> HashSet<String>;
+
+    /// Read-only resolve (no path compression). Safe for concurrent reads.
+    fn resolve_readonly(&self, entity_id: &str) -> String;
+
+    /// Read-only equivalent of `get_alias_group`.
+    fn get_alias_group_readonly(&self, entity_id: &str) -> HashSet<String>;
 
     // ── Cache management ───────────────────────────────────────────────
 
@@ -214,7 +222,7 @@ pub trait StorageBackend {
     fn claims_by_project(&self, project: &str) -> Vec<Claim>;
 
     fn claims_for(
-        &mut self,
+        &self,
         entity_id: &str,
         predicate_type: Option<&str>,
         source_type: Option<&str>,
@@ -228,24 +236,33 @@ pub trait StorageBackend {
     // ── Graph traversal ────────────────────────────────────────────────
 
     /// Get neighbor entity IDs from adjacency index — no claim materialization.
-    fn neighbors(&mut self, entity_id: &str) -> Vec<String>;
+    fn neighbors(&self, entity_id: &str) -> Vec<String>;
 
     /// BFS traversal collecting claims at each hop depth.
-    fn bfs_claims(&mut self, entity_id: &str, max_depth: usize) -> Vec<(Claim, usize)>;
+    fn bfs_claims(&self, entity_id: &str, max_depth: usize) -> Vec<(Claim, usize)>;
 
     /// Check if a path exists between two entities within max_depth hops.
-    fn path_exists(&mut self, entity_a: &str, entity_b: &str, max_depth: usize) -> bool;
+    fn path_exists(&self, entity_a: &str, entity_b: &str, max_depth: usize) -> bool;
 
     /// Get the bidirectional adjacency list.
     fn get_adjacency_list(&self) -> HashMap<String, HashSet<String>>;
 
+    /// Brandes betweenness centrality computed directly from the adjacency index.
+    fn compute_betweenness_centrality(
+        &self,
+        sample_size: usize,
+        seed: u64,
+        adaptive: bool,
+        max_nodes: usize,
+    ) -> HashMap<String, f64>;
+
     // ── Temporal queries ───────────────────────────────────────────────
 
     /// Get claims within a timestamp range [min_ts, max_ts] (inclusive).
-    fn claims_in_range(&mut self, min_ts: i64, max_ts: i64) -> Vec<Claim>;
+    fn claims_in_range(&self, min_ts: i64, max_ts: i64) -> Vec<Claim>;
 
     /// Get the most recent N claims by timestamp.
-    fn most_recent_claims(&mut self, n: usize) -> Vec<Claim>;
+    fn most_recent_claims(&self, n: usize) -> Vec<Claim>;
 
     // ── Text search ────────────────────────────────────────────────────
 

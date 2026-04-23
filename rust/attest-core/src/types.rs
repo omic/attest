@@ -6,7 +6,9 @@ use std::collections::HashMap;
 /// Claim lifecycle status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ClaimStatus {
+    #[default]
     Active,
     Archived,
     Tombstoned,
@@ -16,11 +18,6 @@ pub enum ClaimStatus {
     Disputed,
 }
 
-impl Default for ClaimStatus {
-    fn default() -> Self {
-        Self::Active
-    }
-}
 
 impl ClaimStatus {
     /// String value matching the Python enum.

@@ -80,7 +80,7 @@ impl StorageBackend for Backend {
     }
 
     fn claims_for_with_inverse(
-        &mut self,
+        &self,
         entity_id: &str,
         predicate_type: Option<&str>,
         source_type: Option<&str>,
@@ -94,7 +94,7 @@ impl StorageBackend for Backend {
     }
 
     fn transitive_closure(
-        &mut self,
+        &self,
         entity_id: &str,
         predicates: &std::collections::HashSet<String>,
         max_depth: usize,
@@ -179,6 +179,20 @@ impl StorageBackend for Backend {
         match self {
             Backend::InMemory(m) => m.get_alias_group(entity_id),
             Backend::Lmdb(l) => l.get_alias_group(entity_id),
+        }
+    }
+
+    fn resolve_readonly(&self, entity_id: &str) -> String {
+        match self {
+            Backend::InMemory(m) => m.resolve_readonly(entity_id),
+            Backend::Lmdb(l) => l.resolve_readonly(entity_id),
+        }
+    }
+
+    fn get_alias_group_readonly(&self, entity_id: &str) -> HashSet<String> {
+        match self {
+            Backend::InMemory(m) => m.get_alias_group_readonly(entity_id),
+            Backend::Lmdb(l) => l.get_alias_group_readonly(entity_id),
         }
     }
 
@@ -331,7 +345,7 @@ impl StorageBackend for Backend {
     }
 
     fn claims_for(
-        &mut self,
+        &self,
         entity_id: &str,
         predicate_type: Option<&str>,
         source_type: Option<&str>,
@@ -351,21 +365,21 @@ impl StorageBackend for Backend {
         }
     }
 
-    fn neighbors(&mut self, entity_id: &str) -> Vec<String> {
+    fn neighbors(&self, entity_id: &str) -> Vec<String> {
         match self {
             Backend::InMemory(m) => m.neighbors(entity_id),
             Backend::Lmdb(l) => l.neighbors_pub(entity_id),
         }
     }
 
-    fn bfs_claims(&mut self, entity_id: &str, max_depth: usize) -> Vec<(Claim, usize)> {
+    fn bfs_claims(&self, entity_id: &str, max_depth: usize) -> Vec<(Claim, usize)> {
         match self {
             Backend::InMemory(m) => m.bfs_claims(entity_id, max_depth),
             Backend::Lmdb(l) => l.bfs_claims(entity_id, max_depth),
         }
     }
 
-    fn path_exists(&mut self, entity_a: &str, entity_b: &str, max_depth: usize) -> bool {
+    fn path_exists(&self, entity_a: &str, entity_b: &str, max_depth: usize) -> bool {
         match self {
             Backend::InMemory(m) => m.path_exists(entity_a, entity_b, max_depth),
             Backend::Lmdb(l) => l.path_exists(entity_a, entity_b, max_depth),
@@ -379,14 +393,27 @@ impl StorageBackend for Backend {
         }
     }
 
-    fn claims_in_range(&mut self, min_ts: i64, max_ts: i64) -> Vec<Claim> {
+    fn compute_betweenness_centrality(
+        &self,
+        sample_size: usize,
+        seed: u64,
+        adaptive: bool,
+        max_nodes: usize,
+    ) -> HashMap<String, f64> {
+        match self {
+            Backend::InMemory(m) => m.compute_betweenness_centrality(sample_size, seed, adaptive, max_nodes),
+            Backend::Lmdb(l) => l.compute_betweenness_centrality(sample_size, seed, adaptive, max_nodes),
+        }
+    }
+
+    fn claims_in_range(&self, min_ts: i64, max_ts: i64) -> Vec<Claim> {
         match self {
             Backend::InMemory(m) => m.claims_in_range(min_ts, max_ts),
             Backend::Lmdb(l) => l.claims_in_range(min_ts, max_ts),
         }
     }
 
-    fn most_recent_claims(&mut self, n: usize) -> Vec<Claim> {
+    fn most_recent_claims(&self, n: usize) -> Vec<Claim> {
         match self {
             Backend::InMemory(m) => m.most_recent_claims(n),
             Backend::Lmdb(l) => l.most_recent_claims(n),

@@ -216,37 +216,51 @@ impl ClaimLog {
 
     // ── Timestamp index ─────────────────────────────────────────────
 
-    /// Ensure the timestamp index is sorted (required for binary search).
-    /// Called lazily before range queries if non-monotonic timestamps were inserted.
-    fn ensure_ts_sorted(&mut self) {
-        if !self.ts_sorted {
-            self.timestamp_index.sort_by_key(|&(ts, _)| ts);
-            self.ts_sorted = true;
+/// Get all claims within a timestamp range [min_ts, max_ts] (inclusive).
+    /// Uses binary search on the sorted timestamp index — O(log n + k) where k is result count.
+    /// `&self`: if the index isn't sorted, falls back to sorting a local copy
+    /// (one-shot O(n log n)) so concurrent reads remain safe.
+    pub fn in_time_range(&self, min_ts: i64, max_ts: i64) -> Vec<&Claim> {
+        if self.ts_sorted {
+            let start = self.timestamp_index.partition_point(|&(ts, _)| ts < min_ts);
+            let end = self.timestamp_index.partition_point(|&(ts, _)| ts <= max_ts);
+            self.timestamp_index[start..end]
+                .iter()
+                .filter_map(|(_, idx)| self.claims.get(*idx))
+                .collect()
+        } else {
+            let mut sorted = self.timestamp_index.clone();
+            sorted.sort_by_key(|&(ts, _)| ts);
+            let start = sorted.partition_point(|&(ts, _)| ts < min_ts);
+            let end = sorted.partition_point(|&(ts, _)| ts <= max_ts);
+            sorted[start..end]
+                .iter()
+                .filter_map(|(_, idx)| self.claims.get(*idx))
+                .collect()
         }
     }
 
-    /// Get all claims within a timestamp range [min_ts, max_ts] (inclusive).
-    /// Uses binary search on the sorted timestamp index — O(log n + k) where k is result count.
-    pub fn in_time_range(&mut self, min_ts: i64, max_ts: i64) -> Vec<&Claim> {
-        self.ensure_ts_sorted();
-        let start = self.timestamp_index.partition_point(|&(ts, _)| ts < min_ts);
-        let end = self.timestamp_index.partition_point(|&(ts, _)| ts <= max_ts);
-        self.timestamp_index[start..end]
-            .iter()
-            .filter_map(|(_, idx)| self.claims.get(*idx))
-            .collect()
-    }
-
     /// Get the most recent N claims by timestamp.
-    /// Uses the sorted index and iterates from the end — O(n) sort check + O(k) iteration.
-    pub fn most_recent(&mut self, n: usize) -> Vec<&Claim> {
-        self.ensure_ts_sorted();
-        self.timestamp_index
-            .iter()
-            .rev()
-            .take(n)
-            .filter_map(|(_, idx)| self.claims.get(*idx))
-            .collect()
+    /// `&self`: like `in_time_range`, falls back to sorting a local copy
+    /// when the index isn't already sorted.
+    pub fn most_recent(&self, n: usize) -> Vec<&Claim> {
+        if self.ts_sorted {
+            self.timestamp_index
+                .iter()
+                .rev()
+                .take(n)
+                .filter_map(|(_, idx)| self.claims.get(*idx))
+                .collect()
+        } else {
+            let mut sorted = self.timestamp_index.clone();
+            sorted.sort_by_key(|&(ts, _)| ts);
+            sorted
+                .iter()
+                .rev()
+                .take(n)
+                .filter_map(|(_, idx)| self.claims.get(*idx))
+                .collect()
+        }
     }
 
     /// Rebuild derived indexes (adjacency, timestamp, source, predicate) from claim data.
