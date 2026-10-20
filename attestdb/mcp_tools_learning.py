@@ -61,7 +61,8 @@ def recall(db, topic: str, limit: int = 8, *, exact: bool = False) -> list[dict]
     for entity in dict.fromkeys(entities):
         for claim in db.claims_for(entity, limit=200):
             if claim.payload is not None and claim.payload.schema_ref == SCHEMA:
-                if exact and claim.payload.data.get("subject") != topic:
+                # remember() keeps the subject stripped, so the topic is compared stripped too.
+                if exact and claim.payload.data.get("subject") != topic.strip():
                     continue
                 found[claim.claim_id] = {
                     **claim.payload.data, "claim_id": claim.claim_id,

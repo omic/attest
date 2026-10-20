@@ -189,8 +189,8 @@ LONG_SUMMARY = " ".join(f"step {i}: checked the token refresh path and its retri
 
 
 def test_a_session_with_a_long_summary_is_stored_and_recalled(tmp_path):
-    """An entity id is an LMDB key of at most 511 bytes: a summary of about 800 characters was
-    rejected by the storage engine, and attest_session_end failed."""
+    """The store keys a subject with its predicate and its source in one LMDB key of at most 511
+    bytes: a summary of about 800 characters was rejected, and attest_session_end failed."""
     assert len(LONG_SUMMARY) > 800
     db = AttestDB(str(tmp_path / "long.attest"), embedding_dim=None)
     mcp_server.configure(db)
@@ -239,5 +239,17 @@ def test_a_subject_of_any_length_around_the_limit_is_stored(tmp_path, length):
         remember(db, subject, "Stored", "tip")
 
         assert [row["subject"] for row in recall(db, subject, exact=True)] == [subject]
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("subject", ["auth.py ", "  docs/guide.md", "проверка " * 34, "🔑" * 150])
+def test_a_subject_is_recalled_exactly_as_it_was_given(tmp_path, subject):
+    """remember() strips a subject; the exact recall compared the unstripped topic and missed it."""
+    db = AttestDB(str(tmp_path / "exact.attest"), embedding_dim=None)
+    try:
+        remember(db, subject, "Found again", "tip")
+
+        assert [row["description"] for row in recall(db, subject, exact=True)] == ["Found again"]
     finally:
         db.close()
