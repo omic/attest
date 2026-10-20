@@ -45,6 +45,7 @@ browser = [
 ]
 mcp = [
     "mcp[cli]>=1.0,<2",
+    "tomlkit>=0.13",
 ]
 otel = [
     "opentelemetry-api>=1.20",
@@ -100,4 +101,8 @@ include = [
     "/LICENSE",
     "/pyproject.toml",
     "/tests/unit/test_embedding_index.py",
+    "/tests/integration/test_public_brain.py",
+    "/tests/integration/test_compliance_reference.py",
+    "/examples",
+    "/docs",
 ]

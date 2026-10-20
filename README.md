@@ -3,6 +3,24 @@
 An embedded database for claims with sources, confidence scores and timestamps.
 The Python API uses a Rust storage engine backed by LMDB.
 
+![Application references and their current readiness](docs/assets/application-map.svg)
+
+This is the **0.2.1 release candidate**. Brain features below require this
+candidate; they are not a claim about older published packages.
+
+Choose an application path:
+
+| Application | What you can use here | Readiness |
+| --- | --- | --- |
+| [Brain](#local-agent-memory) | MCP memory for findings, file notes and reported session outcomes | Candidate; installed-wheel tests |
+| [Compliance evidence](#compliance-evidence-example) | Find uncovered obligations and reopen a gap when evidence is withdrawn | Runnable synthetic example |
+| [Attest Swarm](docs/reference-architectures.md#attest-swarm-bounded-evidence-driven-coding) | Bounded coding-agent reference design | Planned public reference |
+| [Autofunnel](docs/reference-architectures.md#autofunnel-evidence-backed-sales-and-marketing) | Evidence-backed sales and marketing reference design | Planned public reference |
+
+See the [architecture and delivery plan](docs/reference-architectures.md) for
+boundaries, acceptance gates and what each label means. The planned references
+are not included applications or supported hosted services.
+
 ```bash
 pip install attestdb
 ```
@@ -26,6 +44,39 @@ try:
 finally:
     db.close()
 ```
+
+## Local agent memory
+
+Install the MCP extra, then configure your coding client:
+
+```bash
+pip install 'attestdb[mcp]'
+attest brain install --tool claude
+# Or: attest brain install --tool codex
+```
+
+Restart the client. Ask it to call
+`attest_learned("auth.py", "Check session expiry before accepting a token", "tip")`,
+then `attest_check_file("auth.py")`. Findings remain after the MCP server restarts.
+`attest_negative_result`, `attest_get_prior_approaches` and `attest_session_end`
+store failed approaches, recall topics and record reported outcomes.
+
+Storage is local and requires no model API key. Topic recall is lexical; file
+recall is exact. Records are agent-reported evidence, not independently verified
+truth. The public installer adds MCP configuration without lifecycle hooks or
+semantic recall, and preserves other client settings.
+
+## Compliance evidence example
+
+From a source checkout with AttestDB installed:
+
+```bash
+python examples/compliance_evidence.py
+```
+
+The example starts with two uncovered, invented obligations. Adding synthetic
+evidence covers one; withdrawing its source reopens that gap. It demonstrates
+evidence-link coverage, not certification, legal compliance or evidence acceptance.
 
 The open source package contains the claim engine and selected basic connectors.
 Proprietary models, model training and evaluation assets, enterprise connectors,
