@@ -95,6 +95,8 @@ warn_unused_configs = true
 include = [
     "/attestdb",
     "/README.md",
+    "/CHANGELOG.md",
+    "/RELEASE_POLICY.md",
     "/LICENSE",
     "/pyproject.toml",
     "/tests/unit/test_embedding_index.py",

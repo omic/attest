@@ -37,4 +37,6 @@ engine tests with `cargo test --manifest-path rust/Cargo.toml --all`.
 Python 3.11 and 3.12 are the release test targets. If a matching native wheel is
 unavailable, building `attest-py` from source requires a Rust toolchain.
 
+CI and release validation run on private runners. See [release validation](RELEASE_POLICY.md).
+
 Licensed under [Apache-2.0](LICENSE).
