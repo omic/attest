@@ -90,3 +90,60 @@ class TestSaveLoad:
         assert len(results) == 2
         # Closest to [1,0,...] should be "a"
         assert results[0][0] == "a"
+
+
+def _mark_saved_files(path):
+    import os
+    from pathlib import Path
+
+    marker = 1_600_000_000_000_000_000
+    for file in (Path(path), Path(str(path) + ".json")):
+        os.utime(file, ns=(marker, marker))
+    return marker
+
+
+def test_unchanged_index_keeps_saved_files_untouched(tmp_path):
+    from pathlib import Path
+
+    index = EmbeddingIndex(ndim=4)
+    index.add("a", [1, 0, 0, 0])
+    path = str(tmp_path / "index.usearch")
+    index.save(path)
+    marker = _mark_saved_files(path)
+    index.save(path)
+    assert Path(path).stat().st_mtime_ns == marker
+    assert Path(path + ".json").stat().st_mtime_ns == marker
+    loaded = EmbeddingIndex.load_from(path)
+    loaded.save(path)
+    assert Path(path).stat().st_mtime_ns == marker
+
+
+def test_changed_index_and_model_are_persisted(tmp_path):
+    index = EmbeddingIndex(ndim=4)
+    path = str(tmp_path / "index.usearch")
+    index.add("a", [1, 0, 0, 0])
+    index.save(path)
+    index.add("b", [0, 1, 0, 0])
+    index.save(path)
+    assert len(EmbeddingIndex.load_from(path)) == 2
+    index.remove("a")
+    index.model = "caller-model-v1"
+    index.save(path)
+    loaded = EmbeddingIndex.load_from(path)
+    assert len(loaded) == 1 and loaded.model == "caller-model-v1"
+    assert loaded.search([0, 1, 0, 0], top_k=1)[0][0] == "b"
+
+
+def test_missing_sidecar_and_new_destination_are_written(tmp_path):
+    from pathlib import Path
+
+    index = EmbeddingIndex(ndim=4)
+    index.add("a", [1, 0, 0, 0])
+    path = str(tmp_path / "index.usearch")
+    index.save(path)
+    Path(path + ".json").unlink()
+    index.save(path)
+    assert len(EmbeddingIndex.load_from(path)) == 1
+    other = str(tmp_path / "other.usearch")
+    index.save(other)
+    assert len(EmbeddingIndex.load_from(other)) == 1

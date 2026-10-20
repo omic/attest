@@ -209,7 +209,9 @@ VERIFICATION_PROFILES: dict[str, dict] = {
 
 # Predicates with special engine semantics
 CONTRADICTION_PREDICATES: set[str] = {"contradicts", "contradiction_resolved"}
-SYMMETRIC_PREDICATES: set[str] = {"interacts", "binds", "resembles", "homolog_of", "same_as"}
+SYMMETRIC_PREDICATES: set[str] = {
+    "interacts", "interacts_with", "binds", "resembles", "homolog_of", "same_as",
+}
 
 # Opposing predicate pairs — built from PredicateStore seed data.
 # Kept as a module-level dict for backward compatibility with 17+ import sites.

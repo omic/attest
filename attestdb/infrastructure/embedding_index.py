@@ -19,10 +19,13 @@ class EmbeddingIndex:
 
     def __init__(self, ndim: int = 768):
         self._ndim = ndim
+        self.model: str | None = None
         self._index = Index(ndim=ndim, metric="cos")
         self._id_to_key: dict[str, int] = {}
         self._key_to_id: dict[int, str] = {}
         self._next_key = 0
+        self._changes = 0
+        self._saved: tuple[str, int, str | None] | None = None
 
     @property
     def ndim(self) -> int:
@@ -44,6 +47,7 @@ class EmbeddingIndex:
         self._id_to_key[claim_id] = key
         self._key_to_id[key] = claim_id
         self._index.add(key, vec)
+        self._changes += 1
 
     def remove(self, claim_id: str) -> bool:
         """Remove a claim_id from the index. Returns True if it was present."""
@@ -51,6 +55,7 @@ class EmbeddingIndex:
         if key is None:
             return False
         self._key_to_id.pop(key, None)
+        self._changes += 1
         if hasattr(self._index, "remove"):
             try:
                 self._index.remove(key)
@@ -69,16 +74,12 @@ class EmbeddingIndex:
             logger.warning("Failed to retrieve embedding for %s: %s", claim_id, e)
             return None
 
-    def search(
-        self, query: list[float] | np.ndarray, top_k: int = 10
-    ) -> list[tuple[str, float]]:
+    def search(self, query: list[float] | np.ndarray, top_k: int = 10) -> list[tuple[str, float]]:
         if len(self._id_to_key) == 0:
             return []
         vec = np.asarray(query, dtype=np.float32)
         if vec.shape[0] != self._ndim:
-            raise DimensionalityError(
-                f"Expected {self._ndim}-dim query, got {vec.shape[0]}-dim"
-            )
+            raise DimensionalityError(f"Expected {self._ndim}-dim query, got {vec.shape[0]}-dim")
         actual_k = min(top_k, len(self._id_to_key))
         matches = self._index.search(vec, actual_k)
         results = []
@@ -89,17 +90,25 @@ class EmbeddingIndex:
         return results
 
     def save(self, path: str) -> None:
-        self._index.save(path)
         sidecar = path + ".json"
+        if (
+            self._saved == (path, self._changes, self.model)
+            and os.path.exists(path)
+            and os.path.exists(sidecar)
+        ):
+            return
+        self._index.save(path)
         with open(sidecar, "w") as f:
             json.dump(
                 {
                     "ndim": self._ndim,
+                    "model": self.model,
                     "id_to_key": self._id_to_key,
                     "next_key": self._next_key,
                 },
                 f,
             )
+        self._saved = (path, self._changes, self.model)
 
     def load(self, path: str) -> None:
         self._index.load(path)
@@ -108,12 +117,14 @@ class EmbeddingIndex:
             with open(sidecar) as f:
                 data = json.load(f)
             self._ndim = data["ndim"]
+            self.model = data.get("model")
             self._id_to_key = data["id_to_key"]
             self._next_key = data["next_key"]
         else:
             logger.warning("Embedding index sidecar missing at %s", sidecar)
         # Always rebuild reverse mapping from id_to_key
         self._key_to_id = {int(v): k for k, v in self._id_to_key.items()}
+        self._saved = (path, self._changes, self.model)
 
     @classmethod
     def load_from(cls, path: str) -> EmbeddingIndex:

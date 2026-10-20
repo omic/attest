@@ -1,6 +1,7 @@
 name: Test
 
 on:
+  workflow_call:
   push:
     branches: [main]
   pull_request:
@@ -24,9 +25,12 @@ jobs:
       - name: Build Rust extension first (attestdb depends on attest-py)
         run: |
           python -m venv .venv
-          source .venv/bin/activate
-          pip install maturin
-          cd rust/attest-py && maturin develop --release
+          .venv/bin/python -m pip install maturin build
+          .venv/bin/maturin build --release --locked \
+            --manifest-path rust/attest-py/Cargo.toml \
+            --out "$RUNNER_TEMP/oss-rust-dist" \
+            --interpreter "$PWD/.venv/bin/python"
+          .venv/bin/python -m pip install "$RUNNER_TEMP"/oss-rust-dist/*.whl
 
       - name: Install Python package and dev dependencies
         run: |
@@ -50,14 +54,17 @@ jobs:
 
       - name: Smoke test wheel install
         run: |
-          python -m venv /tmp/smoke-venv
-          source /tmp/smoke-venv/bin/activate
-          pip install maturin
-          cd rust/attest-py && maturin build --release
-          pip install ../../rust/target/wheels/attest_py-*.whl
-          python -c "import attest_rust; print('attest_rust import OK')"
-          pip install -e ../..
-          python -c "from attestdb import open; db = open(':memory:'); db.close(); print('attestdb smoke test OK')"
+          .venv/bin/python -m build --outdir "$RUNNER_TEMP/oss-python-dist"
+          .venv/bin/python scripts/verify_release_artifacts.py \
+            "$RUNNER_TEMP"/oss-rust-dist/*.whl \
+            "$RUNNER_TEMP"/oss-python-dist/*
+          python -m venv "$RUNNER_TEMP/oss-smoke"
+          "$RUNNER_TEMP/oss-smoke/bin/python" -m pip install \
+            "$RUNNER_TEMP"/oss-rust-dist/*.whl \
+            "$RUNNER_TEMP"/oss-python-dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/oss-smoke/bin/python" -I -c \
+            "from attestdb import AttestDB; db = AttestDB(':memory:', embedding_dim=None); db.close(); print('installed OSS wheel smoke test OK')"
 
   rust-tests:
     runs-on: ubuntu-latest
@@ -80,7 +87,7 @@ jobs:
 
       - name: Run Rust tests
         working-directory: rust
-        run: cargo test --all
+        run: cargo test --locked --all
 
   lint:
     runs-on: ubuntu-latest
@@ -95,5 +102,12 @@ jobs:
       - name: Install ruff
         run: pip install ruff
 
-      - name: Lint
-        run: ruff check attestdb/ || echo "::warning::Lint issues found (non-blocking)"
+      - name: Lint release changes
+        run: |
+          ruff check scripts/verify_release_artifacts.py \
+            attestdb/infrastructure/embedding_index.py \
+            attestdb/infrastructure/entity_resolver.py \
+            tests/unit/test_release_artifacts.py \
+            tests/unit/test_readme_example.py \
+            tests/integration/test_entity_resolution.py \
+            tests/integration/test_symmetric.py

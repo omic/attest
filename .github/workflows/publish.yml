@@ -10,6 +10,11 @@ permissions:
   contents: read
 
 jobs:
+  # Use the standalone OSS workflow; no private regression scripts or ledgers.
+  test:
+    name: Standalone OSS validation
+    uses: ./.github/workflows/test.yml
+
   # --- Build the pure-Python attestdb package ---
   build-python:
     name: Build attestdb sdist + wheel
@@ -26,6 +31,9 @@ jobs:
         run: |
           pip install build
           python -m build
+
+      - name: Verify reviewed package contents
+        run: python scripts/verify_release_artifacts.py dist/*
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -68,8 +76,12 @@ jobs:
         with:
           working-directory: rust/attest-py
           target: ${{ matrix.target }}
-          args: --release --out dist -i python3.12
+          args: --release --locked --out dist -i python3.12
           manylinux: auto
+
+      - name: Verify reviewed wheel contents
+        shell: bash
+        run: python scripts/verify_release_artifacts.py rust/attest-py/dist/*.whl
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -77,10 +89,29 @@ jobs:
           name: dist-rust-${{ matrix.target }}
           path: rust/attest-py/dist/
 
+  build-rust-sdist:
+    name: Build attest-py source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build native source distribution
+        run: |
+          pip install maturin
+          maturin sdist --manifest-path rust/attest-py/Cargo.toml --out dist-rust-sdist
+      - name: Verify reviewed source archive
+        run: python scripts/verify_release_artifacts.py dist-rust-sdist/*.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-rust-sdist
+          path: dist-rust-sdist/*.tar.gz
+
   # --- Publish everything to PyPI from a single Linux runner ---
   publish-python:
     name: Publish attestdb to PyPI
-    needs: build-python
+    needs: [test, build-python, build-rust, build-rust-sdist]
     runs-on: ubuntu-latest
     environment: pypi
     steps:
@@ -95,8 +126,7 @@ jobs:
 
   publish-rust:
     name: Publish attest-py to PyPI
-    needs: build-rust
-    if: always() && !cancelled()
+    needs: [test, build-python, build-rust, build-rust-sdist]
     runs-on: ubuntu-latest
     environment: pypi
     steps:
