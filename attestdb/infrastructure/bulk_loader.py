@@ -21,22 +21,38 @@ logger = logging.getLogger(__name__)
 
 # LMDB max key size — entity IDs exceeding this are truncated + hashed.
 _MAX_ENTITY_ID_LEN = 500  # leave headroom below LMDB's 511-byte limit
+# LMDB's key limit, and the separator of the store's compound keys.
+LMDB_MAX_KEY_BYTES = 511
+_KEY_SEPARATOR = "\x1f"
 
 
-def _safe_entity_id(raw_id: str, *, ext_ids: dict | None = None) -> tuple[str, dict]:
+def max_subject_bytes(predicate_id: str, source_id: str) -> int:
+    """The longest subject entity id the store accepts beside this predicate and source.
+
+    The store keys counts by "{subject}\x1f{predicate}" and "{subject}\x1f{source}" and does
+    not cut the subject ("Subject IDs are always short", rust/attest-store/src/backend/lmdb.rs),
+    so a longer subject is rejected: 472 bytes beside a 38-byte source, measured with attest-py
+    0.2.1 (2026-10-20).
+    """
+    keyed_with = max(len(predicate_id.encode("utf-8")), len(source_id.encode("utf-8")))
+    return LMDB_MAX_KEY_BYTES - len(_KEY_SEPARATOR) - keyed_with
+
+
+def _safe_entity_id(raw_id: str, *, ext_ids: dict | None = None,
+                    max_bytes: int = _MAX_ENTITY_ID_LEN) -> tuple[str, dict]:
     """Ensure entity ID fits in LMDB key limit.
 
-    If the normalized ID exceeds _MAX_ENTITY_ID_LEN bytes, truncate and append
-    a hash suffix.  The original ID is preserved in ext_ids["original_id"].
+    If the normalized ID exceeds ``max_bytes``, truncate and append a hash suffix.
+    The original ID is preserved in ext_ids["original_id"].
 
     Returns (safe_id, updated_ext_ids).
     """
     import hashlib
-    if len(raw_id.encode("utf-8")) <= _MAX_ENTITY_ID_LEN:
+    if len(raw_id.encode("utf-8")) <= max_bytes:
         return raw_id, ext_ids or {}
     h = hashlib.sha256(raw_id.encode("utf-8")).hexdigest()[:16]
     # Truncate at a safe byte boundary
-    truncated = raw_id.encode("utf-8")[:_MAX_ENTITY_ID_LEN - 18].decode("utf-8", errors="ignore")
+    truncated = raw_id.encode("utf-8")[:max_bytes - 18].decode("utf-8", errors="ignore")
     safe = f"{truncated}_{h}"
     updated = dict(ext_ids) if ext_ids else {}
     updated["original_id"] = raw_id
