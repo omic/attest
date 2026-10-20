@@ -1,4 +1,6 @@
-# Offline AutoFunnel reference
+# Sales and Marketing Fabric
+
+**Implementation: AutoFunnel — offline synthetic reference.**
 
 A synthetic account brief demonstrates how missing evidence becomes an
 investigation task, sourced facts become a draft, and human review gates local

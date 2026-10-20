@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1120" height="520" viewBox="0 0 1120 520" role="img" aria-labelledby="title desc">
-  <title id="title">Applications built on AttestDB</title>
-  <desc id="desc">Brain is a candidate local MCP integration. Compliance has a runnable evidence example. Swarm has an offline synthetic workflow. Autofunnel has a synthetic brief and approval-gated local outbox. All sit above the public claim database. Private models and enterprise services stay outside the public package.</desc>
+  <title id="title">Fabric reference implementations on AttestDB</title>
+  <desc id="desc">Agent Memory Fabric uses Brain, a candidate local MCP integration. Compliance Fabric has a runnable evidence example. Software Engineering Fabric uses an offline Attest Swarm workflow. Sales and Marketing Fabric uses a synthetic AutoFunnel brief and approval-gated local outbox. All sit above the public claim database. Private models and enterprise services stay outside the public package.</desc>
   <defs>
     <linearGradient id="bg" x2="1" y2="1"><stop stop-color="#101b32"/><stop offset="1" stop-color="#101827"/></linearGradient>
     <linearGradient id="core" x2="1"><stop stop-color="#143c53"/><stop offset="1" stop-color="#194b50"/></linearGradient>
@@ -8,8 +8,8 @@
   </defs>
   <rect width="1120" height="520" rx="20" fill="url(#bg)"/>
   <g font-family="Arial, Helvetica, sans-serif">
-    <text x="40" y="48" fill="#6ee7c2" font-size="13" font-weight="700" letter-spacing="2">ATTESTDB · APPLICATION REFERENCES</text>
-    <text x="40" y="88" fill="#f1f5ff" font-size="31" font-weight="700">Start with an application. Keep the evidence.</text>
+    <text x="40" y="48" fill="#6ee7c2" font-size="13" font-weight="700" letter-spacing="2">ATTESTDB · FABRIC REFERENCE IMPLEMENTATIONS</text>
+    <text x="40" y="88" fill="#f1f5ff" font-size="31" font-weight="700">Start with a fabric. Keep the evidence.</text>
     <text x="40" y="117" fill="#b5c3dc" font-size="16">Claims connect what you know, where it came from, and what needs investigating.</text>
     <g fill="#19263e" stroke="#34445f">
       <rect x="40" y="148" width="248" height="157" rx="13"/>
@@ -17,21 +17,23 @@
       <rect x="568" y="148" width="248" height="157" rx="13"/>
       <rect x="832" y="148" width="248" height="157" rx="13"/>
     </g>
-    <g font-size="22" font-weight="700" fill="#f1f5ff">
-      <text x="60" y="184">Brain</text><text x="324" y="184">Compliance</text>
-      <text x="588" y="184">Swarm</text><text x="852" y="184">Autofunnel</text>
+    <g font-size="18" font-weight="700" fill="#f1f5ff">
+      <text x="60" y="177">Agent Memory</text><text x="60" y="201">Fabric</text>
+      <text x="324" y="177">Compliance</text><text x="324" y="201">Fabric</text>
+      <text x="588" y="177">Software Engineering</text><text x="588" y="201">Fabric</text>
+      <text x="852" y="177">Sales and Marketing</text><text x="852" y="201">Fabric</text>
     </g>
-    <g font-size="15" fill="#c3cee0">
-      <text x="60" y="215">Recall findings.</text><text x="60" y="238">Keep lessons across sessions.</text>
-      <text x="324" y="215">Find evidence gaps.</text><text x="324" y="238">Trace changes to their source.</text>
-      <text x="588" y="215">Test claims about code.</text><text x="588" y="238">One fixture. Tests. Memory.</text>
-      <text x="852" y="215">Ground briefs and drafts.</text><text x="852" y="238">Review before local staging.</text>
+    <g font-size="14" fill="#c3cee0">
+      <text x="60" y="229">Recall findings.</text><text x="60" y="250">Keep lessons across sessions.</text>
+      <text x="324" y="229">Find evidence gaps.</text><text x="324" y="250">Trace changes to their source.</text>
+      <text x="588" y="229">Test claims about code.</text><text x="588" y="250">One fixture. Tests. Memory.</text>
+      <text x="852" y="229">Ground briefs and drafts.</text><text x="852" y="250">Review before local staging.</text>
     </g>
     <g font-size="12" font-weight="700">
-      <rect x="60" y="259" width="175" height="25" rx="12" fill="#173e68"/><text x="73" y="276" fill="#b7d9ff">CANDIDATE · LOCAL MCP</text>
-      <rect x="324" y="259" width="149" height="25" rx="12" fill="#184b40"/><text x="337" y="276" fill="#b5f3d4">RUNNABLE EXAMPLE</text>
-      <rect x="588" y="259" width="172" height="25" rx="12" fill="#184b40"/><text x="601" y="276" fill="#b5f3d4">OFFLINE EXAMPLE</text>
-      <rect x="852" y="259" width="172" height="25" rx="12" fill="#184b40"/><text x="865" y="276" fill="#b5f3d4">OFFLINE EXAMPLE</text>
+      <rect x="60" y="268" width="175" height="25" rx="12" fill="#173e68"/><text x="73" y="285" fill="#b7d9ff">CANDIDATE · LOCAL MCP</text>
+      <rect x="324" y="268" width="149" height="25" rx="12" fill="#184b40"/><text x="337" y="285" fill="#b5f3d4">RUNNABLE EXAMPLE</text>
+      <rect x="588" y="268" width="172" height="25" rx="12" fill="#184b40"/><text x="601" y="285" fill="#b5f3d4">OFFLINE EXAMPLE</text>
+      <rect x="852" y="268" width="172" height="25" rx="12" fill="#184b40"/><text x="865" y="285" fill="#b5f3d4">OFFLINE EXAMPLE</text>
     </g>
     <g stroke="#7185a6" stroke-width="1.4" fill="none" marker-end="url(#arrow)">
       <path d="M164 306V333"/><path d="M428 306V333"/><path d="M692 306V333"/><path d="M956 306V333"/>
@@ -40,6 +42,6 @@
     <text x="64" y="375" fill="#ecfff8" font-size="23" font-weight="700">AttestDB · the public claim engine</text>
     <text x="64" y="407" fill="#c1e4e2" font-size="16">Python API + Rust storage    /    provenance    /    confidence    /    source retraction</text>
     <text x="40" y="468" fill="#b5c3dc" font-size="14">Provider authentication, private models and enterprise services have separate boundaries.</text>
-    <text x="40" y="493" fill="#8b9cb7" font-size="13">Readiness applies to this source branch. Reference examples are not hosted-service support commitments.</text>
+    <text x="40" y="493" fill="#8b9cb7" font-size="13">Readiness applies to this source branch. Fabric examples are not hosted-service support commitments.</text>
   </g>
 </svg>

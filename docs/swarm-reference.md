@@ -1,4 +1,6 @@
-# Offline Swarm reference
+# Software Engineering Fabric
+
+**Implementation: Attest Swarm — offline synthetic reference.**
 
 This small reference demonstrates the application loop using only public AttestDB
 and Brain APIs. It is written independently of the private Swarm application.

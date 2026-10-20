@@ -1,30 +1,32 @@
-# Application reference architectures
+# Fabric reference implementations
 
-Design the platform around useful applications: each reference must demonstrate
+Each Fabric reference implementation demonstrates an application domain on the
+public claim engine. Brain, Attest Swarm and AutoFunnel identify the corresponding
+implementations. Each reference must demonstrate
 an uncertainty, the evidence needed to investigate it, an evidence update, and
 the resulting change in what the application reports. A diagram is not a support
 commitment. Readiness below refers to this source branch, not an available hosted service.
 
-| Reference | Current public deliverable | Next acceptance gate |
+| Fabric reference implementation | Current public deliverable | Next acceptance gate |
 | --- | --- | --- |
-| Brain | Candidate MCP memory tools and client configuration | Independent review and release; installed-wheel tests have passed on private CI |
-| Compliance evidence | Synthetic runnable evidence-link example | Tested collection freshness, evidence review and coverage boundaries before a larger reference |
-| Attest Swarm | Offline synthetic workflow with real tests, memory and replay | Provider adapter review and a separately budgeted single-agent comparison before live support |
-| Autofunnel | Synthetic brief, cited draft, approval checks and local outbox | Authenticated review, current permission sources and delivery-adapter review before any external delivery |
+| Agent Memory Fabric (Brain) | Candidate MCP memory tools and client configuration | Independent review and release; installed-wheel tests have passed on private CI |
+| Compliance Fabric | Synthetic runnable evidence-link example | Tested collection freshness, evidence review and coverage boundaries before a larger reference |
+| Software Engineering Fabric (Attest Swarm) | Offline synthetic workflow with real tests, memory and replay | Provider adapter review and a separately budgeted single-agent comparison before live support |
+| Sales and Marketing Fabric (AutoFunnel) | Synthetic brief, cited draft, approval checks and local outbox | Authenticated review, current permission sources and delivery-adapter review before any external delivery |
 
 ## Proposed portfolio
 
 These are delivery priorities, not promises of supported services.
 
-| Order | Reference | Purpose | Scope |
+| Order | Fabric reference implementation | Purpose | Scope |
 | --- | --- | --- | --- |
-| 1 | Brain | Persistent findings and prior approaches for existing agents | Public candidate |
-| 2 | Swarm | Bounded coding, deterministic checks and recorded outcomes | Offline synthetic example |
-| 3 | Compliance | Investigate missing or withdrawn obligation evidence | Synthetic coverage example |
-| 4 | Autofunnel | Sourced account briefs and approved outreach drafts | Offline synthetic example |
-| Later | Research workbench | Investigate unanswered questions and conflicting sources | Proposed |
-| Later | Support and incidents | Reuse verified resolutions and investigate unresolved causes | Proposed |
-| Later | Supplier assurance | Review missing or stale evidence behind supplier decisions | Proposed |
+| 1 | Agent Memory Fabric (Brain) | Persistent findings and prior approaches for existing agents | Public candidate |
+| 2 | Software Engineering Fabric (Attest Swarm) | Bounded coding, deterministic checks and recorded outcomes | Offline synthetic example |
+| 3 | Compliance Fabric | Investigate missing or withdrawn obligation evidence | Synthetic coverage example |
+| 4 | Sales and Marketing Fabric (AutoFunnel) | Sourced account briefs and approved outreach drafts | Offline synthetic example |
+| Later | Research Fabric | Investigate unanswered questions and conflicting sources | Proposed |
+| Later | Support and Incident Fabric | Reuse verified resolutions and investigate unresolved causes | Proposed |
+| Later | Supplier Assurance Fabric | Review missing or stale evidence behind supplier decisions | Proposed |
 
 ## Shared application contract
 
@@ -42,7 +44,9 @@ end-to-end test, an architecture diagram, a deployment boundary, a cost model,
 and an explicit list of unimplemented or unqualified integrations. Imports must
 work with only public distributions. User data and credentials are not demo fixtures.
 
-## Brain: local memory for existing agent clients
+## Agent Memory Fabric
+
+Implementation: **Brain**, local memory for existing agent clients.
 
 ```mermaid
 flowchart LR
@@ -57,7 +61,9 @@ check rather than instructions to execute. Installation must preserve other MCP
 servers and settings. The public installer does not install lifecycle hooks or
 provide semantic recall. Memory-tool storage does not require model credentials.
 
-## Compliance: investigate uncovered obligations
+## Compliance Fabric
+
+Investigate uncovered obligations.
 
 The current [example](../examples/compliance_evidence.py) links two invented
 obligations to synthetic evidence. Adding an evidence link closes one coverage
@@ -81,7 +87,9 @@ imports, provenance, review records and reproducible exports. A multi-user porta
 authorization, encrypted archives, framework packs and enterprise collectors each
 need their own public/private decision and tests; they are not implied by this demo.
 
-## Attest Swarm: bounded, evidence-driven coding
+## Software Engineering Fabric
+
+Implementation: **Attest Swarm**, bounded coding with recorded evidence.
 
 ```mermaid
 flowchart LR
@@ -109,7 +117,9 @@ tokens when reported, authentication/billing mode and quota-limit stops. Unknown
 usage is unknown, not zero. Set a small live-run budget before using subscriptions.
 The existing private swarm code is not automatically approved for publication.
 
-## Autofunnel: evidence-backed sales and marketing
+## Sales and Marketing Fabric
+
+Implementation: **AutoFunnel**, sales and marketing drafts backed by evidence.
 
 ```mermaid
 flowchart LR
