@@ -104,6 +104,7 @@ include = [
     "/tests/integration/test_public_brain.py",
     "/tests/integration/test_compliance_reference.py",
     "/tests/integration/test_swarm_reference.py",
+    "/tests/integration/test_autofunnel_reference.py",
     "/examples",
     "/docs",
 ]

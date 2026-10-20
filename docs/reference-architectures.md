@@ -7,10 +7,10 @@ commitment. Readiness below refers to this source branch, not an available hoste
 
 | Reference | Current public deliverable | Next acceptance gate |
 | --- | --- | --- |
-| Brain | Candidate MCP memory tools and client configuration | Installed-wheel protocol, restart and installer tests on private CI |
+| Brain | Candidate MCP memory tools and client configuration | Independent review and release; installed-wheel tests have passed on private CI |
 | Compliance evidence | Synthetic runnable evidence-link example | Tested collection freshness, evidence review and coverage boundaries before a larger reference |
 | Attest Swarm | Offline synthetic workflow with real tests, memory and replay | Provider adapter review and a separately budgeted single-agent comparison before live support |
-| Autofunnel | Architecture plan; no public application in this repository | Synthetic CRM workflow, evidence-linked drafts and enforced approval tests |
+| Autofunnel | Synthetic brief, cited draft, approval checks and local outbox | Authenticated review, current permission sources and delivery-adapter review before any external delivery |
 
 ## Proposed portfolio
 
@@ -21,7 +21,7 @@ These are delivery priorities, not promises of supported services.
 | 1 | Brain | Persistent findings and prior approaches for existing agents | Public candidate |
 | 2 | Swarm | Bounded coding, deterministic checks and recorded outcomes | Offline synthetic example |
 | 3 | Compliance | Investigate missing or withdrawn obligation evidence | Synthetic coverage example |
-| 4 | Autofunnel | Sourced account briefs and approved outreach drafts | Planned |
+| 4 | Autofunnel | Sourced account briefs and approved outreach drafts | Offline synthetic example |
 | Later | Research workbench | Investigate unanswered questions and conflicting sources | Proposed |
 | Later | Support and incidents | Reuse verified resolutions and investigate unresolved causes | Proposed |
 | Later | Supplier assurance | Review missing or stale evidence behind supplier decisions | Proposed |
@@ -124,18 +124,22 @@ flowchart LR
     O --> K
 ```
 
-Begin with a synthetic account brief, sourced product claims, a content/outreach
-draft, and a review queue. Sending stays disabled in the default demo. The
-reference must distinguish observed outcomes from inferred attribution and
-explicitly test consent/suppression and approval before any external delivery.
-Private CRM, advertising, enrichment and email connectors are not public by default.
+The [offline walkthrough](autofunnel-reference.md) builds a synthetic account brief
+and a template draft from claim references. Tests enforce approval bound to the
+exact draft, demo consent and suppression checks, and evidence revalidation before
+local staging. Conflicting or withdrawn evidence requires investigation. There is
+no external delivery adapter or model call; observed outcomes remain unknown.
+
+Authenticated reviewers, real permission sources, freshness rules, transactional
+queue invalidation and delivery integration are future gates. Private CRM,
+advertising, enrichment and email connectors are not public by default.
 
 ## Delivery order and README promotion
 
-1. Finish brain installation and installed-wheel validation.
+1. Complete independent Brain release review; installed-wheel validation has passed.
 2. Keep the compliance example small; add reviewed freshness and acceptance semantics next.
-3. Qualify the private swarm baseline before selecting a public extraction scope.
-4. Design Autofunnel against synthetic data before extracting any private implementation.
+3. Review the independently written offline Swarm reference before adding a bounded live adapter.
+4. Review the independently written synthetic Autofunnel reference before adding real integrations.
 
 Use `planned`, `runnable example`, `validated reference`, and `supported service`
 as distinct labels. A supported service additionally needs a named owner,
