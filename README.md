@@ -14,7 +14,7 @@ Choose an application path:
 | --- | --- | --- |
 | [Brain](#local-agent-memory) | MCP memory for findings, file notes and reported session outcomes | Candidate; installed-wheel tests |
 | [Compliance evidence](#compliance-evidence-example) | Find uncovered obligations and reopen a gap when evidence is withdrawn | Runnable synthetic example |
-| [Attest Swarm](docs/reference-architectures.md#attest-swarm-bounded-evidence-driven-coding) | Bounded coding-agent reference design | Planned public reference |
+| [Attest Swarm](#offline-swarm-example) | One synthetic builder, real tests, Brain memory and recorded replay | Runnable offline example |
 | [Autofunnel](docs/reference-architectures.md#autofunnel-evidence-backed-sales-and-marketing) | Evidence-backed sales and marketing reference design | Planned public reference |
 
 See the [architecture and delivery plan](docs/reference-architectures.md) for
@@ -65,6 +65,20 @@ Storage is local and requires no model API key. Topic recall is lexical; file
 recall is exact. Records are agent-reported evidence, not independently verified
 truth. The public installer adds MCP configuration without lifecycle hooks or
 semantic recall, and preserves other client settings.
+
+## Offline Swarm example
+
+From a source checkout with the candidate AttestDB package installed:
+
+```bash
+python examples/swarm_reference.py --run-dir /tmp/attest-swarm-demo --db /tmp/swarm-memory.attest
+python examples/swarm_reference.py --run-dir /tmp/attest-swarm-demo --replay
+```
+
+A synthetic builder repairs a tiny fixture; real subprocess tests check the result,
+then public Brain memory stores the evidence. One builder attempt is allowed per
+run directory. Failed checks or an explicit review policy require human review.
+This example makes no model calls. See the [walkthrough and limits](docs/swarm-reference.md).
 
 ## Compliance evidence example
 

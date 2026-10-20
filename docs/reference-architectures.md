@@ -9,8 +9,22 @@ commitment. Readiness below refers to this source branch, not an available hoste
 | --- | --- | --- |
 | Brain | Candidate MCP memory tools and client configuration | Installed-wheel protocol, restart and installer tests on private CI |
 | Compliance evidence | Synthetic runnable evidence-link example | Tested collection freshness, evidence review and coverage boundaries before a larger reference |
-| Attest Swarm | Architecture plan; no public runner in this repository | Independently audited code, bounded provider benchmark and replay tests |
+| Attest Swarm | Offline synthetic workflow with real tests, memory and replay | Provider adapter review and a separately budgeted single-agent comparison before live support |
 | Autofunnel | Architecture plan; no public application in this repository | Synthetic CRM workflow, evidence-linked drafts and enforced approval tests |
+
+## Proposed portfolio
+
+These are delivery priorities, not promises of supported services.
+
+| Order | Reference | Purpose | Scope |
+| --- | --- | --- | --- |
+| 1 | Brain | Persistent findings and prior approaches for existing agents | Public candidate |
+| 2 | Swarm | Bounded coding, deterministic checks and recorded outcomes | Offline synthetic example |
+| 3 | Compliance | Investigate missing or withdrawn obligation evidence | Synthetic coverage example |
+| 4 | Autofunnel | Sourced account briefs and approved outreach drafts | Planned |
+| Later | Research workbench | Investigate unanswered questions and conflicting sources | Proposed |
+| Later | Support and incidents | Reuse verified resolutions and investigate unresolved causes | Proposed |
+| Later | Supplier assurance | Review missing or stale evidence behind supplier decisions | Proposed |
 
 ## Shared application contract
 
@@ -79,7 +93,12 @@ flowchart LR
     J --> D[(AttestDB memory)]
 ```
 
-Start with one builder and hard invocation/time limits. Escalate only on explicit
+The [offline walkthrough](swarm-reference.md) runs one deterministic synthetic
+builder, real acceptance checks, persisted public Brain memory and a replay log.
+It has no provider adapter and spends no model credits. Its builder reservation
+is per run directory; it does not implement an account-wide spending budget.
+
+For a future live adapter, start with one builder and hard invocation/time limits. Escalate only on explicit
 criteria. Local provider adapters should use officially supported authentication;
 the selected billing mode must be visible and must not silently fall back to a
 paid API or another account. Provider limits remain real limits.

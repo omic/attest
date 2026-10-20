@@ -103,6 +103,7 @@ include = [
     "/tests/unit/test_embedding_index.py",
     "/tests/integration/test_public_brain.py",
     "/tests/integration/test_compliance_reference.py",
+    "/tests/integration/test_swarm_reference.py",
     "/examples",
     "/docs",
 ]
