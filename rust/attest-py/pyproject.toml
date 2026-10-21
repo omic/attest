@@ -4,10 +4,10 @@ build-backend = "maturin"
 
 [project]
 name = "attest-py"
-version = "0.2.0"
-description = "Rust storage engine for AttestDB — 1.3M claims/sec, LMDB, ~12µs queries. Install with: pip install attestdb attest-py"
+version = "0.2.1"
+description = "Rust storage engine for AttestDB"
 requires-python = ">=3.11"
-license = {text = "Apache-2.0"}
+license = {file = "LICENSE"}
 authors = [
     {name = "Omic Research"},
 ]

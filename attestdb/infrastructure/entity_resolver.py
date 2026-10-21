@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import math
 
 import jellyfish
 
@@ -197,21 +196,6 @@ class EntityResolver:
         # Blocking index: blocking_key -> set of entity_ids
         self._blocking_index: dict[str, set[str]] = {}
         self._built = False
-        # Optional calibration hooks (set via configure_calibration)
-        self._prediction_log = None
-        self._review_queue = None
-        self._threshold_engine = None
-
-    def configure_calibration(
-        self,
-        prediction_log=None,
-        review_queue=None,
-        threshold_engine=None,
-    ) -> None:
-        """Attach calibration modules for decision logging and review routing."""
-        self._prediction_log = prediction_log
-        self._review_queue = review_queue
-        self._threshold_engine = threshold_engine
 
     def build_index(self) -> None:
         """Scan all entities and build reverse external_id + blocking indexes.
@@ -353,9 +337,6 @@ class EntityResolver:
                     if es.id != normalized:
                         candidate_ids.add(es.id)
 
-            # Get calibrated thresholds (or defaults)
-            accept_threshold, review_threshold = self._get_thresholds(entity_type)
-
             # Score all unique candidates
             best_id = None
             best_score = 0.0
@@ -375,27 +356,9 @@ class EntityResolver:
                     best_score = score
                     best_id = candidate.id
 
-            if best_id is not None:
-                if best_score >= accept_threshold:
-                    # Auto-merge: high confidence
-                    self._log_decision(
-                        name, best_id, entity_type, best_score, "auto_merge",
-                    )
-                    return best_id, best_score
-                elif best_score >= review_threshold:
-                    # Gray zone: route to review queue, don't merge yet
-                    self._log_decision(
-                        name, best_id, entity_type, best_score, "review",
-                    )
-                    self._enqueue_review(
-                        name, best_id, entity_type, best_score,
-                    )
-                    # Don't resolve — let the human decide
-                else:
-                    # Below review threshold: reject
-                    self._log_decision(
-                        name, best_id, entity_type, best_score, "reject",
-                    )
+            # Standalone OSS resolution uses a fixed acceptance threshold.
+            if best_id is not None and best_score >= 0.5:
+                return best_id, best_score
 
         return None, 0.0
 
@@ -582,97 +545,3 @@ class EntityResolver:
 
         # Cap at 0.95 — reserve 1.0 for exact/ext-id matches
         return min(0.95, score)
-
-    # ── Calibration helpers ──────────────────────────────────────────
-
-    def _get_thresholds(self, entity_type: str = "") -> tuple[float, float]:
-        """Get (accept_threshold, review_threshold) from calibration or defaults.
-
-        Returns per-entity-type thresholds if calibration is wired,
-        otherwise falls back to sensible defaults.
-        """
-        if self._threshold_engine is not None:
-            try:
-                cfg = self._threshold_engine.get_thresholds(
-                    decision_type="entity_match",
-                )
-                return cfg.auto_approve_threshold, cfg.review_threshold
-            except Exception:
-                pass
-        # Defaults: accept >= 0.5, review >= 0.4
-        return 0.5, 0.4
-
-    def _log_decision(
-        self,
-        query_name: str,
-        candidate_id: str,
-        entity_type: str,
-        score: float,
-        decision: str,
-    ) -> None:
-        """Log a match decision to the prediction log."""
-        if self._prediction_log is None:
-            return
-        try:
-            import time
-            import uuid
-            from attestdb.calibration.prediction_log import PredictionRecord
-
-            # Map ER decisions to valid prediction outcomes
-            outcome_map = {
-                "auto_merge": "confirmed",
-                "review": "pending",
-                "reject": "rejected",
-            }
-            record = PredictionRecord(
-                prediction_id=str(uuid.uuid4()),
-                tenant_id="default",
-                decision_type="entity_match",
-                source_id="entity_resolver",
-                field_semantic_type=entity_type or None,
-                predicted_confidence=score,
-                predicted_value=f"{query_name} <-> {candidate_id}",
-                review_outcome=outcome_map.get(decision, "pending"),
-                corrected_value=None,
-                reviewed_at=None,
-                reviewed_by=None,
-                created_at=time.time(),
-            )
-            self._prediction_log.record(record)
-        except Exception as e:
-            logger.debug("Failed to log ER decision: %s", e)
-
-    def _enqueue_review(
-        self,
-        query_name: str,
-        candidate_id: str,
-        entity_type: str,
-        score: float,
-    ) -> None:
-        """Route a gray-zone match to the human review queue."""
-        if self._review_queue is None:
-            return
-        try:
-            import time
-            import uuid
-            from attestdb.review.models import ReviewItem
-
-            item = ReviewItem(
-                item_id=str(uuid.uuid4()),
-                item_type="entity_match",
-                source_id="entity_resolver",
-                priority=score,
-                status="pending",
-                context={
-                    "query_name": query_name,
-                    "candidate_id": candidate_id,
-                    "entity_type": entity_type,
-                    "score": score,
-                },
-                proposed_value=f"merge:{query_name}->{candidate_id}",
-                created_at=time.time(),
-                tenant_id="default",
-            )
-            self._review_queue.add(item)
-        except Exception as e:
-            logger.debug("Failed to enqueue ER review: %s", e)

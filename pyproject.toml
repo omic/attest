@@ -1,9 +1,10 @@
 [project]
 name = "attestdb"
-version = "0.2.0"
-description = "A brain for AI agents that actually learns — confidence scoring, negative results, gap detection. pip install attestdb && attest brain install"
+version = "0.2.1"
+description = "Embedded claim database with provenance, confidence and retraction"
 readme = "README.md"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [
     {name = "Omic Research"},
@@ -12,7 +13,7 @@ keywords = ["knowledge-graph", "claims", "provenance", "database", "mcp", "ai-ag
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
-    "License :: Other/Proprietary License",
+    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -20,10 +21,12 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
 dependencies = [
-    "attest-py>=0.1.30",
+    "attest-py>=0.2.1",
     "usearch>=2.9",
     "numpy>=1.24",
     "jsonschema>=4.20",
+    "requests>=2.31",
+    "jellyfish>=1.0",
 ]
 
 [project.optional-dependencies]
@@ -41,7 +44,8 @@ browser = [
     "openai>=1.0",
 ]
 mcp = [
-    "mcp[cli]>=1.0",
+    "mcp[cli]>=1.0,<2",
+    "tomlkit>=0.13",
 ]
 otel = [
     "opentelemetry-api>=1.20",
@@ -87,3 +91,18 @@ select = ["E", "F", "I", "W"]
 python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/attestdb",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/RELEASE_POLICY.md",
+    "/LICENSE",
+    "/pyproject.toml",
+    "/tests/unit/test_embedding_index.py",
+    "/tests/integration/test_public_brain.py",
+    "/tests/integration/test_compliance_reference.py",
+    "/examples",
+    "/docs",
+]

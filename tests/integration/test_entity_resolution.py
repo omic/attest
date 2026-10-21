@@ -2,11 +2,8 @@
 
 import logging
 
-import pytest
-
 from attestdb.core.normalization import normalize_entity_id
 from attestdb.core.types import ClaimInput
-from attestdb.infrastructure.attest_db import AttestDB
 
 logging.disable(logging.WARNING)
 
@@ -77,7 +74,7 @@ def test_ingestion_resolves_to_existing(make_db):
     claims = db.claims_for(gene_672_canonical)
     predicates = {c.predicate.id for c in claims}
     assert "interacts_with" in predicates or "interacts" in predicates, (
-        f"Expected 'interacts' or 'interacts_with' in claims for {gene_672_canonical}, got {predicates}"
+        f"Expected interaction in claims for {gene_672_canonical}, got {predicates}"
     )
 
 
@@ -630,8 +627,8 @@ def test_unrelated_entities_stay_separate(make_db):
 
 def test_external_id_overrides_text(make_db):
     """External ID match produces high score even with dissimilar names."""
-    from attestdb.infrastructure.entity_resolver import EntityResolver
     from attestdb.core.types import EntitySummary
+    from attestdb.infrastructure.entity_resolver import EntityResolver
 
     c = EntitySummary(
         id="gene_672", name="Gene 672", entity_type="gene",
@@ -642,117 +639,6 @@ def test_external_id_overrides_text(make_db):
         query_external_ids={"ncbi_gene": "672"},
     )
     assert score >= 0.80, f"External ID match should score >=0.80, got {score:.3f}"
-
-
-# --- Calibration wiring tests ---
-
-
-def test_prediction_logging(make_db):
-    """Match decisions are logged to prediction_log when wired."""
-    import tempfile
-    from attestdb.calibration.prediction_log import PredictionLog
-
-    db = make_db(embedding_dim=None)
-    log_path = tempfile.mktemp(suffix=".sqlite")
-    pred_log = PredictionLog(log_path)
-
-    db.ingest(
-        subject=("Acme Corporation", "organization"),
-        predicate=("sells", "relates_to"),
-        object=("Widgets", "product"),
-        provenance={"source_type": "observation", "source_id": "src1"},
-        timestamp=1000,
-    )
-
-    db.enable_entity_resolution("fuzzy")
-    db._entity_resolver.configure_calibration(prediction_log=pred_log)
-
-    # This should trigger a match decision (Acme Corp -> Acme Corporation)
-    db.ingest(
-        subject=("Acme Corp", "organization"),
-        predicate=("hires", "relates_to"),
-        object=("Engineers", "role"),
-        provenance={"source_type": "observation", "source_id": "src2"},
-        timestamp=2000,
-    )
-
-    # Check that a prediction was logged
-    records = pred_log.get_resolved(decision_type="entity_match")
-    pending = pred_log.get_pending()
-    total = len(records) + len(pending)
-    assert total >= 1, f"Expected at least 1 prediction logged, got {total}"
-
-
-def test_review_queue_routing(make_db):
-    """Gray-zone matches are routed to review queue, not auto-merged."""
-    import tempfile
-    from attestdb.calibration.prediction_log import PredictionLog
-    from attestdb.calibration.threshold_engine import ThresholdEngine
-    from attestdb.review.queue import ReviewQueue
-
-    db = make_db(embedding_dim=None)
-    log_path = tempfile.mktemp(suffix=".sqlite")
-    review_path = tempfile.mktemp(suffix=".sqlite")
-
-    pred_log = PredictionLog(log_path)
-    review_q = ReviewQueue(review_path)
-    threshold_eng = ThresholdEngine(log_path)
-
-    db.ingest(
-        subject=("Alpha Corp", "organization"),
-        predicate=("sells", "relates_to"),
-        object=("Products", "product"),
-        provenance={"source_type": "observation", "source_id": "src1"},
-        timestamp=1000,
-    )
-
-    db.enable_entity_resolution("fuzzy")
-    db._entity_resolver.configure_calibration(
-        prediction_log=pred_log,
-        review_queue=review_q,
-        threshold_engine=threshold_eng,
-    )
-
-    # "Alpha Inc" is somewhat similar to "Alpha Corp" but with suffix difference
-    # The scorer should produce a moderate score — depends on calibrated thresholds
-    db.ingest(
-        subject=("Alpha Inc", "organization"),
-        predicate=("hires", "relates_to"),
-        object=("Engineers", "role"),
-        provenance={"source_type": "observation", "source_id": "src2"},
-        timestamp=2000,
-    )
-
-    # Check entities — if score was in gray zone, they should NOT be merged
-    # If score was above accept threshold, they SHOULD be merged
-    # Either way, a decision was logged
-    records = pred_log.get_pending()
-    resolved = pred_log.get_resolved(decision_type="entity_match")
-    total_logged = len(records) + len(resolved)
-    assert total_logged >= 1, "At least one decision should be logged"
-
-
-def test_calibrated_thresholds(make_db):
-    """Resolver uses calibrated thresholds from ThresholdEngine."""
-    from attestdb.infrastructure.entity_resolver import EntityResolver
-    from unittest.mock import MagicMock
-
-    db = make_db(embedding_dim=None)
-    db.enable_entity_resolution("fuzzy")
-
-    # Mock threshold engine to return specific thresholds
-    mock_te = MagicMock()
-    mock_config = MagicMock()
-    mock_config.auto_approve_threshold = 0.90
-    mock_config.review_threshold = 0.60
-    mock_te.get_thresholds.return_value = mock_config
-
-    db._entity_resolver.configure_calibration(threshold_engine=mock_te)
-
-    accept, review = db._entity_resolver._get_thresholds("organization")
-    assert accept == 0.90
-    assert review == 0.60
-    mock_te.get_thresholds.assert_called_with(decision_type="entity_match")
 
 
 # --- ClaimInput ingest overload ---

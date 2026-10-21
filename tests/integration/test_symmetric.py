@@ -4,14 +4,13 @@ import time
 
 import pytest
 
-from attestdb.infrastructure.embedding_index import EmbeddingIndex
+from attestdb.core.types import ClaimInput
 from attestdb.infrastructure.ingestion import IngestionPipeline
 from attestdb.infrastructure.query_engine import QueryEngine
-from attestdb.core.types import ClaimInput
 
 
-@pytest.fixture
-def sym_db(make_store):
+@pytest.fixture(params=["interacts", "interacts_with"])
+def sym_db(make_store, request):
     store = make_store()
     pipeline = IngestionPipeline(store, None, embedding_dim=None)
     qe = QueryEngine(store)
@@ -19,7 +18,7 @@ def sym_db(make_store):
 
     # Symmetric: interacts
     pipeline.ingest(ClaimInput(
-        subject=("protein_a", "protein"), predicate=("interacts", "relates_to"),
+        subject=("protein_a", "protein"), predicate=(request.param, "relates_to"),
         object=("protein_b", "protein"),
         provenance={"source_type": "observation", "source_id": "s1"},
         confidence=0.9, timestamp=now,
@@ -39,7 +38,7 @@ def sym_db(make_store):
 def test_symmetric_relationship_marked(sym_db):
     _, qe = sym_db
     frame = qe.query("protein_a", depth=1)
-    interacts_rels = [r for r in frame.direct_relationships if r.predicate == "interacts"]
+    interacts_rels = [r for r in frame.direct_relationships if r.predicate == "interacts_with"]
     assert len(interacts_rels) > 0
     for r in interacts_rels:
         assert r.is_symmetric is True
@@ -58,10 +57,16 @@ def test_symmetric_query_from_both_sides(sym_db):
     _, qe = sym_db
     # Query from A
     frame_a = qe.query("protein_a", depth=1)
-    targets_a = {r.target.id for r in frame_a.direct_relationships if r.predicate == "interacts"}
+    targets_a = {
+        r.target.id for r in frame_a.direct_relationships
+        if r.predicate == "interacts_with"
+    }
     assert "protein_b" in targets_a
 
     # Query from B — bidirectional BFS should find the relationship
     frame_b = qe.query("protein_b", depth=1)
-    targets_b = {r.target.id for r in frame_b.direct_relationships if r.predicate == "interacts"}
+    targets_b = {
+        r.target.id for r in frame_b.direct_relationships
+        if r.predicate == "interacts_with"
+    }
     assert "protein_a" in targets_b
