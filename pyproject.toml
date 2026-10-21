@@ -1,6 +1,6 @@
 [project]
 name = "attestdb"
-version = "0.2.1"
+version = "0.2.2"
 description = "Embedded claim database with provenance, confidence and retraction"
 readme = "README.md"
 license = "Apache-2.0"
@@ -21,7 +21,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
 dependencies = [
-    "attest-py>=0.2.1",
+    "attest-py>=0.2.2",
     "usearch>=2.9",
     "numpy>=1.24",
     "jsonschema>=4.20",

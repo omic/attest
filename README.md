@@ -5,7 +5,7 @@ The Python API uses a Rust storage engine backed by LMDB.
 
 ![Fabric reference implementations and their current readiness](docs/assets/application-map.svg)
 
-This is the **0.2.1 release candidate**. Brain features below require this
+This is the **0.2.2 release candidate**. Brain features below require this
 candidate; they are not a claim about older published packages.
 
 ## Start with AutoCompany
