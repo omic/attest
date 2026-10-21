@@ -11,7 +11,7 @@ import tomllib
 import pytest
 
 from attestdb import AttestDB, brain, mcp_install, mcp_server
-from attestdb.mcp_tools_learning import recall, remember
+from attestdb.mcp_tools_learning import _SUBJECT_BYTES, recall, remember
 
 
 def test_real_mcp_protocol_remembers_across_server_restarts(tmp_path):
@@ -182,3 +182,74 @@ def test_claude_install_preserves_other_servers_without_hooks(tmp_path, monkeypa
     assert not (tmp_path / ".claude/settings.json").exists()
     brain.uninstall("claude")
     assert json.loads(path.read_text())["mcpServers"] == {"existing": {"command": "keep"}}
+
+
+LONG_SUMMARY = " ".join(f"step {i}: checked the token refresh path and its retries"
+                         for i in range(16))
+
+
+def test_a_session_with_a_long_summary_is_stored_and_recalled(tmp_path):
+    """The store keys a subject with its predicate and its source in one LMDB key of at most 511
+    bytes: a summary of about 800 characters was rejected, and attest_session_end failed."""
+    assert len(LONG_SUMMARY) > 800
+    db = AttestDB(str(tmp_path / "long.attest"), embedding_dim=None)
+    mcp_server.configure(db)
+    try:
+        mcp_server.attest_session_end("success", LONG_SUMMARY, "Ship it", ["auth.py"])
+
+        by_summary = mcp_server.attest_get_prior_approaches(LONG_SUMMARY)
+        by_file = mcp_server.attest_check_file("auth.py")
+
+        assert [row["subject"] for row in by_summary] == [LONG_SUMMARY]
+        assert by_file[0]["description"] == LONG_SUMMARY
+    finally:
+        db.close()
+        mcp_server.configure(None)
+
+
+def test_a_long_subject_is_recalled_exactly_and_by_topic(tmp_path):
+    db = AttestDB(str(tmp_path / "subject.attest"), embedding_dim=None)
+    try:
+        remember(db, LONG_SUMMARY, "Retries hide the expiry bug", "bug")
+        remember(db, LONG_SUMMARY + " again", "A second, distinct subject", "tip")
+
+        exact = recall(db, LONG_SUMMARY, exact=True)
+
+        assert [row["description"] for row in exact] == ["Retries hide the expiry bug"]
+        assert recall(db, LONG_SUMMARY)[0]["subject"] == LONG_SUMMARY
+    finally:
+        db.close()
+
+
+def test_a_short_subject_keeps_the_entity_id_it_always_had(tmp_path):
+    db = AttestDB(str(tmp_path / "short.attest"), embedding_dim=None)
+    try:
+        remember(db, "auth.py", "Tokens expire after an hour", "warning")
+
+        assert [c.subject.id for c in db.claims_for("auth.py")] == ["auth.py"]
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("length", [_SUBJECT_BYTES, _SUBJECT_BYTES + 1, 2000])
+def test_a_subject_of_any_length_around_the_limit_is_stored(tmp_path, length):
+    db = AttestDB(str(tmp_path / f"edge{length}.attest"), embedding_dim=None)
+    try:
+        subject = "a" * length
+        remember(db, subject, "Stored", "tip")
+
+        assert [row["subject"] for row in recall(db, subject, exact=True)] == [subject]
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("subject", ["auth.py ", "  docs/guide.md", "проверка " * 34, "🔑" * 150])
+def test_a_subject_is_recalled_exactly_as_it_was_given(tmp_path, subject):
+    """remember() strips a subject; the exact recall compared the unstripped topic and missed it."""
+    db = AttestDB(str(tmp_path / "exact.attest"), embedding_dim=None)
+    try:
+        remember(db, subject, "Found again", "tip")
+
+        assert [row["description"] for row in recall(db, subject, exact=True)] == ["Found again"]
+    finally:
+        db.close()

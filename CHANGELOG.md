@@ -1,5 +1,14 @@
 # Release notes
 
+## 0.2.2
+
+- Organize the application roadmap as Fabric reference implementations with explicit readiness labels.
+- Add synthetic, offline Software Engineering and Sales and Marketing examples with real database tests and human-review gates.
+- Add the portable AutoCompany setup skill, a private workspace preparation script, and guided onboarding documentation. Setup starts paused; it does not provision a running company.
+- Store and recall Brain memories with long subjects safely within LMDB key limits, and match subjects with surrounding spaces consistently.
+
+The examples and setup kit make no live model calls. Separate private applications, enterprise features, models, training data, and private connectors are not included in this update.
+
 ## 0.2.1
 
 - Restore five local brain memory tools, test real MCP client sessions across server restarts, and preserve client settings during install/uninstall.
