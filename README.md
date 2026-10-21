@@ -8,6 +8,19 @@ The Python API uses a Rust storage engine backed by LMDB.
 This is the **0.2.1 release candidate**. Brain features below require this
 candidate; they are not a claim about older published packages.
 
+## Start with AutoCompany
+
+Give your existing Dot, Claude Code, Codex or other capable client this prompt:
+
+> Help me set up my company on Fabric. Read the AutoCompany setup skill at
+> `skills/autocompany-setup/SKILL.md` in this checkout. Ask what my company does,
+> which tools we use and which workflow to automate first. Help me connect it,
+> create the first useful work item, and show what is ready and what needs attention.
+
+The [setup guide](docs/autocompany.md) explains the portable skill and private
+workspace creator. This is a guided setup kit; live services and account
+connections are verified individually rather than implied by installation.
+
 Choose a Fabric reference implementation:
 
 | Priority | Fabric reference implementation | Purpose | Readiness |
