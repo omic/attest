@@ -17,12 +17,17 @@ FABRICS = {
     "supplier-assurance",
 }
 
+KIT_VERSION = json.loads((Path(__file__).resolve().parents[1] / "kit-manifest.json").read_text())[
+    "version"
+]
+
 
 def prepare(root: Path, company: str, fabrics: list[str], goal: str = "") -> dict:
     if not company.strip() or not fabrics or set(fabrics) - FABRICS:
         raise ValueError("Company name and known Fabric selections are required")
     manifest = {
         "schema_version": 1,
+        "onboarding_kit_version": KIT_VERSION,
         "company": company.strip(),
         "goal": goal,
         "fabrics": {

@@ -1,0 +1,9 @@
+{
+  "files": {
+    "SKILL.md": "9500917ba54ee97d59ce31bd981cff6df63f72d6fb949f5343a746e602c33354",
+    "references/fabric-catalog.md": "7a2df740f1f19467468198b7493255e7bcf5681b62319c149bfb17b57f224484",
+    "scripts/prepare_workspace.py": "a0472b226c98a419e6698cd375b15d9cef49f995d438d156f85a23e2e6356c91"
+  },
+  "schema_version": 1,
+  "version": "0.1.2"
+}

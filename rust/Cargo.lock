@@ -48,7 +48,7 @@ dependencies = [
 
 [[package]]
 name = "attest-py"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "attest-core",
  "attest-store",
