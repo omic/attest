@@ -10,6 +10,10 @@ candidate; they are not a claim about older published packages.
 
 ## Start with AutoCompany
 
+The shared setup kit is also included in the Python package. Export it for your
+client with `python -m attestdb.onboarding --zip autocompany-setup.zip`.
+Enterprise uses this same versioned kit with a separate operating reference.
+
 Give your existing Dot, Claude Code, Codex or other capable client this prompt:
 
 > Help me set up my company on Fabric. Read the AutoCompany setup skill at

@@ -1,5 +1,11 @@
 # Release notes
 
+## 0.2.3 (unreleased)
+
+- Export the same versioned AutoCompany onboarding kit from installed OSS and Enterprise packages, with deterministic archives and per-file integrity receipts.
+- Refresh the Fabric catalog for merged Engineering investigations and Compliance plan-review workflows, keeping deployment and live-integration gates explicit.
+- Preserve setup defaults: local private workspace, paused automation, and no implicit service connection or external action.
+
 ## 0.2.2
 
 - Organize the application roadmap as Fabric reference implementations with explicit readiness labels.

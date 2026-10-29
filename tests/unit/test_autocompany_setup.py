@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 SOURCE = (
-    Path(__file__).resolve().parents[2] / "skills/autocompany-setup/scripts/prepare_workspace.py"
+    Path(__file__).resolve().parents[2] / "attestdb/onboarding/skill/scripts/prepare_workspace.py"
 )
 spec = importlib.util.spec_from_file_location("company_setup", SOURCE)
 setup = importlib.util.module_from_spec(spec)

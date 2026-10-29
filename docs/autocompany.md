@@ -1,54 +1,56 @@
-# AutoCompany: put your company on Fabric
+# AutoCompany onboarding
 
-Start with the agent client you already use. Give Dot, Claude Code, Codex or
-another capable client this prompt from a trusted Fabric source checkout:
+AutoCompany helps an existing agent client connect a company's first Fabric workflow,
+prepare useful work and report what still needs attention. The shared kit is maintained
+in `attestdb/onboarding/skill/`, alongside its version and file-hash manifest. OSS and
+Enterprise consume these same resources; private services and tenant data stay separate.
 
-> Help me set up my company on Fabric using the AutoCompany setup skill at
-> `skills/autocompany-setup/SKILL.md`. Ask what my company does, which tools we
-> already use, and which workflow I want to automate first. Reuse my existing
-> accounts and help me connect the selected Fabric. Create the first useful work
-> item, show what is connected and what still needs attention, and give me a simple
-> way to resume. Start with a small budget and human review of proposed changes.
+## Export the installed kit
 
-If the client cannot read local skill files, supply the skill through its
-supported attachment or skill-import flow. There is no qualified Dot-specific
-installer in this checkout. A public hosted setup link is a release deliverable,
-not a URL to guess.
+With a package built from this source, create a new ZIP or skill folder:
 
-The target experience is one setup conversation followed by a working first
-workflow. The current kit provides a portable skill and private workspace creator;
-it does not provision every service, authenticate external accounts or start
-unattended company operations by itself. The skill guides actual discovery and
-verification using the user's client and available services.
-
-```mermaid
-flowchart LR
-    P[One setup prompt] --> C[Company goal and existing tools]
-    C --> F[Choose the first Fabric]
-    F --> A[Connect authorized services]
-    A --> V[Verify tools and scoped reads]
-    V --> W[Create the first useful work item]
-    W --> H[Human review and explicit automation limits]
+```sh
+python -m attestdb.onboarding --zip autocompany-setup.zip
+python -m attestdb.onboarding --directory /path/to/new/autocompany-setup
 ```
 
-The workspace is a private operational artifact. Keep it outside public source
-repositories. The creator is idempotent for identical input, refuses differing
-existing configuration and records connections as `not_checked`, with automation
-paused. Existing connections are verified through actual tools before their state
-changes. Creating a manifest is not proof that a company is running.
+Use either command for the format your current client accepts. Both refuse existing
+destinations. The folder includes `SKILL.md`, the Fabric catalog, the workspace creator
+and `kit-manifest.json`. The ZIP also records its edition and manifest digest in
+`distribution.json`. Installation does not authenticate accounts or enable scheduling.
 
-## Patterns informing the design
+Give the client this prompt:
 
-- [Paperclip company packages](https://github.com/paperclipai/companies) provide a
-  company-creator skill that interviews users and scaffolds a company package.
-- [Paperclip's skills store](https://github.com/paperclipai/paperclip/blob/master/docs/guides/agent-developer/skills-store.md)
-  separates its catalog from the skills installed for a specific company.
-- [gstack](https://github.com/garrytan/gstack) packages engineering work into
-  role-specific skills and documents different host integration levels.
-- [OpenClaw skills](https://docs.openclaw.ai/tools/skills) distinguish discovery,
-  runtime readiness and visibility to the selected agent.
-- [Agent Skills](https://agentskills.io/specification) defines the portable
-  `SKILL.md` package structure used by this setup kit.
+> Use the AutoCompany setup skill to help me connect my company and prepare the
+> first useful workflow. Reuse my existing accounts, verify what is connected,
+> and show the first artifact and remaining gaps.
 
-These are design references, not bundled dependencies or assertions of compatibility
-with their runtimes. No third-party skill code is imported or executed by this kit.
+The workspace creator records the kit version, marks connections `not_checked` and
+starts automation paused. It preserves an existing manifest and refuses changed
+configuration. Service access and workflow completion require separate observations.
+
+## Enterprise distribution
+
+The Enterprise service's `/connect` page links `/autocompany-skill.zip`. That download
+uses the shared installed kit and adds `references/enterprise.md` for organization
+identity, approved services, human decisions and operational qualification. Its
+`distribution.json` records the same shared-kit version plus the extension hash.
+Use matching OSS/core and Enterprise builds; the service does not carry a second copy
+of the catalog. The generic extension contains no tenant routes or credentials.
+
+## Maintenance and public release
+
+Edit the shared resources here, bump the kit version and refresh their hashes in
+`kit-manifest.json`. Run the workspace/export tests and Enterprise download tests.
+The kit version is independent of the Python distribution version.
+
+The public candidate includes the shared module and a portable copy under
+`skills/autocompany-setup/`. `scripts/stage_oss_candidate.py` verifies the reviewed
+candidate tree, then checks that both copies match the maintained kit exactly.
+Regenerate the reviewed candidate patch, manifest and pins when the kit changes;
+do not weaken tree verification or copy private Enterprise files into public releases.
+
+Public examples remain synthetic references. Real engineering investigations,
+compliance review workbenches and sales workflows have their own integration,
+authorization and operating requirements. Their existence does not qualify an
+offline reference as a supported hosted service.

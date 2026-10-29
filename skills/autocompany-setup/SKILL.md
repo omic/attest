@@ -17,6 +17,9 @@ an initial choice of engineering, security/compliance, or sales/marketing; memor
 supports each. Start with one workflow rather than requiring every department.
 
 Read only the relevant entry in [fabric-catalog.md](references/fabric-catalog.md).
+If this distribution includes `references/enterprise.md`, read it for organization
+identity, authorized services and workflow-specific setup. It extends the shared
+catalog; it does not change a reference's readiness or authorize a workflow.
 Explain which implementation is runnable, a pilot, or proposed. Reuse existing
 services and integrations before creating new ones. Do not invent endpoints,
 repositories, installation commands or Dot skill directories.
@@ -28,6 +31,7 @@ With the user-selected location and company name, run the bundled
 Fabrics, owners, references to connections and bounded automation policy. It never
 stores credentials. Existing files are preserved; rerunning with changed inputs
 requires reviewing the difference rather than silently overwriting the workspace.
+The workspace records the kit version so a later session can identify its setup contract.
 
 ## Connect through the current client
 
@@ -47,7 +51,9 @@ connected or healthy without evidence. Preserve other client settings.
 ## Make the first useful artifact
 
 Engineering: turn the first monthly/quarterly goal into a milestone and a proposed
-feature/issue plan with acceptance checks. Security/compliance: identify the first
+feature/issue plan with acceptance checks. If the goal is a reported failure or
+uncertain code behavior, use the connected implementation's investigation inbox
+and snapshot workflow before proposing a builder job. Security/compliance: identify the first
 obligation/evidence gap. Sales/marketing: prepare the first sourced account brief
 and draft. Use the selected service's actual tools, not fabricated local stand-ins.
 If only an offline reference is available, demonstrate it with clearly synthetic
